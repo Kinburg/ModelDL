@@ -1,0 +1,29 @@
+# Downloaded models — never commit these
+downloads/
+*.part
+*.part.json
+
+# Local settings (contains HF / Civitai tokens)
+settings.json
+settings.local.json
+
+# The download queue
+queue.db
+queue.db-journal
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

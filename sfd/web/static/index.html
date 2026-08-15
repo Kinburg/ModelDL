@@ -1,0 +1,594 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ModelDL</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #14161a; --panel: #1c1f25; --line: #2a2f38; --line-soft: #23272f;
+    --text: #e6e9ef; --muted: #8b93a3; --accent: #5b9dff; --accent-dim: #2f5c99;
+    --ok: #4ec98a; --warn: #e3b341; --bad: #f2606a; --bar: #2b3240;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 "Segoe UI", system-ui, sans-serif;
+  }
+  header {
+    position: sticky; top: 0; z-index: 5; background: var(--bg);
+    border-bottom: 1px solid var(--line); padding: 14px 20px;
+    display: flex; gap: 12px; align-items: center;
+  }
+  h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .2px; white-space: nowrap; }
+  main { padding: 18px 20px 60px; max-width: 1100px; margin: 0 auto; }
+  input, select, button, textarea {
+    font: inherit; color: var(--text); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 7px; padding: 8px 11px;
+  }
+  input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent-dim); border-color: var(--accent-dim); }
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent-dim); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent-dim); border-color: var(--accent-dim); }
+  button.danger:hover { border-color: var(--bad); color: var(--bad); }
+  #source { flex: 1; min-width: 200px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .muted { color: var(--muted); }
+  .small { font-size: 12.5px; }
+  .task {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px 14px 12px 30px; margin-bottom: 10px; position: relative;
+  }
+  .task.dragging { opacity: .4; }
+  .task.drop-target { border-color: var(--accent); }
+  .grip {
+    position: absolute; left: 9px; top: 13px; cursor: grab; color: var(--muted);
+    letter-spacing: 1px; line-height: 1; user-select: none; font-size: 13px;
+  }
+  .grip:active { cursor: grabbing; }
+  .timing { margin-top: 6px; display: flex; gap: 14px; flex-wrap: wrap; }
+  .task.blocked { border-color: #5a4a1e; }
+  .task.failed { border-color: #5a2a2e; }
+  .task-head { display: flex; gap: 10px; align-items: baseline; }
+  .name { font-weight: 600; word-break: break-all; }
+  .state {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .6px;
+    padding: 2px 7px; border-radius: 20px; border: 1px solid var(--line); color: var(--muted);
+    white-space: nowrap;
+  }
+  .state.running { color: var(--accent); border-color: var(--accent-dim); }
+  .state.done { color: var(--ok); border-color: #27543c; }
+  .state.failed { color: var(--bad); border-color: #5a2a2e; }
+  .state.blocked { color: var(--warn); border-color: #5a4a1e; }
+  .track { height: 6px; background: var(--bar); border-radius: 4px; overflow: hidden; margin: 9px 0 7px; }
+  .fill { height: 100%; background: var(--accent); width: 0; transition: width .3s ease; }
+  .fill.done { background: var(--ok); }
+  .dest { font-family: ui-monospace, Consolas, monospace; font-size: 12px; word-break: break-all; }
+  .why { margin-top: 6px; }
+  .actions { display: flex; gap: 6px; margin-left: auto; }
+  .actions button { padding: 4px 10px; font-size: 12.5px; }
+  details { margin-top: 10px; }
+  summary { cursor: pointer; color: var(--muted); }
+  .grid { display: grid; grid-template-columns: 210px 1fr; gap: 10px 14px; align-items: center; margin-top: 12px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 18px; }
+  .empty { color: var(--muted); text-align: center; padding: 40px 0; }
+  .err { color: var(--bad); }
+  .tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+  .tag { font-size: 11.5px; background: var(--line-soft); border-radius: 5px; padding: 1px 7px; color: var(--muted); }
+  .record {
+    margin-top: 10px; border-top: 1px solid var(--line-soft); padding-top: 10px;
+    display: grid; grid-template-columns: 120px 1fr; gap: 5px 12px; font-size: 12.5px;
+  }
+  .record dt { color: var(--muted); }
+  .record dd { margin: 0; word-break: break-all; }
+  .record .mono { font-family: ui-monospace, Consolas, monospace; font-size: 11.5px; }
+  .record pre {
+    grid-column: 1 / -1; margin: 6px 0 0; padding: 10px; background: var(--bg);
+    border: 1px solid var(--line-soft); border-radius: 7px; overflow-x: auto;
+    font-size: 11.5px; max-height: 320px;
+  }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>ModelDL</h1>
+  <input id="source" placeholder="Paste a HuggingFace or Civitai link, or org/repo" autofocus>
+  <button class="primary" id="add">Add</button>
+  <button id="toggle-settings">Settings</button>
+</header>
+
+<main>
+  <div id="message" class="small" style="margin-bottom:12px"></div>
+
+  <section class="panel" id="settings" hidden>
+    <div class="row" style="justify-content:space-between">
+      <strong>Settings</strong>
+      <span class="small muted" id="settings-saved"></span>
+    </div>
+    <div class="grid">
+      <label for="library_root">Library root</label>
+      <input id="library_root" placeholder="F:\ComfyUI\Shared — leave empty to keep one flat folder">
+
+      <label for="profile">Folder profile</label>
+      <select id="profile"><option value="comfyui">ComfyUI</option><option value="a1111">A1111</option></select>
+
+      <label for="group_by_base_model">Group by base model</label>
+      <input type="checkbox" id="group_by_base_model">
+
+      <label for="hf_token">HuggingFace token</label>
+      <input id="hf_token" type="password" placeholder="unchanged">
+
+      <label for="civitai_token">Civitai API key</label>
+      <input id="civitai_token" type="password" placeholder="unchanged">
+
+      <label for="connections">Connections per file</label>
+      <input id="connections" type="number" min="1" max="64">
+
+      <label for="concurrent_downloads">Files at once</label>
+      <input id="concurrent_downloads" type="number" min="1" max="8">
+
+      <label for="auto_start" title="Off: added links wait paused until you press Start all">Start downloads on add</label>
+      <input type="checkbox" id="auto_start">
+
+      <label for="hf_engine" title="native: our transfer, with resume and hashing we control. hf_hub: HuggingFace's own client in a subprocess, for Xet chunk deduplication">HuggingFace engine</label>
+      <select id="hf_engine">
+        <option value="native">native transfer</option>
+        <option value="hf_hub">huggingface_hub (subprocess)</option>
+      </select>
+
+      <label for="hf_fallback" title="Try the other engine once when one fails outright">Fall back to the other engine</label>
+      <input type="checkbox" id="hf_fallback">
+
+      <label for="disk_kind">Target disk</label>
+      <select id="disk_kind">
+        <option value="">detect automatically</option>
+        <option value="ssd">SSD / NVMe</option>
+        <option value="hdd">mechanical</option>
+      </select>
+
+      <label for="verify_hash">Verify checksums</label>
+      <input type="checkbox" id="verify_hash">
+
+      <label for="write_sidecars">Write metadata sidecars</label>
+      <input type="checkbox" id="write_sidecars">
+
+      <label for="sidecar_dir">Keep .json records in</label>
+      <input id="sidecar_dir" placeholder="empty = next to each model; a path collects them">
+
+      <label for="write_compat_files" title="Read by A1111 and ComfyUI model managers, which look for them beside the model">Also .civitai.info + preview</label>
+      <input type="checkbox" id="write_compat_files">
+
+      <label for="write_trigger_txt" title="Loaders paste this file straight into the prompt, so it holds the trigger words and nothing else">Trigger words as .txt</label>
+      <input type="checkbox" id="write_trigger_txt">
+    </div>
+    <div class="row" style="margin-top:14px">
+      <button class="primary" id="save-settings">Save</button>
+      <button id="show-layout">Check folder mapping</button>
+    </div>
+    <pre id="layout" class="small muted" style="white-space:pre-wrap"></pre>
+  </section>
+
+  <div class="row" style="margin-bottom:12px">
+    <span class="small muted" id="summary"></span>
+    <span style="flex:1"></span>
+    <!-- Windows Task Manager reports bits, downloaders report bytes, and the factor of 8
+         between them makes every cross-check look like a bug. -->
+    <button id="start-all" hidden class="primary">Start all</button>
+    <button id="toggle-units" title="Switch speed between bytes and bits">MB/s</button>
+    <button id="clear-done">Clear finished</button>
+  </div>
+
+  <div id="tasks"></div>
+  <div class="empty" id="empty">Nothing queued yet.</div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const tasks = new Map();
+let categories = [];
+
+const fmtBytes = (n) => {
+  if (n === null || n === undefined) return "—";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let v = n, i = 0;
+  while (Math.abs(v) >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)} ${units[i]}`;
+};
+// Task Manager shows bits per second; downloaders traditionally show bytes. Comparing the
+// two without noticing costs an evening of thinking the download is eight times slower
+// than it is, so both are one click apart.
+let useBits = localStorage.getItem("units") === "bits";
+const fmtSpeed = (bytesPerSecond) => {
+  if (!bytesPerSecond) return "0";
+  if (!useBits) return `${fmtBytes(bytesPerSecond)}/s`;
+  let v = bytesPerSecond * 8, i = 0;
+  const units = ["bit", "Kbit", "Mbit", "Gbit"];
+  while (v >= 1000 && i < units.length - 1) { v /= 1000; i++; }
+  return `${v.toFixed(v < 10 ? 1 : 0)} ${units[i]}/s`;
+};
+
+const fmtEta = (s) => {
+  if (!s || !isFinite(s) || s > 86400) return "—";
+  const m = Math.floor(s / 60), sec = Math.floor(s % 60);
+  return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m}:${String(sec).padStart(2, "0")}`;
+};
+const fmtWhen = (epoch) => epoch
+  ? new Date(epoch * 1000).toLocaleString(undefined,
+      { dateStyle: "short", timeStyle: "medium" })
+  : "—";
+const fmtDuration = (s) => {
+  if (!s || !isFinite(s)) return "—";
+  if (s < 60) return `${s.toFixed(1)}s`;
+  const m = Math.floor(s / 60), sec = Math.round(s % 60);
+  return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m}m ${sec}s`;
+};
+
+function message(text, bad = false) {
+  $("message").textContent = text;
+  $("message").className = "small " + (bad ? "err" : "muted");
+}
+
+// Snapshots arrive from two places — the event stream and the reply to whatever request
+// just made the change — and they can overtake each other. A task claimed by a worker while
+// the POST reply is still in flight would otherwise be redrawn as pending, showing "PENDING"
+// over a progress bar that is visibly moving.
+function upsert(task) {
+  const known = tasks.get(task.id);
+  if (known && known.updated_at > task.updated_at) return false;
+  tasks.set(task.id, { ...known, ...task });
+  return true;
+}
+
+async function api(path, options = {}) {
+  const response = await fetch(path, {
+    headers: { "Content-Type": "application/json" }, ...options,
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.detail || response.statusText);
+  return body;
+}
+
+function render() {
+  const order = (t) => (t.position ?? t.id);
+  const list = [...tasks.values()].sort((a, b) => order(a) - order(b) || a.id - b.id);
+  $("empty").hidden = list.length > 0;
+
+  const active = list.filter((t) => t.state === "running" || t.state === "pending").length;
+  const blocked = list.filter((t) => t.state === "blocked").length;
+  const waiting = list.filter((t) => t.state === "paused").length;
+  $("summary").textContent = list.length
+    ? `${list.length} in queue · ${active} active`
+      + (waiting ? ` · ${waiting} waiting to start` : "")
+      + (blocked ? ` · ${blocked} need a decision` : "")
+    : "";
+  // Only worth offering when several are held; one has its own Resume button.
+  $("start-all").hidden = waiting < 2;
+  $("start-all").textContent = `Start all (${waiting})`;
+
+  $("tasks").innerHTML = list.map(taskHtml).join("");
+  for (const task of list) {
+    const node = document.querySelector(`[data-id="${task.id}"]`);
+    if (!node) continue;
+    node.querySelectorAll("button").forEach((b) => {
+      b.onclick = () => act(task.id, b.dataset.action, node);
+    });
+    wireDrag(node);
+  }
+}
+
+// --- reordering -------------------------------------------------------------
+
+let dragging = null;
+
+function wireDrag(node) {
+  // The card is only draggable while the grip is held. A permanently draggable card lets
+  // the browser claim every mouse-down for a drag, so a path or a trigger word cannot be
+  // selected to copy — and reading those is most of what the card is for.
+  const grip = node.querySelector(".grip");
+  grip.addEventListener("mousedown", () => { node.draggable = true; });
+  const release = () => { node.draggable = false; };
+  grip.addEventListener("mouseup", release);
+  node.addEventListener("dragend", release);
+
+  node.addEventListener("dragstart", (e) => {
+    dragging = node;
+    node.classList.add("dragging");
+    e.dataTransfer.effectAllowed = "move";
+    // Firefox refuses to start a drag without payload.
+    e.dataTransfer.setData("text/plain", node.dataset.id);
+  });
+  node.addEventListener("dragend", async () => {
+    node.classList.remove("dragging");
+    document.querySelectorAll(".drop-target").forEach((n) => n.classList.remove("drop-target"));
+    dragging = null;
+    const ids = [...document.querySelectorAll(".task")].map((n) => Number(n.dataset.id));
+    try { await api("/api/tasks/reorder", { method: "POST", body: JSON.stringify({ ids }) }); }
+    catch (e) { message(e.message, true); }
+  });
+  node.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    if (!dragging || dragging === node) return;
+    node.classList.add("drop-target");
+    // Insert before or after depending on which half of the row the cursor is over, so a
+    // row can be dropped at either end of the list.
+    const box = node.getBoundingClientRect();
+    const after = e.clientY > box.top + box.height / 2;
+    node.parentNode.insertBefore(dragging, after ? node.nextSibling : node);
+  });
+  node.addEventListener("dragleave", () => node.classList.remove("drop-target"));
+  node.addEventListener("drop", (e) => e.preventDefault());
+}
+
+function taskHtml(t) {
+  const pct = t.fraction ? Math.round(t.fraction * 100) : 0;
+  const buttons = [];
+  if (t.state === "blocked") buttons.push(`<button data-action="confirm">Accept</button>`);
+  if (t.state === "running" || t.state === "pending") buttons.push(`<button data-action="pause">Pause</button>`);
+  if (t.state === "paused") buttons.push(`<button data-action="resume">Resume</button>`);
+  if (t.state === "failed") buttons.push(`<button data-action="retry">Retry</button>`);
+  if (t.state === "done") buttons.push(`<button data-action="record">Info</button>`);
+  buttons.push(`<button class="danger" data-action="cancel">Remove</button>`);
+
+  const picker = t.state === "blocked"
+    ? `<select data-role="category">${categories.map((c) =>
+        `<option value="${c}" ${c === t.category ? "selected" : ""}>${c}</option>`).join("")}</select>`
+    : "";
+
+  const why = t.reason
+    ? `<div class="why small muted">${escapeHtml(t.category || "")}
+         ${t.confidence ? `(${t.confidence})` : ""} — ${escapeHtml(t.reason)}</div>`
+    : "";
+
+  const triggers = (t.trigger_words || []).length
+    ? `<div class="tags">${t.trigger_words.map((w) => `<span class="tag">${escapeHtml(w)}</span>`).join("")}</div>`
+    : "";
+
+  // What actually happened, once it has. Average speed is computed from bytes really
+  // fetched, so a resumed or skipped file does not claim credit for the whole size.
+  const timing = [];
+  if (t.finished_at) {
+    timing.push(`finished ${fmtWhen(t.finished_at)}`);
+    if (t.duration) timing.push(`took ${fmtDuration(t.duration)}`);
+    if (t.average_speed) timing.push(`avg ${fmtSpeed(t.average_speed)}`);
+    if (t.transferred === 0) timing.push("already present");
+    else if (t.size && t.transferred && t.transferred < t.size * 0.98) {
+      timing.push(`${fmtBytes(t.transferred)} fetched — resumed`);
+    }
+  } else if (t.started_at && t.state === "running") {
+    timing.push(`started ${fmtWhen(t.started_at)}`);
+  } else {
+    timing.push(`added ${fmtWhen(t.created_at)}`);
+  }
+
+  return `
+    <div class="task ${t.state}" data-id="${t.id}">
+      <span class="grip" title="Drag to reorder">⣿</span>
+      <div class="task-head">
+        <span class="name">${escapeHtml(t.filename || t.source)}</span>
+        <span class="state ${t.state}">${t.state}</span>
+        <span class="actions">${picker}${buttons.join("")}</span>
+      </div>
+      <div class="track"><div class="fill ${t.state === "done" ? "done" : ""}" style="width:${pct}%"></div></div>
+      <div class="row small muted">
+        <span data-role="stats">${fmtBytes(t.downloaded)} / ${fmtBytes(t.size)}</span>
+        <span style="flex:1"></span>
+        <span>${escapeHtml(t.label || "")}</span>
+      </div>
+      ${t.dest ? `<div class="dest muted small">${escapeHtml(t.dest)}</div>` : ""}
+      ${why}
+      ${t.disagreement ? `<div class="small" style="color:var(--warn)">the service lists this as ${escapeHtml(t.disagreement)}</div>` : ""}
+      ${t.error ? `<div class="small err">${escapeHtml(t.error)}</div>` : ""}
+      <div class="timing small muted">${timing.map((x) => `<span>${escapeHtml(x)}</span>`).join("")}</div>
+      ${triggers}
+      <div data-role="record"></div>
+    </div>`;
+}
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// --- the stored record ------------------------------------------------------
+
+function recordHtml(record, path) {
+  const source = record.source || {};
+  const usage = record.usage || {};
+  const integrity = record.integrity || {};
+  const classification = record.classification || {};
+
+  const rows = [];
+  const add = (label, value) => value && rows.push(
+    `<dt>${escapeHtml(label)}</dt><dd>${value}</dd>`);
+
+  if (source.page) {
+    const page = escapeHtml(source.page);
+    // rel=noreferrer: the model page has no business learning where the click came from.
+    add("Page", `<a href="${page}" target="_blank" rel="noopener noreferrer">${page}</a>`);
+  }
+  add("Model", escapeHtml([source.model_name, source.version_name].filter(Boolean).join(" / ")));
+  add("Repository", escapeHtml(source.repo_id || ""));
+  add("Commit", source.commit ? `<span class="mono">${escapeHtml(source.commit)}</span>` : "");
+  add("Downloaded", escapeHtml(record.downloaded_at || ""));
+  add("SHA256", integrity.sha256
+    ? `<span class="mono">${escapeHtml(integrity.sha256)}</span>` : "");
+  add("Base model", escapeHtml(usage.base_model || ""));
+  add("Filed as", escapeHtml(
+    `${classification.category || "?"} (${classification.confidence || "?"})`
+    + (classification.service_called_it
+       ? ` — the service called it ${classification.service_called_it}` : "")));
+  add("Why", escapeHtml(classification.reason || ""));
+
+  const words = usage.trigger_words || [];
+  if (words.length) {
+    add("Triggers",
+      `<span class="mono" data-role="triggers">${escapeHtml(words.join(", "))}</span>`
+      + ` <button data-action="copy-triggers" style="padding:1px 8px;font-size:11.5px">Copy</button>`);
+  }
+  add("Record", `<span class="mono">${escapeHtml(path)}</span>`);
+
+  return `<dl class="record">${rows.join("")}
+    <pre hidden data-role="raw">${escapeHtml(JSON.stringify(record, null, 2))}</pre>
+    <dt></dt><dd><button data-action="raw" style="padding:2px 9px;font-size:12px">Raw JSON</button></dd>
+  </dl>`;
+}
+
+async function toggleRecord(id, node) {
+  const holder = node.querySelector('[data-role="record"]');
+  if (holder.innerHTML) { holder.innerHTML = ""; return; }
+  const { record, path } = await api(`/api/tasks/${id}/record`);
+  holder.innerHTML = recordHtml(record, path);
+
+  holder.querySelector('[data-action="raw"]').onclick = (e) => {
+    const raw = holder.querySelector('[data-role="raw"]');
+    raw.hidden = !raw.hidden;
+    e.target.textContent = raw.hidden ? "Raw JSON" : "Hide JSON";
+  };
+  const copy = holder.querySelector('[data-action="copy-triggers"]');
+  if (copy) copy.onclick = async (e) => {
+    await navigator.clipboard.writeText(
+      holder.querySelector('[data-role="triggers"]').textContent);
+    e.target.textContent = "Copied";
+    setTimeout(() => (e.target.textContent = "Copy"), 1500);
+  };
+}
+
+async function act(id, action, node) {
+  try {
+    if (action === "record") { await toggleRecord(id, node); return; }
+    if (action === "cancel") await api(`/api/tasks/${id}`, { method: "DELETE" });
+    else if (action === "confirm") {
+      const picked = node.querySelector('[data-role="category"]');
+      await api(`/api/tasks/${id}/confirm`, {
+        method: "POST", body: JSON.stringify({ category: picked ? picked.value : null }),
+      });
+    } else await api(`/api/tasks/${id}/${action}`, { method: "POST" });
+    message("");
+  } catch (e) { message(e.message, true); }
+}
+
+// --- live updates -----------------------------------------------------------
+
+function connect() {
+  const stream = new EventSource("/api/events");
+  stream.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    if (data.type === "task") { if (upsert(data.task)) render(); }
+    else if (data.type === "removed") { tasks.delete(data.id); render(); }
+    else if (data.type === "reload") load();
+    else if (data.type === "progress") {
+      const task = tasks.get(data.id);
+      if (!task) return;
+      task.downloaded = data.downloaded;
+      task.size = data.total ?? task.size;
+      task.fraction = task.size ? data.downloaded / task.size : 0;
+      // Patch in place: re-rendering the whole list several times a second would fight
+      // with the user's own clicks and scrolling.
+      const node = document.querySelector(`[data-id="${data.id}"]`);
+      if (!node) { render(); return; }
+      node.querySelector(".fill").style.width = `${Math.round(task.fraction * 100)}%`;
+      node.querySelector('[data-role="stats"]').textContent =
+        `${fmtBytes(data.downloaded)} / ${fmtBytes(task.size)} · ${fmtSpeed(data.speed)}`
+        + ` · ${data.connections} conn · ETA ${fmtEta(data.eta)}`;
+    }
+  };
+  stream.onerror = () => { stream.close(); setTimeout(connect, 2000); };
+}
+
+async function load() {
+  const { tasks: list } = await api("/api/tasks");
+  tasks.clear();
+  list.forEach((t) => tasks.set(t.id, t));
+  render();
+}
+
+// --- settings ---------------------------------------------------------------
+
+const FIELDS = ["library_root", "profile", "connections", "concurrent_downloads",
+                "disk_kind", "sidecar_dir", "hf_engine"];
+const CHECKS = ["group_by_base_model", "verify_hash", "write_sidecars",
+                "write_compat_files", "write_trigger_txt", "hf_fallback", "auto_start"];
+
+async function loadSettings() {
+  const { settings, categories: cats, error } = await api("/api/settings");
+  categories = cats;
+  if (error) { message(error, true); $("settings").hidden = false; }
+  FIELDS.forEach((k) => { if ($(k)) $(k).value = settings[k] ?? ""; });
+  CHECKS.forEach((k) => { if ($(k)) $(k).checked = !!settings[k]; });
+  $("hf_token").placeholder = settings.hf_token_from_env
+    ? "set from $HF_TOKEN" : settings.hf_token_set ? "saved — leave blank to keep" : "not set";
+  $("civitai_token").placeholder = settings.civitai_token_from_env
+    ? "set from $CIVITAI_TOKEN" : settings.civitai_token_set ? "saved — leave blank to keep" : "not set";
+}
+
+$("save-settings").onclick = async () => {
+  const patch = {};
+  FIELDS.forEach((k) => { patch[k] = $(k).type === "number" ? Number($(k).value) : $(k).value; });
+  CHECKS.forEach((k) => { patch[k] = $(k).checked; });
+  patch.hf_token = $("hf_token").value;
+  patch.civitai_token = $("civitai_token").value;
+  try {
+    await api("/api/settings", { method: "PUT", body: JSON.stringify(patch) });
+    $("hf_token").value = ""; $("civitai_token").value = "";
+    $("settings-saved").textContent = "saved";
+    setTimeout(() => ($("settings-saved").textContent = ""), 2000);
+    await loadSettings();
+  } catch (e) { message(e.message, true); }
+};
+
+$("show-layout").onclick = async () => {
+  const layout = await api("/api/layout");
+  if (!layout.root) { $("layout").textContent = "No library root set — everything goes to one folder."; return; }
+  const lines = Object.entries(layout.paths).map(([category, path]) =>
+    `${layout.exists[category] ? "  " : "* "}${category.padEnd(17)} ${path}`);
+  const ambiguous = Object.entries(layout.ambiguities || {}).map(([c, others]) =>
+    `  ${c}: also found ${others.join(", ")}`);
+  $("layout").textContent =
+    lines.join("\n") + "\n\n* = would be created\n"
+    + (ambiguous.length ? "\nseveral folders could have served:\n" + ambiguous.join("\n") : "");
+};
+
+$("toggle-settings").onclick = () => { $("settings").hidden = !$("settings").hidden; };
+
+$("add").onclick = async () => {
+  const source = $("source").value.trim();
+  if (!source) return;
+  $("add").disabled = true;
+  message("resolving…");
+  try {
+    const { tasks: created } = await api("/api/tasks", {
+      method: "POST", body: JSON.stringify({ source }),
+    });
+    created.forEach(upsert);
+    $("source").value = "";
+    message(`added ${created.length} file(s)`);
+    render();
+  } catch (e) { message(e.message, true); }
+  finally { $("add").disabled = false; }
+};
+
+$("source").addEventListener("keydown", (e) => { if (e.key === "Enter") $("add").click(); });
+$("clear-done").onclick = async () => { await api("/api/tasks/clear", { method: "POST" }); await load(); };
+
+$("start-all").onclick = async () => {
+  try {
+    const { released } = await api("/api/tasks/start-all", { method: "POST" });
+    await load();
+    message(`started ${released} download(s)`);
+  } catch (e) { message(e.message, true); }
+};
+
+$("toggle-units").onclick = () => {
+  useBits = !useBits;
+  localStorage.setItem("units", useBits ? "bits" : "bytes");
+  $("toggle-units").textContent = useBits ? "Mbit/s" : "MB/s";
+};
+$("toggle-units").textContent = useBits ? "Mbit/s" : "MB/s";
+
+loadSettings().then(load).then(connect).catch((e) => message(e.message, true));
+</script>
+</body>
+</html>

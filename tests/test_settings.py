@@ -26,6 +26,17 @@ def test_round_trip(tmp_path: Path):
     assert reloaded.connections == 12
 
 
+def test_new_downloads_join_the_bottom_unless_asked_otherwise(tmp_path: Path):
+    """Where a pasted link lands is opt-in; without a choice the queue stays a queue."""
+    path = tmp_path / "settings.json"
+    settings = Settings.load(path)
+    assert settings.queue_position == "bottom"
+
+    settings.apply({"queue_position": "top"})
+    settings.save()
+    assert Settings.load(path).queue_position == "top"
+
+
 def test_saving_returns_to_the_file_it_came_from(tmp_path: Path):
     path = tmp_path / "custom.json"
     settings = Settings.load(path)

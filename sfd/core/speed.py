@@ -1,12 +1,17 @@
-"""Throughput measurement and the stall watchdog.
+"""Throughput: measuring it, watching for stalls, and holding it down on purpose.
 
 A read timeout only fires when *nothing* arrives. The failure mode that actually costs
 people hours is different: bytes keep trickling in at a few KB/s, so every socket looks
 healthy and the download never finishes. That needs a throughput floor, not a timeout.
+
+The ceiling at the bottom of this file is the opposite problem: a 40 GB model fetched over
+sixteen connections will take the whole line, and the machine is usually being used for
+something else at the same time.
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections import deque
 
@@ -59,6 +64,45 @@ class SpeedTracker:
     @property
     def total(self) -> int:
         return self._total
+
+
+class RateLimiter:
+    """A ceiling on how fast bytes are taken off the network, shared by everything running.
+
+    One bucket for every connection of every download, because the thing being protected is
+    the link: sixteen connections each politely capped at "1 MB/s" is not the limit anyone
+    meant to set. `rate` may be changed while downloads are in flight — the setting is meant
+    to be reachable mid-download, which is when you actually notice you want it.
+    """
+
+    __slots__ = ("rate", "_allowance", "_last", "_lock")
+
+    def __init__(self, rate: float = 0.0) -> None:
+        self.rate = rate  # bytes per second; 0 means no ceiling at all
+        self._allowance = 0.0
+        self._last = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def take(self, nbytes: int) -> None:
+        """Block until `nbytes` fit under the ceiling, then count them against it."""
+        if self.rate <= 0 or nbytes <= 0:
+            return
+        async with self._lock:
+            while True:
+                rate = self.rate
+                if rate <= 0:  # lifted while we were waiting
+                    return
+                now = time.monotonic()
+                # The bucket holds a second's worth, or one read — whichever is larger, or a
+                # read bigger than the budget could never be paid for and would hang here.
+                self._allowance = min(
+                    max(rate, nbytes), self._allowance + (now - self._last) * rate
+                )
+                self._last = now
+                if self._allowance >= nbytes:
+                    self._allowance -= nbytes
+                    return
+                await asyncio.sleep((nbytes - self._allowance) / rate)
 
 
 class SmoothedSpeed:

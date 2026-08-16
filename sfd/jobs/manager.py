@@ -19,7 +19,18 @@ from typing import Any, Callable
 
 import httpx
 
-from ..core.errors import ChecksumMismatch, SfdError
+from ..core.diskinfo import free_bytes
+from ..core.errors import (
+    AccessDenied,
+    AuthRequired,
+    ChecksumMismatch,
+    NotBinaryContent,
+    NotEnoughSpace,
+    RangeNotHonored,
+    RemoteChanged,
+    SfdError,
+)
+from ..core.speed import RateLimiter
 from ..core.state import PartState
 from ..core.transfer import Transfer, TransferOptions, hash_file
 from ..engines.hf_hub import HfHubEngine, HfHubOptions
@@ -44,6 +55,27 @@ PROGRESS_INTERVAL = 0.4
 # shows 0% for a download that is eight gigabytes in, which reads exactly like the restart
 # this project exists to prevent.
 PERSIST_INTERVAL = 5.0
+# Slack kept between the queue and a completely full volume. Filling the last byte of a
+# system disk breaks more than this download.
+SPACE_HEADROOM = 64 * 1024**2
+
+# How long to wait before each automatic attempt, and how many there are. Wide gaps on
+# purpose: what these recover from is an outage — a router rebooting, a CDN edge having a
+# bad ten minutes — and hammering a service that just refused us is how a temporary failure
+# becomes a permanent one.
+RETRY_DELAYS = (30.0, 120.0, 600.0)
+RETRY_POLL = 5.0
+
+# Failures no amount of waiting fixes. Everything else — a reset connection, an expired
+# signature, a chunk that ran out of its own retries — is worth another go later.
+NO_RETRY = (
+    AccessDenied, AuthRequired, ChecksumMismatch, NotBinaryContent,
+    NotEnoughSpace, RangeNotHonored, RemoteChanged,
+)
+
+
+def _gb(size: float) -> str:
+    return f"{size / 1024**3:.1f} GB"
 
 
 class Manager:
@@ -52,7 +84,13 @@ class Manager:
         self.db = database
         self._subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
         self._running: dict[int, asyncio.Task[None]] = {}
-        self._workers: list[asyncio.Task[None]] = []
+        # Keyed by slot, so a worker keeps its identity across a resize and the ones past
+        # the limit know they are the ones to go.
+        self._workers: dict[int, asyncio.Task[None]] = {}
+        self._retries: asyncio.Task[None] | None = None
+        self._wanted = 0
+        # One ceiling for everything running, adjustable while it runs.
+        self.limiter = RateLimiter(max(0.0, settings.max_speed_kb * 1024))
         self._wake = asyncio.Event()
         self._stopping = False
         self._last_emit: dict[int, float] = {}
@@ -62,25 +100,59 @@ class Manager:
     async def start(self) -> None:
         self._stopping = False
         self.reconcile()
-        count = max(1, int(self.settings.concurrent_downloads))
-        self._workers = [
-            asyncio.create_task(self._worker(), name=f"queue-worker-{i}")
-            for i in range(count)
-        ]
+        self.resize()
+        self._retries = asyncio.create_task(self._retry_loop(), name="queue-retries")
+
+    def apply_settings(self) -> None:
+        """Take up the settings that are allowed to change while the queue is running."""
+        self.limiter.rate = max(0.0, self.settings.max_speed_kb * 1024)
+        self.resize()
+
+    def resize(self) -> int:
+        """Match the worker pool to the setting.
+
+        Called again whenever the setting is saved, because a number that only takes effect
+        after a restart reads as a broken control — especially next to `connections`, which
+        is picked up by the very next download.
+
+        A worker past the new limit retires when its current download finishes; it is not
+        cancelled. The setting says how many run at once, not that one nine tenths of the
+        way through should be dropped.
+        """
+        self._wanted = max(1, int(self.settings.concurrent_downloads))
+        for slot, worker in list(self._workers.items()):
+            if worker.done():
+                del self._workers[slot]
+        for slot in range(self._wanted):
+            if slot not in self._workers:
+                self._workers[slot] = asyncio.create_task(
+                    self._worker(slot), name=f"queue-worker-{slot}"
+                )
+        # Wakes the idle ones so a shrink takes effect now rather than on their next poll.
         self._wake.set()
+        return self._wanted
+
+    @property
+    def workers(self) -> int:
+        """Workers still alive. A retiring one is counted until it actually returns."""
+        return sum(1 for worker in self._workers.values() if not worker.done())
 
     async def stop(self) -> None:
         self._stopping = True
         self._wake.set()
         for task in list(self._running.values()):
             task.cancel()
-        for worker in self._workers:
+        for worker in self._workers.values():
             worker.cancel()
-        for task in [*self._running.values(), *self._workers]:
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
+        if self._retries is not None:
+            self._retries.cancel()
+        for task in [*self._running.values(), *self._workers.values(), self._retries]:
+            if task is not None:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
         self._workers.clear()
         self._running.clear()
+        self._retries = None
 
     def reconcile(self) -> None:
         """Re-read progress from the files themselves.
@@ -145,7 +217,12 @@ class Manager:
                 hf_token=self.settings.effective_hf_token,
                 civitai_token=self.settings.effective_civitai_token,
             )
-            for item in resolution.items:
+            # Reserved for the whole expansion at once, so the files of one link keep the
+            # order the provider listed them in whichever end of the queue they join.
+            positions = self.db.reserve_positions(
+                len(resolution.items), self.settings.queue_position
+            )
+            for item, position in zip(resolution.items, positions):
                 verdict = None
                 if self.settings.library_root:
                     verdict = await self._classify(resolution.provider, item, client)
@@ -181,6 +258,7 @@ class Manager:
                     ),
                     base_model=verdict.base_model if verdict else None,
                     meta=item.meta,
+                    position=position,
                 )
                 if task is not None:
                     created.append(task)
@@ -209,15 +287,23 @@ class Manager:
         running = self._running.get(task_id)
         if running is not None:
             running.cancel()
-        self.db.update(task_id, state=db.PAUSED)
+        # Pausing also calls off a booked retry: the answer to "start again in ten minutes"
+        # is no longer yes once someone has said stop.
+        self.db.update(task_id, state=db.PAUSED, retry_at=None)
         self._emit_task(task_id)
 
     def resume(self, task_id: int) -> None:
-        self.db.update(task_id, state=db.PENDING, error=None)
+        self.db.update(task_id, state=db.PENDING, error=None, retry_at=None)
         self._emit_task(task_id)
         self._wake.set()
 
     def retry(self, task_id: int) -> None:
+        """Asked for by hand, which also forgives the attempts spent so far.
+
+        Otherwise a task that used its three tries at 3am gets exactly one more forever,
+        even after the thing that broke it has been fixed.
+        """
+        self.db.update(task_id, attempts=0)
         self.resume(task_id)
 
     def confirm(self, task_id: int, category: str | None = None) -> None:
@@ -269,8 +355,8 @@ class Manager:
 
     # --- the worker loop --------------------------------------------------
 
-    async def _worker(self) -> None:
-        while not self._stopping:
+    async def _worker(self, slot: int = 0) -> None:
+        while not self._stopping and slot < self._wanted:
             task = self.db.claim_next()
             if task is None:
                 self._wake.clear()
@@ -291,8 +377,7 @@ class Manager:
                         self.db.update(task.id, state=db.PAUSED)
                         self._emit_task(task.id)
             except Exception as exc:  # noqa: BLE001 - a failed download must not kill the worker
-                self.db.update(task.id, state=db.FAILED, error=str(exc))
-                self._emit_task(task.id)
+                self._fail(task, exc)
             finally:
                 self._running.pop(task.id, None)
                 self._last_emit.pop(task.id, None)
@@ -301,6 +386,12 @@ class Manager:
         kind = task.identity.get("provider", task.provider)
         identity = FileIdentity(provider=kind, ref=task.identity.get("ref", {}))
         destination = Path(task.dest)
+
+        try:
+            self._require_space(task, destination)
+        except SfdError as exc:
+            self._fail(task, exc)
+            return
 
         use_hub = kind == "huggingface" and self.settings.hf_engine == "hf_hub"
         if use_hub:
@@ -334,9 +425,55 @@ class Manager:
                     return
             self._fail(task, exc)
 
+    def _require_space(self, task: Task, destination: Path) -> None:
+        """Refuse a file the volume cannot hold, before a byte of it is fetched.
+
+        Said at the start, this is one line to read and act on. Said by the file system
+        forty gigabytes in, it is an OSError from a chunk writer at four in the morning,
+        with the whole queue behind it failing the same way.
+        """
+        remaining = (task.size or 0) - task.downloaded
+        if remaining <= 0:
+            return
+        free = free_bytes(destination.parent)
+        if free is None or free >= remaining + SPACE_HEADROOM:
+            return
+        raise NotEnoughSpace(
+            f"{_gb(remaining)} still to fetch, {_gb(free)} free on "
+            f"{destination.drive or destination.parent}"
+        )
+
     def _fail(self, task: Task, exc: Exception) -> None:
-        self.db.update(task.id, state=db.FAILED, error=str(exc))
+        """Record a failure, and book another attempt when one might help.
+
+        The wait grows because what this recovers from is an outage, and the queue it was
+        written for is one left running overnight. What it must not do is spin: a wrong
+        token or a full disk is answered by a person, not by asking again in thirty seconds.
+        """
+        attempts = task.attempts + 1
+        eligible = (
+            self.settings.auto_retry
+            and not isinstance(exc, NO_RETRY)
+            and attempts <= len(RETRY_DELAYS)
+        )
+        retry_at = time.time() + RETRY_DELAYS[attempts - 1] if eligible else None
+        self.db.update(
+            task.id, state=db.FAILED, error=str(exc), attempts=attempts, retry_at=retry_at,
+        )
         self._emit_task(task.id)
+
+    async def _retry_loop(self) -> None:
+        """Put failed tasks back in the queue once their wait is up."""
+        while not self._stopping:
+            for task in self.db.due_retries(time.time()):
+                self.db.update(task.id, state=db.PENDING, error=None, retry_at=None)
+                self.emit({
+                    "type": "note", "id": task.id,
+                    "message": f"retrying (attempt {task.attempts + 1})",
+                })
+                self._emit_task(task.id)
+                self._wake.set()
+            await asyncio.sleep(RETRY_POLL)
 
     async def _run_hf_hub(
         self, task: Task, identity: FileIdentity, destination: Path
@@ -403,7 +540,9 @@ class Manager:
         progress = {"downloaded": task.downloaded, "persisted": 0.0}
         on_progress = self._progress_reporter(task, progress)
 
-        transfer = Transfer(provider, identity, destination, self._options(), on_progress)
+        transfer = Transfer(
+            provider, identity, destination, self._options(), on_progress, self.limiter
+        )
         try:
             path = await transfer.run()
         except SfdError:

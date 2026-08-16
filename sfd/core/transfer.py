@@ -47,7 +47,7 @@ from .errors import (
 )
 from .hashing import PrefixHasher
 from .prealloc import allocate
-from .speed import SmoothedSpeed, SpeedTracker
+from .speed import RateLimiter, SmoothedSpeed, SpeedTracker
 from .state import PartState
 from .types import DiskKind, FileIdentity, ProgressSnapshot, ResolvedTarget
 
@@ -121,12 +121,16 @@ class Transfer:
         dest: Path | str,
         options: TransferOptions | None = None,
         on_progress: ProgressCallback | None = None,
+        limiter: RateLimiter | None = None,
     ) -> None:
         self._provider = provider
         self._identity = identity
         self._dest_arg = Path(dest)
         self._opts = options or TransferOptions()
         self._on_progress = on_progress
+        # Shared with every other transfer running, so the ceiling is on the link rather
+        # than on each file. Absent means no ceiling.
+        self._limiter = limiter
 
         self._target: ResolvedTarget | None = None
         self._resolved_at = 0.0
@@ -415,6 +419,10 @@ class Transfer:
                         break
                     if len(data) > room:
                         data = data[:room]
+                    if self._limiter is not None:
+                        # Held before the write, so waiting here stops reading the socket
+                        # and the pause is pushed back to the sender rather than buffered.
+                        await self._limiter.take(len(data))
                     _write_all(fh, data)
                     # Only now, with the bytes handed to the OS, may `done` advance — the
                     # hasher trusts everything below it.
@@ -423,7 +431,7 @@ class Transfer:
                     self._state.touch()
                     self._state.flush()
                     tracker.add(len(data))
-                    if tracker.is_stalled(self._opts.min_speed):
+                    if tracker.is_stalled(self._stall_floor()):
                         raise Stalled(
                             f"chunk {chunk.index}: {tracker.rate():.0f} B/s over the last "
                             f"{self._opts.stall_window:.0f}s"
@@ -432,6 +440,20 @@ class Transfer:
             raise TransportError(f"chunk {chunk.index}: {exc}") from exc
         finally:
             self._active -= 1
+
+    def _stall_floor(self) -> float:
+        """The throughput below which a connection counts as dead rather than slow.
+
+        A speed ceiling has to move this floor, or the watchdog starts shooting the very
+        connections we are deliberately holding back: the cap is shared out between them,
+        so each one is *meant* to be slow. Half of its share leaves the check doing its real
+        job — a connection delivering nothing still reads as nothing.
+        """
+        floor = self._opts.min_speed
+        if self._limiter is not None and self._limiter.rate > 0:
+            share = self._limiter.rate / max(1, self._opts.connections)
+            floor = min(floor, share / 2)
+        return floor
 
     # --- response validation ---------------------------------------------
 
@@ -504,11 +526,13 @@ class Transfer:
             ) as resp:
                 self._validate_unsized(resp)
                 async for data in resp.aiter_bytes():
+                    if self._limiter is not None:
+                        await self._limiter.take(len(data))
                     _write_all(fh, data)
                     written += len(data)
                     self._transferred += len(data)
                     tracker.add(len(data))
-                    if tracker.is_stalled(self._opts.min_speed):
+                    if tracker.is_stalled(self._stall_floor()):
                         raise Stalled(f"{tracker.rate():.0f} B/s — giving up on this connection")
                     self._emit(ProgressSnapshot(
                         downloaded=written, total=info.size,

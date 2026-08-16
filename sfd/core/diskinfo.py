@@ -11,6 +11,7 @@ with a manual override for cases we get wrong (network shares, virtual disks, RA
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 from functools import lru_cache
@@ -102,6 +103,22 @@ def detect_disk_kind(path: Path | str) -> DiskKind:
     if not drive or not drive.endswith(":"):
         return DiskKind.UNKNOWN  # UNC / mapped network path — do not guess
     return _drive_table().get(drive[0].upper(), DiskKind.UNKNOWN)
+
+
+def free_bytes(path: Path | str) -> int | None:
+    """Free space on the volume `path` would land on, or None when it cannot be told.
+
+    The directory does not have to exist yet — a library root is created on the first
+    download — so this walks up to the nearest parent that does.
+    """
+    candidate = Path(path).resolve()
+    while True:
+        try:
+            return shutil.disk_usage(candidate).free
+        except OSError:
+            if candidate.parent == candidate:
+                return None
+            candidate = candidate.parent
 
 
 def recommend_connections(

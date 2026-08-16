@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -161,6 +162,295 @@ def test_dragging_changes_what_runs_next(database: Database):
     assert database.claim_next().id == third.id
 
 
+def test_new_tasks_queue_behind_what_is_already_waiting(database: Database):
+    first = add(database)
+    second = add(database, identity={"provider": "direct", "ref": {"url": "b"}}, filename="b")
+    assert [t.id for t in database.list()] == [first.id, second.id]
+
+
+def test_queueing_at_the_top_jumps_the_line(database: Database):
+    """With `queue_position: top`, the link just pasted is the one being waited on."""
+    waiting = add(database)
+    urgent = add(
+        database,
+        identity={"provider": "direct", "ref": {"url": "b"}},
+        filename="b",
+        position_mode=states.TOP,
+    )
+    assert [t.id for t in database.list()] == [urgent.id, waiting.id]
+    assert database.claim_next().id == urgent.id
+
+
+def test_a_batch_queued_at_the_top_keeps_its_own_order(database: Database):
+    """One link expands into several files. Taking the top slot once per file would put
+    each new one above the last and land the whole set reversed."""
+    waiting = add(database)
+    names = ["a.bin", "b.bin", "c.bin"]
+    batch = [
+        add(
+            database,
+            identity={"provider": "direct", "ref": {"url": name}},
+            filename=name,
+            position=position,
+        )
+        for name, position in zip(names, database.reserve_positions(len(names), states.TOP))
+    ]
+    assert [t.filename for t in database.list()] == [*names, "model.safetensors"]
+    assert database.claim_next().id == batch[0].id
+
+
+async def test_the_setting_decides_which_end_a_pasted_link_joins(tmp_path: Path, monkeypatch):
+    """The end-to-end path the setting travels: settings → manager → the queue's order."""
+    from sfd.jobs import manager as manager_module
+    from sfd.jobs.manager import Manager
+    from sfd.providers.direct import DirectProvider, make_identity
+    from sfd.providers.registry import Item, Resolution
+
+    async def fake_expand(text, client, **kwargs):
+        return Resolution(
+            provider=DirectProvider(),
+            items=[
+                Item(identity=make_identity(f"https://example.com/{name}"), filename=name)
+                for name in ("one.bin", "two.bin")
+            ],
+            label="pack",
+        )
+
+    monkeypatch.setattr(manager_module, "expand", fake_expand)
+
+    database = Database(tmp_path / "queue.db")
+    add(database)
+    settings = Settings(
+        download_dir=str(tmp_path / "downloads"),
+        queue_position=states.TOP,
+        _path=str(tmp_path / "settings.json"),
+    )
+    await Manager(settings, database).add("https://example.com/pack")
+
+    assert [t.filename for t in database.list()] == ["one.bin", "two.bin", "model.safetensors"]
+
+
+def _manager(database: Database, **settings):
+    from sfd.jobs.manager import Manager
+
+    return Manager(Settings(**settings), database)
+
+
+def test_a_failure_worth_retrying_books_another_attempt(database: Database):
+    """The queue this is written for is one left running overnight: a router rebooting at
+    3am should cost minutes, not the rest of the night."""
+    from sfd.core.errors import TransportError
+
+    task = add(database)
+    manager = _manager(database)
+
+    manager._fail(task, TransportError("connection reset"))
+    failed = database.get(task.id)
+    assert failed.state == states.FAILED
+    assert failed.attempts == 1
+    assert failed.retry_at is not None
+
+
+def test_a_failure_no_wait_can_fix_is_left_alone(database: Database):
+    """A missing token is answered by a person. Asking again in thirty seconds is noise."""
+    from sfd.core.errors import AuthRequired
+
+    task = add(database)
+    _manager(database)._fail(task, AuthRequired("needs a token"))
+
+    failed = database.get(task.id)
+    assert failed.state == states.FAILED
+    assert failed.retry_at is None
+
+
+def test_retries_run_out(database: Database):
+    from sfd.core.errors import TransportError
+    from sfd.jobs.manager import RETRY_DELAYS
+
+    task = add(database)
+    manager = _manager(database)
+    for _ in range(len(RETRY_DELAYS)):
+        manager._fail(database.get(task.id), TransportError("down"))
+        assert database.get(task.id).retry_at is not None
+
+    manager._fail(database.get(task.id), TransportError("down"))
+    exhausted = database.get(task.id)
+    assert exhausted.attempts == len(RETRY_DELAYS) + 1
+    assert exhausted.retry_at is None, "it stops asking rather than retrying forever"
+
+
+def test_turning_auto_retry_off_stops_booking_them(database: Database):
+    from sfd.core.errors import TransportError
+
+    task = add(database)
+    _manager(database, auto_retry=False)._fail(task, TransportError("down"))
+    assert database.get(task.id).retry_at is None
+
+
+def test_a_retry_asked_for_by_hand_forgives_the_attempts_spent(database: Database):
+    """Otherwise a task that used its three tries at 3am gets one more forever, even after
+    the thing that broke it is fixed."""
+    from sfd.core.errors import TransportError
+
+    task = add(database)
+    manager = _manager(database)
+    manager._fail(task, TransportError("down"))
+
+    manager.retry(task.id)
+    revived = database.get(task.id)
+    assert revived.state == states.PENDING
+    assert revived.attempts == 0
+    assert revived.retry_at is None
+
+
+def test_only_retries_that_have_come_round_are_released(database: Database):
+    now = 1_000_000.0
+    soon = add(database)
+    database.update(soon.id, state=states.FAILED, retry_at=now - 1)
+    later = add(database, identity={"provider": "direct", "ref": {"url": "b"}}, filename="b")
+    database.update(later.id, state=states.FAILED, retry_at=now + 600)
+
+    assert [t.id for t in database.due_retries(now)] == [soon.id]
+
+
+async def test_the_retry_loop_puts_a_due_task_back_in_the_queue(database: Database, monkeypatch):
+    import time
+
+    from sfd.jobs import manager as manager_module
+
+    monkeypatch.setattr(manager_module, "RETRY_POLL", 0.01)
+    task = add(database)
+    database.update(task.id, state=states.FAILED, retry_at=time.time() - 1, error="down")
+
+    manager = _manager(database)
+    loop = asyncio.create_task(manager._retry_loop())
+    try:
+        for _ in range(100):
+            if database.get(task.id).state == states.PENDING:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        manager._stopping = True
+        loop.cancel()
+
+    revived = database.get(task.id)
+    assert revived.state == states.PENDING
+    assert revived.error is None and revived.retry_at is None
+
+
+def test_pausing_calls_off_a_booked_retry(database: Database):
+    from sfd.core.errors import TransportError
+
+    task = add(database)
+    manager = _manager(database)
+    manager._fail(task, TransportError("down"))
+
+    manager.pause(task.id)
+    assert database.get(task.id).retry_at is None
+
+
+async def test_the_worker_pool_follows_the_setting(tmp_path: Path):
+    """A number that only takes effect after a restart reads as a broken control — the more
+    so next to `connections`, which the very next download picks up."""
+    from sfd.jobs.manager import Manager
+
+    settings = Settings(concurrent_downloads=1)
+    manager = Manager(settings, Database(tmp_path / "queue.db"))
+    await manager.start()
+    try:
+        assert manager.workers == 1
+
+        settings.concurrent_downloads = 3
+        manager.resize()
+        assert manager.workers == 3
+
+        settings.concurrent_downloads = 1
+        manager.resize()
+        for _ in range(50):
+            if manager.workers == 1:
+                break
+            await asyncio.sleep(0.01)
+        assert manager.workers == 1, "workers past the limit retire when they next come up"
+    finally:
+        await manager.stop()
+
+
+def test_saving_the_setting_resizes_the_pool(client):
+    manager = client.app.state.manager
+    assert manager.workers == 1
+
+    client.put("/api/settings", json={"concurrent_downloads": 4})
+    assert manager.workers == 4
+
+
+def test_the_speed_ceiling_takes_effect_without_a_restart(client):
+    """You reach for a speed limit precisely while something is downloading."""
+    manager = client.app.state.manager
+    assert manager.limiter.rate == 0
+
+    client.put("/api/settings", json={"max_speed_kb": 512})
+    assert manager.limiter.rate == 512 * 1024
+
+    client.put("/api/settings", json={"max_speed_kb": 0})
+    assert manager.limiter.rate == 0
+
+
+async def test_a_file_the_disk_cannot_hold_fails_before_it_starts(tmp_path: Path, monkeypatch):
+    """Preallocation is sparse, so nothing is reserved up front and a full disk would
+    otherwise surface as an OSError from a chunk writer, forty gigabytes in."""
+    from sfd.jobs import manager as manager_module
+    from sfd.jobs.manager import Manager
+
+    database = Database(tmp_path / "queue.db")
+    task = add(database, size=40 * 1024**3, dest=str(tmp_path / "huge.safetensors"))
+    monkeypatch.setattr(manager_module, "free_bytes", lambda path: 11 * 1024**3)
+
+    await Manager(Settings(), database)._run(database.get(task.id))
+
+    failed = database.get(task.id)
+    assert failed.state == states.FAILED
+    assert "40.0 GB" in failed.error and "11.0 GB" in failed.error
+
+
+async def test_a_file_that_fits_is_not_stopped(tmp_path: Path, monkeypatch):
+    from sfd.jobs import manager as manager_module
+    from sfd.jobs.manager import Manager
+
+    database = Database(tmp_path / "queue.db")
+    task = add(database, size=1000, dest=str(tmp_path / "small.safetensors"))
+    monkeypatch.setattr(manager_module, "free_bytes", lambda path: 40 * 1024**3)
+
+    manager = Manager(Settings(), database)
+    manager._require_space(database.get(task.id), tmp_path / "small.safetensors")
+
+
+def test_an_unknown_size_is_not_treated_as_zero(tmp_path: Path, monkeypatch):
+    """Civitai does not always say how big a file is. Refusing those would refuse most of
+    what the tool is pointed at."""
+    from sfd.jobs import manager as manager_module
+    from sfd.jobs.manager import Manager
+
+    database = Database(tmp_path / "queue.db")
+    task = add(database, size=None, dest=str(tmp_path / "unknown.safetensors"))
+    monkeypatch.setattr(manager_module, "free_bytes", lambda path: 0)
+
+    Manager(Settings(), database)._require_space(database.get(task.id), tmp_path / "u.bin")
+
+
+def test_the_space_endpoint_totals_what_is_left_to_fetch(client, tmp_path: Path):
+    started = add(client.database, size=1000)
+    client.database.update(started.id, downloaded=400)
+    add(client.database, size=2000, state=states.DONE,
+        identity={"provider": "direct", "ref": {"url": "done"}}, filename="done.bin")
+    add(client.database, size=None, state=states.BLOCKED,
+        identity={"provider": "direct", "ref": {"url": "unsure"}}, filename="unsure.bin")
+
+    body = client.get("/api/space").json()
+    assert body["needed"] == 600, "finished tasks are not still to fetch"
+    assert body["unknown"] == 1
+    assert body["free"] is None or body["free"] > 0
+
+
 def test_average_speed_uses_bytes_really_fetched(database: Database):
     """Dividing the file size by the elapsed time once reported 364 MB/s for a download
     that never happened, because the file was already on disk."""
@@ -245,13 +535,35 @@ def client(tmp_path: Path):
         _path=str(tmp_path / "settings.json"),
     )
     database = Database(tmp_path / "queue.db")
-    with TestClient(create_app(settings, database)) as test_client:
+    # Under 127.0.0.1 rather than TestClient's default `testserver`: the app refuses names
+    # it is not served under, and the tests should exercise the same path a browser takes.
+    with TestClient(create_app(settings, database), base_url="http://127.0.0.1:7788") as test_client:
         test_client.database = database  # type: ignore[attr-defined]
         yield test_client
 
 
 def test_the_page_is_served(client):
     assert client.get("/").status_code == 200
+
+
+def test_the_stylesheet_and_script_are_served(client):
+    """The page is three files now. A missing mount leaves it rendering as plain text with
+    no behaviour at all — which the page-is-served test above would not notice."""
+    for asset in ("/static/styles.css", "/static/app.js"):
+        assert client.get(asset).status_code == 200, asset
+
+
+def test_a_request_under_someone_elses_name_is_refused(client):
+    """DNS rebinding: a page can point a hostname it owns at 127.0.0.1 and then reach this
+    API as same-origin. There is no authentication here, so the name is the check."""
+    assert client.get("/api/tasks", headers={"host": "models.evil.example"}).status_code == 403
+    assert client.put("/api/settings", json={"library_root": "C:/"},
+                      headers={"host": "models.evil.example"}).status_code == 403
+
+
+def test_the_names_this_server_answers_to(client):
+    for name in ("127.0.0.1", "127.0.0.1:7788", "localhost:7788", "[::1]:7788"):
+        assert client.get("/api/tasks", headers={"host": name}).status_code == 200, name
 
 
 def test_listing_starts_empty(client):
@@ -389,6 +701,36 @@ def test_saving_settings_writes_only_to_its_own_file(client, tmp_path: Path):
     assert (tmp_path / "settings.json").exists()
     assert not Path("settings.json").resolve().samefile(tmp_path / "settings.json") \
         if Path("settings.json").exists() else True
+
+
+def test_a_setting_outside_its_bounds_is_refused(client):
+    """Rejected here, or accepted and then failing inside a transfer hours later, as
+    something that reads like a bug in the downloader rather than a typed-in zero."""
+    for patch in ({"connections": 0}, {"connections": 999}, {"connections": "several"},
+                  {"concurrent_downloads": 0}, {"queue_position": "sideways"},
+                  {"hf_engine": "torrent"}, {"min_speed_kb": -1}):
+        assert client.put("/api/settings", json=patch).status_code == 422, patch
+    assert client.get("/api/settings").json()["settings"]["connections"] == Settings().connections
+
+
+def test_a_patch_leaves_the_fields_it_does_not_mention_alone(client, tmp_path: Path):
+    client.put("/api/settings", json={"library_root": str(tmp_path)})
+    client.put("/api/settings", json={"connections": 8})
+
+    body = client.get("/api/settings").json()["settings"]
+    assert body["library_root"] == str(tmp_path)
+    assert body["connections"] == 8
+
+
+def test_every_setting_can_still_be_saved_through_the_page():
+    """The request model lists its fields by hand. One added to the dataclass and forgotten
+    here would be accepted by the form and silently dropped on the way in."""
+    from dataclasses import fields
+
+    from sfd.web.app import SettingsPatch
+
+    storable = {f.name for f in fields(Settings) if not f.name.startswith("_")}
+    assert storable == set(SettingsPatch.model_fields)
 
 
 def test_the_settings_path_cannot_be_changed_through_the_api(client, tmp_path: Path):

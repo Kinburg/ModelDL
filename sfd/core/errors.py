@@ -52,6 +52,15 @@ class ChecksumMismatch(Terminal):
     """The completed file does not match the hash the service advertised."""
 
 
+class NotEnoughSpace(Terminal):
+    """The volume cannot hold what is left of this file.
+
+    Worth its own check because preallocation is sparse: nothing is reserved up front, so a
+    full disk would otherwise surface as an OSError from a chunk writer hours into a
+    download, with the bytes already fetched thrown away on the retry.
+    """
+
+
 class TransferFailed(Terminal):
     """A chunk exhausted its retry budget. Carries the last underlying cause."""
 

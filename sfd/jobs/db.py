@@ -51,7 +51,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- speed computed from size would flatter it.
     started_at    REAL,
     finished_at   REAL,
-    transferred   INTEGER NOT NULL DEFAULT 0
+    transferred   INTEGER NOT NULL DEFAULT 0,
+    -- Automatic retries. `attempts` counts the ones already spent, `retry_at` is when the
+    -- next one is due; both are cleared when a person presses Retry themselves.
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    retry_at      REAL
 );
 """
 
@@ -76,6 +80,10 @@ DONE = "done"
 FAILED = "failed"
 
 ACTIVE_STATES = (PENDING, RUNNING)
+
+# Which end of the queue a newly added task joins — `queue_position` in the settings.
+TOP = "top"
+BOTTOM = "bottom"
 
 
 @dataclass(slots=True)
@@ -104,6 +112,8 @@ class Task:
     started_at: float | None = None
     finished_at: float | None = None
     transferred: int = 0
+    attempts: int = 0
+    retry_at: float | None = None
 
     @property
     def duration(self) -> float | None:
@@ -148,6 +158,8 @@ class Task:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "transferred": self.transferred,
+            "attempts": self.attempts,
+            "retry_at": self.retry_at,
             "duration": self.duration,
             "average_speed": self.average_speed,
             "trigger_words": self.meta.get("trained_words") or [],
@@ -184,6 +196,8 @@ class Database:
             "started_at": "REAL",
             "finished_at": "REAL",
             "transferred": "INTEGER NOT NULL DEFAULT 0",
+            "attempts": "INTEGER NOT NULL DEFAULT 0",
+            "retry_at": "REAL",
         }
         for column, definition in additions.items():
             if column not in existing:
@@ -204,6 +218,11 @@ class Database:
     def add(self, **values: Any) -> Task | None:
         """Insert a task. Returns None when this exact file is already queued."""
         now = time.time()
+        mode = values.pop("position_mode", BOTTOM)
+        position = values.pop("position", None)
+        if position is None:
+            position = self.reserve_positions(1, mode)[0]
+
         payload = {
             "created_at": now,
             "updated_at": now,
@@ -226,7 +245,7 @@ class Database:
             "error": None,
             # Fractional positions let a row be dropped between two others without
             # renumbering the whole queue.
-            "position": values.pop("position", None) or self._next_position(),
+            "position": position,
         }
         columns = ", ".join(payload)
         marks = ", ".join("?" for _ in payload)
@@ -242,9 +261,23 @@ class Database:
             task_id = cursor.lastrowid
         return self.get(task_id)
 
-    def _next_position(self) -> float:
-        row = self._conn.execute("SELECT MAX(position) AS m FROM tasks").fetchone()
-        return (row["m"] or 0.0) + 1.0
+    def reserve_positions(self, count: int, mode: str = BOTTOM) -> list[float]:
+        """Hand out `count` consecutive slots at one end of the queue, in order.
+
+        A batch has to be reserved in one go rather than a slot at a time. Adding to the top
+        means taking the slot above whatever is first right now, so one link expanding into
+        five files would put each one above the last and land the whole batch reversed.
+        """
+        if count <= 0:
+            return []
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MIN(position) AS lo, MAX(position) AS hi FROM tasks"
+            ).fetchone()
+        lowest = row["lo"] if row and row["lo"] is not None else 0.0
+        highest = row["hi"] if row and row["hi"] is not None else 0.0
+        first = lowest - count if mode == TOP else highest + 1.0
+        return [first + offset for offset in range(count)]
 
     def reorder(self, ids: list[int]) -> None:
         """Apply an explicit order, as dragged in the UI."""
@@ -310,6 +343,16 @@ class Database:
             rows = self._conn.execute(query, params).fetchall()
         return [_to_task(row) for row in rows]
 
+    def due_retries(self, now: float) -> list[Task]:
+        """Failed tasks whose next automatic attempt has come round."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM tasks WHERE state = ? AND retry_at IS NOT NULL "
+                "AND retry_at <= ? ORDER BY COALESCE(position, id), id",
+                (FAILED, now),
+            ).fetchall()
+        return [_to_task(row) for row in rows]
+
     def claim_next(self) -> Task | None:
         """Take the oldest pending task and mark it running, atomically."""
         with self._lock:
@@ -358,4 +401,6 @@ def _to_task(row: sqlite3.Row) -> Task:
         started_at=row["started_at"],
         finished_at=row["finished_at"],
         transferred=row["transferred"] or 0,
+        attempts=row["attempts"] or 0,
+        retry_at=row["retry_at"],
     )

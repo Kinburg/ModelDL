@@ -1,0 +1,135 @@
+/* One dark theme, stated once. `color-scheme: dark` is what makes the browser's own
+   furniture — scrollbars, form controls, the canvas behind the page — match it. */
+:root {
+  color-scheme: dark;
+  --bg: #14161a; --panel: #1c1f25; --line: #2a2f38; --line-soft: #23272f;
+  --text: #e6e9ef; --muted: #8b93a3; --accent: #5b9dff; --accent-dim: #2f5c99;
+  --ok: #4ec98a; --warn: #e3b341; --bad: #f2606a; --bar: #2b3240;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.5 "Segoe UI", system-ui, sans-serif;
+}
+header {
+  position: sticky; top: 0; z-index: 5; background: var(--bg);
+  border-bottom: 1px solid var(--line); padding: 14px 20px;
+  display: flex; gap: 12px; align-items: center;
+}
+h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .2px; white-space: nowrap; }
+main { padding: 18px 20px 60px; max-width: 1100px; margin: 0 auto; }
+input, select, button, textarea {
+  font: inherit; color: var(--text); background: var(--panel);
+  border: 1px solid var(--line); border-radius: 7px; padding: 8px 11px;
+}
+input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent-dim); border-color: var(--accent-dim); }
+button { cursor: pointer; }
+button:hover:not(:disabled) { border-color: var(--accent-dim); }
+button:disabled { opacity: .45; cursor: default; }
+button.primary { background: var(--accent-dim); border-color: var(--accent-dim); }
+button.danger:hover { border-color: var(--bad); color: var(--bad); }
+#source { flex: 1; min-width: 200px; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.muted { color: var(--muted); }
+.small { font-size: 12.5px; }
+.task {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 12px 14px 12px 30px; margin-bottom: 10px; position: relative;
+}
+.task.dragging { opacity: .4; }
+.task.drop-target { border-color: var(--accent); }
+.grip {
+  position: absolute; left: 9px; top: 13px; cursor: grab; color: var(--muted);
+  letter-spacing: 1px; line-height: 1; user-select: none; font-size: 13px;
+}
+.grip:active { cursor: grabbing; }
+.timing { margin-top: 6px; display: flex; gap: 14px; flex-wrap: wrap; }
+.task.blocked { border-color: #5a4a1e; }
+.task.failed { border-color: #5a2a2e; }
+.task-head { display: flex; gap: 10px; align-items: baseline; }
+.name { font-weight: 600; word-break: break-all; }
+.state {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .6px;
+  padding: 2px 7px; border-radius: 20px; border: 1px solid var(--line); color: var(--muted);
+  white-space: nowrap;
+}
+.state.running { color: var(--accent); border-color: var(--accent-dim); }
+.state.done { color: var(--ok); border-color: #27543c; }
+.state.failed { color: var(--bad); border-color: #5a2a2e; }
+.state.blocked { color: var(--warn); border-color: #5a4a1e; }
+.track { height: 6px; background: var(--bar); border-radius: 4px; overflow: hidden; margin: 9px 0 7px; }
+.fill { height: 100%; background: var(--accent); width: 0; transition: width .3s ease; }
+.fill.done { background: var(--ok); }
+.dest { font-family: ui-monospace, Consolas, monospace; font-size: 12px; word-break: break-all; }
+.why { margin-top: 6px; }
+.actions { display: flex; gap: 6px; margin-left: auto; }
+.actions button { padding: 4px 10px; font-size: 12.5px; }
+details { margin-top: 10px; }
+summary { cursor: pointer; color: var(--muted); }
+.grid { display: grid; grid-template-columns: 210px 1fr; gap: 10px 14px; align-items: center; }
+.empty { color: var(--muted); text-align: center; padding: 40px 0; }
+.err { color: var(--bad); }
+.warn { color: var(--warn); }
+.filter { padding: 5px 9px; font-size: 12.5px; }
+#filter-text { width: 170px; }
+/* A queue that is being filtered cannot also be dragged: the reorder call sends the rows
+   it can see, and the ones hidden behind the filter would be renumbered around them. */
+.task.pinned .grip { cursor: default; opacity: .35; }
+.task.compact { padding-top: 9px; padding-bottom: 9px; }
+.tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.tag { font-size: 11.5px; background: var(--line-soft); border-radius: 5px; padding: 1px 7px; color: var(--muted); }
+.record {
+  margin-top: 10px; border-top: 1px solid var(--line-soft); padding-top: 10px;
+  display: grid; grid-template-columns: 120px 1fr; gap: 5px 12px; font-size: 12.5px;
+}
+.record dt { color: var(--muted); }
+.record dd { margin: 0; word-break: break-all; }
+.record .mono { font-family: ui-monospace, Consolas, monospace; font-size: 11.5px; }
+.record pre {
+  grid-column: 1 / -1; margin: 6px 0 0; padding: 10px; background: var(--bg);
+  border: 1px solid var(--line-soft); border-radius: 7px; overflow-x: auto;
+  font-size: 11.5px; max-height: 320px;
+}
+a { color: var(--accent); }
+
+/* Modal overlay */
+.modal-backdrop {
+  display: none; position: fixed; inset: 0; z-index: 100;
+  background: rgba(0, 0, 0, .55); backdrop-filter: blur(4px);
+  justify-content: center; align-items: center;
+}
+.modal-backdrop.open { display: flex; }
+.modal {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+  width: min(680px, calc(100vw - 40px)); max-height: calc(100vh - 60px);
+  display: flex; flex-direction: column; box-shadow: 0 16px 48px rgba(0,0,0,.4);
+}
+.modal-header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 18px 22px 14px; border-bottom: 1px solid var(--line);
+}
+.modal-header strong { font-size: 15px; }
+.modal-close {
+  background: none; border: none; color: var(--muted); font-size: 20px;
+  padding: 2px 8px; cursor: pointer; border-radius: 6px; line-height: 1;
+}
+.modal-close:hover { color: var(--text); background: var(--line-soft); }
+.modal-body {
+  padding: 18px 22px; overflow-y: auto; flex: 1;
+}
+.modal-body #layout:empty { display: none; }
+.modal-body #layout { margin: 14px 0 0; }
+.modal-footer {
+  padding: 14px 22px 18px; border-top: 1px solid var(--line);
+  display: flex; gap: 8px; align-items: center;
+}
+
+/* Desktop polish */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+header, .grip, button, label, .state { user-select: none; }
+.input-with-btn { display: flex; gap: 6px; width: 100%; }
+.input-with-btn input { flex: 1; min-width: 0; }
+.btn-browse { padding: 7px 12px; white-space: nowrap; font-size: 13px; }

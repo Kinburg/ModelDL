@@ -14,9 +14,9 @@ if not exist "%PY%" (
     py -3 -m venv .venv || (echo Could not create .venv - is Python 3.12+ installed? & exit /b 1)
     echo Installing dependencies...
     "%PY%" -m pip install --upgrade pip --quiet
-    "%PY%" -m pip install -e ".[hf]" --quiet || (echo Dependency install failed. & exit /b 1)
+    "%PY%" -m pip install -e ".[hf,desktop]" --quiet || (echo Dependency install failed. & exit /b 1)
     echo Done.
     echo.
 )
 
-"%PY%" scripts\serve.py --open %*
+"%PY%" scripts\serve.py %*

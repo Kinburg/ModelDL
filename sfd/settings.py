@@ -37,7 +37,17 @@ class Settings:
     # Whether a newly added link starts downloading straight away. Turned off, links pile up
     # paused so a session of collecting them costs no bandwidth until you say go.
     auto_start: bool = True
+    # Where newly added downloads are queued: "bottom" (default) or "top"
+    queue_position: str = "bottom"
+    # Pick a failed download back up on its own, a few times, with growing gaps. The point is
+    # the queue left running overnight: a router rebooting at 3am should cost minutes, not
+    # the whole night. Failures that a wait cannot fix are never retried — see manager.
+    auto_retry: bool = True
     min_speed_kb: float = 64.0
+    # Ceiling on the whole queue in KB/s, 0 for none. Shared across every connection of
+    # every file: the thing worth protecting is the link, not each download. Applies to the
+    # native transfer; the huggingface_hub engine downloads in a subprocess of its own.
+    max_speed_kb: float = 0.0
     verify_hash: bool = True
     verify_existing: bool = True
     # "" means detect; set to ssd/hdd when Windows reports Unspecified and you know better.

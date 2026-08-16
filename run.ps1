@@ -18,8 +18,8 @@ if (-not (Test-Path $py)) {
 
     Write-Host 'Installing dependencies...'
     & $py -m pip install --upgrade pip --quiet
-    & $py -m pip install -e '.[hf]' --quiet
+    & $py -m pip install -e '.[hf,desktop]' --quiet
     Write-Host "Done.`n"
 }
 
-& $py scripts\serve.py --open @args
+& $py scripts\serve.py @args

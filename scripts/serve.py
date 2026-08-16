@@ -37,6 +37,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - a setup problem, not a 
               f"  {venv} -m pip install -e \".[hf]\"\n", file=sys.stderr)
     raise SystemExit(1) from None
 
+from sfd.desktop import is_gui_available, launch_desktop  # noqa: E402
 from sfd.jobs.db import Database  # noqa: E402
 from sfd.settings import Settings  # noqa: E402
 from sfd.web.app import create_app  # noqa: E402
@@ -44,25 +45,22 @@ from sfd.web.app import create_app  # noqa: E402
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--port", type=int, default=7788)
-    parser.add_argument("--db", default="queue.db")
-    parser.add_argument("--settings", default="settings.json")
-    parser.add_argument("--open", action="store_true", help="open a browser on start")
+    parser.add_argument("--port", type=int, default=7788, help="port to bind to (default: 7788)")
+    parser.add_argument("--db", default="queue.db", help="path to SQLite database (default: queue.db)")
+    parser.add_argument("--settings", default="settings.json", help="path to settings file")
+    parser.add_argument("--browser", "--open", action="store_true", help="open in default web browser instead of desktop window")
+    parser.add_argument("--no-gui", "--headless", action="store_true", help="run server without opening window or browser")
+    parser.add_argument("--debug", action="store_true", help="enable devtools in desktop window")
     args = parser.parse_args()
 
     settings = Settings.load(Path(args.settings))
     app = create_app(settings, Database(args.db))
 
     url = f"http://127.0.0.1:{args.port}"
-    # flush=True throughout: redirected output is buffered, so a process that is killed
-    # rather than exiting takes its startup log with it — leaving an empty file at exactly
-    # the moment you need to know what happened.
     say = lambda line: print(line, flush=True)  # noqa: E731
 
     say(f"ModelDL on {url}")
     if settings.error:
-        # Loud, because the consequence is quiet: files land somewhere else and nothing
-        # else would say why.
         say(f"\n  !! {settings.error}\n")
     if settings.library_root:
         say(f"library: {settings.library_root} ({settings.profile})")
@@ -72,11 +70,28 @@ def main() -> int:
         f"{' (falls back to the other)' if settings.hf_fallback else ''}")
     if not settings.auto_start:
         say("note   : auto-start is off — added links wait until you press Start all")
-    if args.open:
-        webbrowser.open(url)
 
-    uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
-    return 0
+    # Mode 1: Headless / server only
+    if args.no_gui:
+        uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
+        return 0
+
+    # Mode 2: Explicit browser mode or GUI not available
+    if args.browser or not is_gui_available():
+        if not is_gui_available() and not args.browser:
+            say("pywebview not available — opening in default browser")
+        webbrowser.open(url)
+        uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
+        return 0
+
+    # Mode 3: Native desktop standalone window (default)
+    try:
+        return launch_desktop(app, host="127.0.0.1", port=args.port, debug=args.debug)
+    except Exception as exc:
+        say(f"Could not open desktop window ({exc}), opening browser fallback...")
+        webbrowser.open(url)
+        uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
+        return 0
 
 
 if __name__ == "__main__":

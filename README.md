@@ -176,9 +176,12 @@ By hand, or on Linux and macOS:
 
 ```bash
 py -3 -m venv .venv
-.venv\Scripts\python.exe -m pip install -e ".[hf]"
+.venv\Scripts\python.exe -m pip install -e ".[hf,desktop]"
 .venv\Scripts\python.exe scripts\serve.py --open
 ```
+
+`desktop` is the standalone window (pywebview). Leave it out and everything still works —
+the same server opens in your browser instead, which is what a headless box wants anyway.
 
 **`python scripts/serve.py` will not work.** That runs whatever Python is on PATH, which is
 not the one holding the dependencies — always the interpreter inside `.venv`. The scripts
@@ -212,12 +215,48 @@ collecting them costs no bandwidth until you press *Start all*. That releases wh
 waiting; blocked tasks stay blocked, because they are waiting on a decision rather than on
 permission, and answering it is the point.
 
+**Add new downloads to** decides which end of the queue a pasted link joins: the bottom, so
+it waits its turn, or the top, so it is what runs next — the setting to flip when the queue
+is a long backlog and the thing you just found is the thing you actually want. A link that
+expands into several files keeps its own order either way. Anything already downloading
+keeps going; the queue only decides what is picked up next, and a card can still be dragged
+by its grip afterwards.
+
+A failure that a wait might fix is picked back up on its own — after 30 seconds, then two
+minutes, then ten. A router rebooting at 3am costs minutes rather than the rest of the
+night. Failures no wait can fix are never retried: a missing token, a refused licence, a
+hash that did not match and a disk with no room left are all answered by a person, and
+asking the service again every thirty seconds is how a temporary refusal becomes a ban.
+The switch is **retry failures on their own**; pressing *Retry* by hand also forgives the
+attempts already spent.
+
+**Speed limit** caps the whole queue rather than each connection, and takes effect while
+downloads are running — which is when you actually reach for it. It applies to the native
+transfer; the `huggingface_hub` engine downloads in a subprocess of its own and is not
+capped. (Neither is the stall watchdog fooled by it: the floor it uses drops with the
+ceiling, so a connection being held back on purpose is not mistaken for a dead one.)
+
+The header says what the queue as a whole is doing — fetched of total, current speed, ETA —
+and warns when what is left does not fit on the disk. That warning is worth more before
+the queue runs than after: preallocation is sparse, so nothing is reserved up front and a
+full disk otherwise turns up forty gigabytes into a download. A file that plainly cannot
+fit is refused before it starts, with the numbers in the message.
+
+The filter box and the state dropdown narrow a long list; finished downloads collapse to
+one line each until opened. Dragging is disabled while a filter is on, because the reorder
+would only see the rows on screen and would shuffle them around the ones it cannot.
+
 **Info** on a finished task opens its stored record in the card — page link, hash, why it
 was filed where it was, and the trigger words with a copy button. Worth having once records
 are collected into their own directory, where they are tidy and hard to find.
 
 Progress streams over Server-Sent Events; the page patches rows in place rather than
 re-rendering, so a list updating four times a second does not fight with your scrolling.
+
+The server answers only to `127.0.0.1` and `localhost` by name, not merely by address. It
+has no authentication — it holds your tokens and is not meant to be reachable — and a page
+on any website can point a hostname it owns at the loopback address and talk to a local
+server as same-origin. Checking the name it was asked for is what closes that.
 
 ## The command line
 
@@ -310,11 +349,37 @@ Base-model subfolders come from the service, not the file — the opposite of th
 rule, and deliberately. A Pony LoRA records `sdxl_base_v1-0` in its training metadata:
 true, and useless for filing, because Pony LoRAs do not work on plain SDXL.
 
+## Desktop Application & Standalone Executable
+
+ModelDL runs as a standalone desktop window on Windows (powered by Microsoft Edge WebView2 via `pywebview`), macOS (WKWebView), and Linux (WebKitGTK).
+
+### Running locally
+```cmd
+run.cmd
+```
+or PowerShell:
+```powershell
+.\run.ps1
+```
+Optional flags:
+- `--browser`: open in default web browser instead of standalone desktop window.
+- `--no-gui`: run headless backend server without opening a window or browser.
+- `--port 7788`: change port.
+
+### Building standalone ModelDL.exe
+To build a single-file executable that does not require Python or any dependencies:
+```cmd
+build.cmd
+```
+or
+```cmd
+.venv\Scripts\python scripts\build_exe.py
+```
+The resulting `ModelDL.exe` will be located in `dist/`.
+
 ## Status
 
 Working, and verified against the live services end to end: transfer core, the HuggingFace,
 Civitai and generic HTTP providers, model classification, library placement with sidecars,
-the persistent queue, and the local web UI.
+the persistent queue, and the desktop UI.
 
-Still to come: the `hf_hub` engine — running HuggingFace's own client in a subprocess, for
-whole-repo transfers and as a fallback when the native path is refused.

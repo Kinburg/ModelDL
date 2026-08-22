@@ -74,6 +74,20 @@ class Record:
                     verdict.disagreement.value if verdict.disagreement else None
                 ),
             },
+            # The sample images, with the settings that produced them. Trigger words say
+            # which tokens wake a LoRA up and nothing about what a prompt around them looks
+            # like; these are the prompts of someone who already knew, and they exist
+            # nowhere on disk once the model page is gone.
+            "previews": [
+                {
+                    "url": p.get("url"),
+                    "type": p.get("type") or "image",
+                    "nsfw": bool(p.get("nsfw")),
+                    "meta": p.get("meta") or {},
+                }
+                for p in (meta.get("previews") or [])
+                if isinstance(p, dict) and p.get("url")
+            ],
             "usage": {
                 "base_model": verdict.base_model or meta.get("base_model"),
                 # The thing that makes a LoRA usable, and the thing always lost.

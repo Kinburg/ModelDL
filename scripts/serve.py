@@ -10,6 +10,7 @@ not be reachable from the rest of the network.
 from __future__ import annotations
 
 import argparse
+import socket
 import sys
 import webbrowser
 from pathlib import Path
@@ -37,10 +38,16 @@ except ModuleNotFoundError as exc:  # pragma: no cover - a setup problem, not a 
               f"  {venv} -m pip install -e \".[hf]\"\n", file=sys.stderr)
     raise SystemExit(1) from None
 
-from sfd.desktop import is_gui_available, launch_desktop  # noqa: E402
+from sfd.desktop import bind_local_port, is_gui_available, launch_desktop  # noqa: E402
 from sfd.jobs.db import Database  # noqa: E402
 from sfd.settings import Settings  # noqa: E402
 from sfd.web.app import create_app  # noqa: E402
+
+
+def serve(app, host: str, port: int, sock: socket.socket) -> None:
+    """Run the server on a socket we already hold."""
+    config = uvicorn.Config(app=app, host=host, port=port, log_level="warning")
+    uvicorn.Server(config).run(sockets=[sock])
 
 
 def main() -> int:
@@ -54,12 +61,34 @@ def main() -> int:
     args = parser.parse_args()
 
     settings = Settings.load(Path(args.settings))
-    app = create_app(settings, Database(args.db))
-
-    url = f"http://127.0.0.1:{args.port}"
     say = lambda line: print(line, flush=True)  # noqa: E731
 
+    host = "127.0.0.1"
+    try:
+        sock, port = bind_local_port(host, args.port)
+    except RuntimeError as exc:
+        say(f"{exc}")
+        if sys.platform == "win32":
+            # The likeliest cause on Windows, and the one with no visible symptom: nothing
+            # is listening on the port, it is simply reserved out from under us.
+            say("")
+            say("Windows may have reserved the port for Hyper-V, WSL or Docker.")
+            say("The reserved ranges:")
+            say("")
+            say("  netsh interface ipv4 show excludedportrange protocol=tcp")
+            say("")
+            say("Pick a port outside them with --port.")
+        return 1
+
+    # A fresh database per attempt. Shutting the app down closes its connection, so the
+    # browser fallback below cannot reuse the one the desktop attempt already spent.
+    build_app = lambda: create_app(settings, Database(args.db))  # noqa: E731
+
+    url = f"http://{host}:{port}"
+
     say(f"ModelDL on {url}")
+    if port != args.port:
+        say(f"\n  !! port {args.port} was not available — using {port} instead\n")
     if settings.error:
         say(f"\n  !! {settings.error}\n")
     if settings.library_root:
@@ -73,7 +102,7 @@ def main() -> int:
 
     # Mode 1: Headless / server only
     if args.no_gui:
-        uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
+        serve(build_app(), host, port, sock)
         return 0
 
     # Mode 2: Explicit browser mode or GUI not available
@@ -81,16 +110,25 @@ def main() -> int:
         if not is_gui_available() and not args.browser:
             say("pywebview not available — opening in default browser")
         webbrowser.open(url)
-        uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
+        serve(build_app(), host, port, sock)
         return 0
 
     # Mode 3: Native desktop standalone window (default)
     try:
-        return launch_desktop(app, host="127.0.0.1", port=args.port, debug=args.debug)
+        return launch_desktop(app=build_app(), host=host, port=port, debug=args.debug, sock=sock)
     except Exception as exc:
         say(f"Could not open desktop window ({exc}), opening browser fallback...")
-        webbrowser.open(url)
-        uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
+        # That attempt ran the app's lifespan and took the socket down with it. Both have
+        # to be built again; neither survives a shutdown. The close is for the case where
+        # it failed before the server ever adopted the socket -- rebinding a port we still
+        # hold ourselves would only push us onto the next one.
+        try:
+            sock.close()
+        except OSError:
+            pass
+        sock, port = bind_local_port(host, port)
+        webbrowser.open(f"http://{host}:{port}")
+        serve(build_app(), host, port, sock)
         return 0
 
 

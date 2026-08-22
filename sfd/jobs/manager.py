@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -35,7 +36,8 @@ from ..core.state import PartState
 from ..core.transfer import Transfer, TransferOptions, hash_file
 from ..engines.hf_hub import HfHubEngine, HfHubOptions
 from ..core.types import FileIdentity, ProgressSnapshot
-from ..library import sidecar
+from ..library import relocate, sidecar
+from ..library.categories import ALIASES
 from ..library.classify import Verdict, classify
 from ..library.inspect import sniff_remote
 from ..library.layout import Layout, adopt, flat
@@ -87,6 +89,10 @@ class Manager:
         # Keyed by slot, so a worker keeps its identity across a resize and the ones past
         # the limit know they are the ones to go.
         self._workers: dict[int, asyncio.Task[None]] = {}
+        # Moves in flight, by task. A cross-drive move is a copy on a worker thread, and a
+        # thread cannot be cancelled — the event is the only way to ask it to stop, and it
+        # lives here so any request, from any tab, can do the asking.
+        self._moves: dict[int, threading.Event] = {}
         self._retries: asyncio.Task[None] | None = None
         self._wanted = 0
         # One ceiling for everything running, adjustable while it runs.
@@ -206,7 +212,7 @@ class Manager:
 
     async def add(self, source: str) -> list[Task]:
         """Expand a pasted link and queue everything it names."""
-        layout = self._layout()
+        layout = self.layout()
         timeout = httpx.Timeout(connect=15.0, read=60.0, write=30.0, pool=15.0)
         created: list[Task] = []
 
@@ -306,13 +312,32 @@ class Manager:
         self.db.update(task_id, attempts=0)
         self.resume(task_id)
 
-    def confirm(self, task_id: int, category: str | None = None) -> None:
-        """Accept a placement the classifier was not sure about, optionally correcting it."""
+    def confirm(
+        self, task_id: int, category: str | None = None, folder: Path | None = None
+    ) -> None:
+        """Accept a placement the classifier was not sure about, optionally correcting it.
+
+        A folder outranks a category, and is taken exactly as given: nothing is appended to
+        it, not even base-model grouping. The picker shows the whole directory, so what was
+        chosen is what the file gets — a path quietly extended underneath the person who
+        typed it is how you end up hunting for a model that downloaded successfully.
+        """
         task = self.db.get(task_id)
         if task is None:
             return
+
         updates: dict[str, Any] = {"state": db.PENDING, "error": None}
-        if category and category != task.category:
+        if folder is not None:
+            # A folder that names a kind says what the file is as well as where it goes; one
+            # that does not — `sams`, `insightface`, whatever a custom node brought — leaves
+            # the classifier's guess standing rather than inventing a better-sounding one.
+            kind = ALIASES.get(folder.name.lower())
+            updates["category"] = kind.value if kind else task.category
+            updates["confidence"] = "high"
+            updates["reason"] = f"filed by hand into {folder.name}"
+            updates["disagreement"] = None
+            updates["dest"] = str(folder / task.filename)
+        elif category and category != task.category:
             verdict = Verdict(
                 _category(category), "high", "chosen by hand", base_model=task.base_model
             )
@@ -320,10 +345,94 @@ class Manager:
             updates["confidence"] = "high"
             updates["reason"] = "chosen by hand"
             updates["disagreement"] = None
-            updates["dest"] = str(self._layout().destination(verdict, task.filename))
+            updates["dest"] = str(self.layout().destination(verdict, task.filename))
+
         self.db.update(task_id, **updates)
         self._emit_task(task_id)
         self._wake.set()
+
+    async def move(self, task_id: int, folder: Path) -> relocate.Move:
+        """Put a finished download in a different folder, sidecars and all.
+
+        The correction for a classifier that guessed wrong. It runs on a thread because a
+        library spread across two drives turns this into a copy of the whole file, and the
+        queue must keep running while that happens.
+        """
+        task = self.db.get(task_id)
+        if task is None:
+            raise LookupError("no such task")
+        if task.state != db.DONE or not task.dest:
+            raise ValueError("only a finished download can be moved")
+
+        if task_id in self._moves:
+            raise ValueError("this file is already being moved")
+
+        stop = threading.Event()
+        self._moves[task_id] = stop
+        try:
+            result = await asyncio.to_thread(
+                relocate.move,
+                Path(task.dest),
+                folder,
+                sidecar_dir=Path(self.settings.sidecar_dir) if self.settings.sidecar_dir else None,
+                library_root=Path(self.settings.library_root) if self.settings.library_root else None,
+                progress=self._move_progress(task_id),
+                stop=stop,
+            )
+        finally:
+            # Whatever happened, nothing is copying any more, and every page watching needs
+            # to hear that as much as it heard the progress.
+            self._moves.pop(task_id, None)
+            self.emit({"type": "moved", "id": task_id})
+
+        if result.unchanged:
+            return result
+
+        # The card explains where the file went and why. Leaving the old guess on it after
+        # a person has overruled it by hand is how the explanation stops being true.
+        kind = ALIASES.get(folder.name.lower())
+        self.db.update(
+            task_id,
+            dest=str(result.path),
+            category=kind.value if kind is not None else task.category,
+            confidence="high",
+            reason=f"moved by hand into {folder.name}",
+            disagreement=None,
+        )
+        self._emit_task(task_id)
+        return result
+
+    def stop_move(self, task_id: int) -> bool:
+        """Ask an in-flight move to give up. True if there was one to ask."""
+        stop = self._moves.get(task_id)
+        if stop is None:
+            return False
+        stop.set()
+        return True
+
+    def _move_progress(self, task_id: int) -> relocate.Progress:
+        """Report a cross-drive move, which is a copy and therefore has a duration.
+
+        Called from the worker thread doing the copying, so the event cannot be put on the
+        subscriber queues directly — those belong to the loop. Throttled to the same rhythm
+        as download progress: a 4 MB block off an NVMe drive arrives faster than anyone can
+        read, and the page redraws for every one of them.
+        """
+        loop = asyncio.get_running_loop()
+        last = 0.0
+
+        def report(copied: int, total: int) -> None:
+            nonlocal last
+            now = time.monotonic()
+            if copied < total and now - last < PROGRESS_INTERVAL:
+                return
+            last = now
+            loop.call_soon_threadsafe(
+                self.emit,
+                {"type": "moving", "id": task_id, "copied": copied, "total": total},
+            )
+
+        return report
 
     def cancel(self, task_id: int) -> None:
         running = self._running.get(task_id)
@@ -512,6 +621,11 @@ class Manager:
         )
         if self.settings.write_sidecars:
             await self._write_sidecar(path, task, identity)
+        # Deliberately not inside the branch above. The preview beside the model is read by
+        # the model managers, and someone who turned our JSON records off did not thereby
+        # ask their model manager to stop showing pictures.
+        if self.settings.fetch_previews and self.settings.write_compat_files:
+            await self._write_preview(path, task)
         self._emit_task(task.id)
 
     def _progress_reporter(self, task: Task, progress: dict) -> ProgressCallback:
@@ -570,6 +684,8 @@ class Manager:
         )
         if self.settings.write_sidecars:
             await self._write_sidecar(path, task, identity)
+        if self.settings.fetch_previews and self.settings.write_compat_files:
+            await self._write_preview(path, task)
         self._emit_task(task.id)
 
     async def _write_sidecar(self, path: Path, task: Task, identity: FileIdentity) -> None:
@@ -598,18 +714,22 @@ class Manager:
             triggers=self.settings.write_trigger_txt,
         )
 
-        if (
-            self.settings.fetch_previews
-            and self.settings.write_compat_files
-            and task.meta.get("preview_url")
-        ):
-            timeout = httpx.Timeout(connect=15.0, read=30.0, write=30.0, pool=15.0)
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                await sidecar.fetch_preview(path, task.meta, client)
+    async def _write_preview(self, path: Path, task: Task) -> None:
+        """Put `<model>.preview.png` beside the file, at full size.
+
+        Not the cached thumbnail the page draws: that one is 320 pixels wide because it is
+        going into a 56-pixel row, and a model manager showing it as a card would render a
+        blurred stamp.
+        """
+        if not task.meta.get("preview_url"):
+            return
+        timeout = httpx.Timeout(connect=15.0, read=30.0, write=30.0, pool=15.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            await sidecar.fetch_preview(path, task.meta, client)
 
     # --- configuration ----------------------------------------------------
 
-    def _layout(self) -> Layout:
+    def layout(self) -> Layout:
         if not self.settings.library_root:
             return flat(Path(self.settings.download_dir))
         layout = adopt(Path(self.settings.library_root), self.settings.profile)

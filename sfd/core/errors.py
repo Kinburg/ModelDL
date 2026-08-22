@@ -41,10 +41,12 @@ class NotBinaryContent(Terminal):
 
 
 class RangeNotHonored(Terminal):
-    """Asked to resume from a non-zero offset and the server sent the whole file instead.
+    """The byte range we asked for can never be served, and no retry changes that.
 
-    Writing this response would corrupt the file — either by appending a full copy onto a
-    partial one, or by silently overwriting good bytes. We refuse to write anything.
+    A 416 means our own arithmetic is out of step with the file; a redirect where a
+    resolved URL was promised means the provider handed us something we must not follow.
+    Both need a person, not another attempt. A server that merely *ignored* the range on
+    one response is a different matter — see RangeIgnored.
     """
 
 
@@ -86,6 +88,22 @@ class Stalled(Retryable):
 
 class TransportError(Retryable):
     """Connection reset, timeout, DNS blip, 5xx."""
+
+
+class RangeIgnored(Retryable):
+    """The response came back without the byte range we asked for.
+
+    Writing it would corrupt the file — appending a full copy onto a partial one, or
+    overwriting verified bytes — so the response is dropped unread. But dropping it is the
+    whole of the danger: the check runs before the first byte is written, so the partial on
+    disk is exactly as it was and another attempt costs nothing but a round trip.
+
+    Worth retrying because this is nearly always one CDN edge misbehaving rather than the
+    file losing range support. The connection that comes back lands on a different node,
+    and the fresh signed URL may point somewhere else entirely. A server that has genuinely
+    stopped serving ranges simply runs the attempt budget out and fails with the reason
+    intact.
+    """
 
 
 class ResolveError(Retryable):

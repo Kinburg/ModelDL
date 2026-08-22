@@ -4,26 +4,35 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ModelDL</title>
+<link rel="icon" type="image/png" href="/static/logo.png">
 <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
 <header>
+  <img class="logo" src="/static/logo.png" alt="" width="22" height="22">
   <h1>ModelDL</h1>
-  <input id="source" placeholder="Paste a HuggingFace or Civitai link, or org/repo" autofocus>
+  <input id="source" aria-label="Link to download"
+         placeholder="Paste a HuggingFace or Civitai link, or org/repo" autofocus>
   <button class="primary" id="add">Add</button>
   <button id="toggle-settings">Settings</button>
 </header>
 
 <main>
-  <div id="message" class="small" style="margin-bottom:12px"></div>
+  <div class="row" style="margin-bottom:12px">
+    <span id="message" class="small"></span>
+    <!-- Only ever shown while a move is copying across drives, which is the only kind that
+         lasts long enough for anyone to change their mind about it. -->
+    <button id="move-stop" class="danger" hidden>Stop the move</button>
+  </div>
 
   <div class="row" style="margin-bottom:12px">
     <span class="small muted" id="summary"></span>
     <span class="small muted" id="totals" hidden></span>
     <span class="small warn" id="space" hidden></span>
     <span style="flex:1"></span>
-    <input id="filter-text" class="filter" placeholder="Filter by name" spellcheck="false">
-    <select id="filter-state" class="filter">
+    <input id="filter-text" class="filter" aria-label="Filter the queue by name"
+           placeholder="Filter by name" spellcheck="false">
+    <select id="filter-state" class="filter" aria-label="Filter the queue by state">
       <option value="all">everything</option>
       <option value="active">active</option>
       <option value="blocked">needs a decision</option>
@@ -120,6 +129,12 @@
         <label for="write_compat_files" title="Read by A1111 and ComfyUI model managers, which look for them beside the model">Also .civitai.info + preview</label>
         <input type="checkbox" id="write_compat_files">
 
+        <label for="fetch_previews" title="The sample images a model is published with. Shown in the queue, and — with the compatibility files on — stored beside the model as .preview.png">Sample images</label>
+        <input type="checkbox" id="fetch_previews">
+
+        <label for="blur_nsfw" title="Civitai marks its own samples. A covered picture uncovers when you click it">Cover adult samples</label>
+        <input type="checkbox" id="blur_nsfw">
+
         <label for="write_trigger_txt" title="Loaders paste this file straight into the prompt, so it holds the trigger words and nothing else">Trigger words as .txt</label>
         <input type="checkbox" id="write_trigger_txt">
       </div>
@@ -130,6 +145,53 @@
       <button id="show-layout">Check folder mapping</button>
       <span style="flex:1"></span>
       <span class="small muted" id="settings-saved"></span>
+    </div>
+  </div>
+</div>
+
+<!-- Folder picker, for a file the classifier could not place on its own -->
+<div class="modal-backdrop" id="folders-backdrop">
+  <div class="modal" id="folders" role="dialog" aria-modal="true" aria-labelledby="folders-title">
+    <div class="modal-header">
+      <strong id="folders-title">Where does this go?</strong>
+      <button class="modal-close" id="close-folders" title="Close">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div id="folders-preview"></div>
+      <div class="small muted" id="folders-file"></div>
+      <input id="folders-search" aria-label="Search the library, or type a folder to create"
+             placeholder="Search, or type a folder to create"
+             spellcheck="false" autocomplete="off">
+      <div id="folders-list"></div>
+    </div>
+    <div class="modal-footer">
+      <label class="small muted" id="folders-remember-row"
+             title="Only applies to a folder that names a kind of model. A base-model folder like checkpoints/Krea 2 files this one file and leaves the mapping alone.">
+        <input type="checkbox" id="folders-remember">
+        <span>Send this kind of model here from now on</span>
+      </label>
+      <span style="flex:1"></span>
+      <!-- The list above is the library and nothing else, so another drive is unreachable
+           from it by construction. This opens the system's own dialog instead. -->
+      <button id="folders-browse" hidden
+              title="Choose any folder on this machine, including one on another drive">Another drive…</button>
+    </div>
+  </div>
+</div>
+
+<!-- Sample images, full size, with the prompt that produced each one -->
+<div class="modal-backdrop" id="preview-backdrop">
+  <div class="modal wide" id="preview-modal" role="dialog" aria-modal="true" aria-labelledby="preview-title">
+    <div class="modal-header">
+      <strong id="preview-title">Sample</strong>
+      <span class="small muted" id="preview-count"></span>
+      <span style="flex:1"></span>
+      <button class="modal-close" id="close-preview" title="Close">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="stage" id="preview-stage"></div>
+      <div class="strip" id="preview-strip"></div>
+      <dl class="record" id="preview-meta"></dl>
     </div>
   </div>
 </div>

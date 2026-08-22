@@ -35,6 +35,10 @@ class StubState:
         # well-behaved 206 while real chunk requests come back as a full-body 200 — the
         # shape of a misconfigured CDN edge.
         self.ignore_range_over: int | None = None
+        # How many responses the ignore_range_over rule applies to before the edge starts
+        # behaving. None means for ever; a small number is the transient misbehaviour a
+        # download is expected to ride out rather than fail on.
+        self.ignore_range_over_times: int | None = None
         self.head_supported = True
         # Reproduces HuggingFace's Xet bridge: the signed URL is minted for the byte range
         # of the request that triggered the redirect, and answers anything else with
@@ -49,6 +53,10 @@ class StubState:
         self.data_requests = 0
         self.resolve_requests = 0
         self.bytes_served = 0
+        # Bytes sent in responses that actually carried the range asked for. A body the
+        # client is bound to throw away still costs bandwidth, but it is not progress, and
+        # a test asking "did this resume or restart" wants to count only progress.
+        self.ranged_bytes_served = 0
         self.lock = threading.Lock()
 
     def rotate(self) -> None:
@@ -177,10 +185,18 @@ class _Handler(BaseHTTPRequestHandler):
                 if start > end:
                     self._send_simple(416, b"range not satisfiable")
                     return
+                honour = True
                 if ignore_over is not None and (end - start + 1) > ignore_over:
-                    start, end, status = 0, total - 1, 200
-                else:
+                    with st.lock:
+                        budget = st.ignore_range_over_times
+                        if budget is None or budget > 0:
+                            honour = False
+                            if budget is not None:
+                                st.ignore_range_over_times = budget - 1
+                if honour:
                     status = 206
+                else:
+                    start, end, status = 0, total - 1, 200
 
         body = data[start : end + 1]
 
@@ -211,10 +227,14 @@ class _Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             with st.lock:
                 st.bytes_served += min(truncate, len(body))
+                if status == 206:
+                    st.ranged_bytes_served += min(truncate, len(body))
             return
         self.wfile.write(body)
         with st.lock:
             st.bytes_served += len(body)
+            if status == 206:
+                st.ranged_bytes_served += len(body)
 
     # --- helpers ----------------------------------------------------------
 

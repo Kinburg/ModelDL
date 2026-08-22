@@ -16,6 +16,9 @@ header {
   border-bottom: 1px solid var(--line); padding: 14px 20px;
   display: flex; gap: 12px; align-items: center;
 }
+/* The gap between the mark and the name is tighter than the header's own, so the two
+   read as one lockup rather than as two of the header's items. */
+.logo { width: 22px; height: 22px; flex: none; margin-right: -4px; }
 h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .2px; white-space: nowrap; }
 main { padding: 18px 20px 60px; max-width: 1100px; margin: 0 auto; }
 input, select, button, textarea {
@@ -71,6 +74,21 @@ summary { cursor: pointer; color: var(--muted); }
 .err { color: var(--bad); }
 .warn { color: var(--warn); }
 .filter { padding: 5px 9px; font-size: 12.5px; }
+
+/* Folder picker */
+#folders-search { width: 100%; margin: 12px 0 10px; }
+#folders-list { display: flex; flex-direction: column; gap: 4px; }
+.folder {
+  display: flex; gap: 10px; align-items: baseline; text-align: left; width: 100%;
+  background: none; border: 1px solid transparent; border-radius: 8px; padding: 7px 10px;
+}
+.folder:hover, .folder:focus { background: var(--line-soft); border-color: var(--accent-dim); }
+.folder .path { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
+.folder .note { color: var(--muted); font-size: 12px; margin-left: auto; white-space: nowrap; }
+.folder.new .path { color: var(--accent); }
+.folder.absent .path { color: var(--muted); }
+#folders-remember-row { display: flex; gap: 8px; align-items: center; }
+#folders-remember-row.off { opacity: .4; }
 #filter-text { width: 170px; }
 /* A queue that is being filtered cannot also be dragged: the reorder call sends the rows
    it can see, and the ones hidden behind the filter would be renumbered around them. */
@@ -91,6 +109,61 @@ summary { cursor: pointer; color: var(--muted); }
   font-size: 11.5px; max-height: 320px;
 }
 a { color: var(--accent); }
+
+/* Sample images.
+
+   The card is a row now: a picture, then everything that used to be the whole card. The
+   picture is a fixed square rather than the image's own shape, because a list of rows that
+   each set their own height is a list nobody can scan. */
+.task .body { display: flex; gap: 12px; align-items: flex-start; }
+.task .main { flex: 1; min-width: 0; }
+.thumb {
+  flex: none; border-radius: 8px; object-fit: cover; cursor: pointer;
+  background: var(--bar); border: 1px solid var(--line);
+}
+.thumb:hover { border-color: var(--accent-dim); }
+/* Covered rather than hidden: the shape and the colours still tell you which model it is,
+   which is most of what a thumbnail in a queue is for. */
+.thumb.covered, .shot.covered { filter: blur(12px) saturate(.55); }
+#folders-preview:not(:empty) { margin-bottom: 10px; }
+
+/* The lightbox */
+.modal.wide { width: min(1000px, calc(100vw - 40px)); }
+.stage {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--bg); border: 1px solid var(--line-soft); border-radius: 10px; padding: 8px;
+}
+.stage .frame {
+  flex: 1; min-width: 0; position: relative; display: flex;
+  align-items: center; justify-content: center;
+}
+.stage img, .stage video {
+  max-width: 100%; max-height: min(62vh, 700px); border-radius: 7px; display: block;
+}
+.stage .frame.covered img, .stage .frame.covered video { filter: blur(28px) saturate(.55); }
+.stage .uncover {
+  position: absolute; padding: 7px 14px; font-size: 12.5px;
+  background: rgba(20, 22, 26, .85); border-color: var(--line);
+}
+.stage .nav {
+  flex: none; background: none; border: none; color: var(--muted);
+  font-size: 30px; line-height: 1; padding: 4px 10px;
+}
+.stage .nav:hover { color: var(--text); }
+
+/* The filmstrip, and the same strip inside a card's Info panel */
+.strip { display: flex; gap: 6px; overflow-x: auto; padding: 10px 2px 2px; }
+.strip.inline { padding: 0 0 10px; }
+.shot {
+  flex: none; width: 74px; height: 74px; object-fit: cover; cursor: pointer;
+  border-radius: 7px; border: 1px solid var(--line); background: var(--bar); opacity: .65;
+}
+.strip.inline .shot { width: 88px; height: 88px; opacity: 1; }
+.shot:hover { opacity: 1; border-color: var(--accent-dim); }
+.shot.current { opacity: 1; border-color: var(--accent); }
+#preview-meta { margin-top: 14px; }
+#preview-meta dd { white-space: pre-wrap; word-break: break-word; }
+button.mini { padding: 1px 8px; font-size: 11.5px; vertical-align: middle; }
 
 /* Modal overlay */
 .modal-backdrop {

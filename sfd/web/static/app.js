@@ -5,7 +5,6 @@
 
 const $ = (id) => document.getElementById(id);
 const tasks = new Map();
-let categories = [];
 
 const fmtBytes = (n) => {
   if (n === null || n === undefined) return "—";
@@ -130,7 +129,7 @@ function render() {
   for (const task of list) {
     const node = document.querySelector(`[data-id="${task.id}"]`);
     if (!node) continue;
-    node.querySelectorAll("button").forEach((b) => {
+    node.querySelectorAll("[data-action]").forEach((b) => {
       b.onclick = () => act(task.id, b.dataset.action, node);
     });
     if (!pinned) wireDrag(node);
@@ -193,35 +192,45 @@ function taskHtml(t, pinned = false) {
     return `
       <div class="task done compact ${pinned ? "pinned" : ""}" data-id="${t.id}">
         ${grip}
-        <div class="task-head">
-          <span class="name">${escapeHtml(t.filename || t.source)}</span>
-          <span class="state done">done</span>
-          <span class="small muted">${fmtBytes(t.size)}</span>
-          <span class="actions">
-            <button data-action="expand" title="Show the details">⌄</button>
-            ${t.dest ? `<button data-action="open-folder" title="Show in File Explorer">Folder</button>` : ""}
-            <button class="danger" data-action="cancel">Remove</button>
-          </span>
+        <div class="body">
+          ${thumbHtml(t, 30)}
+          <div class="main">
+            <div class="task-head">
+              <span class="name">${escapeHtml(t.filename || t.source)}</span>
+              <span class="state done">done</span>
+              <span class="small muted">${fmtBytes(t.size)}</span>
+              <span class="actions">
+                <button data-action="expand" title="Show the details">⌄</button>
+                ${t.dest ? `<button data-action="open-folder" title="Show in File Explorer">Folder</button>` : ""}
+                ${t.dest ? `<button data-action="move" title="Move it somewhere else in the library">Move to…</button>` : ""}
+                <button class="danger" data-action="cancel">Remove</button>
+              </span>
+            </div>
+          </div>
         </div>
       </div>`;
   }
 
   const buttons = [];
-  if (t.state === "blocked") buttons.push(`<button data-action="confirm">Accept</button>`);
+  if (t.state === "blocked") {
+    buttons.push(`<button data-action="confirm">Accept</button>`);
+    buttons.push(`<button data-action="where" title="Choose a folder in the library">Elsewhere…</button>`);
+  }
   if (t.state === "running" || t.state === "pending") buttons.push(`<button data-action="pause">Pause</button>`);
   if (t.state === "paused") buttons.push(`<button data-action="resume">Resume</button>`);
   if (t.state === "failed") buttons.push(`<button data-action="retry">Retry</button>`);
   if (t.state === "done") {
     buttons.push(`<button data-action="expand" title="Collapse">⌃</button>`);
     if (t.dest) buttons.push(`<button data-action="open-folder" title="Show in File Explorer">Folder</button>`);
+    if (t.dest) buttons.push(`<button data-action="move" title="Move it somewhere else in the library">Move to…</button>`);
     buttons.push(`<button data-action="record">Info</button>`);
   }
   buttons.push(`<button class="danger" data-action="cancel">Remove</button>`);
 
-  const picker = t.state === "blocked"
-    ? `<select data-role="category">${categories.map((c) =>
-        `<option value="${c}" ${c === t.category ? "selected" : ""}>${c}</option>`).join("")}</select>`
-    : "";
+  // No category dropdown any more: *Accept* takes the guess the card already explains, and
+  // *Elsewhere…* opens the library itself. A list of our internal category names could not
+  // name the folder such a file usually needs.
+  const picker = "";
 
   const why = t.reason
     ? `<div class="why small muted">${escapeHtml(t.category || "")}
@@ -255,30 +264,191 @@ function taskHtml(t, pinned = false) {
   return `
     <div class="task ${t.state} ${pinned ? "pinned" : ""}" data-id="${t.id}">
       ${grip}
-      <div class="task-head">
-        <span class="name">${escapeHtml(t.filename || t.source)}</span>
-        <span class="state ${t.state}">${t.state}</span>
-        <span class="actions">${picker}${buttons.join("")}</span>
+      <div class="body">
+        ${thumbHtml(t, 56)}
+        <div class="main">
+          <div class="task-head">
+            <span class="name">${escapeHtml(t.filename || t.source)}</span>
+            <span class="state ${t.state}">${t.state}</span>
+            <span class="actions">${picker}${buttons.join("")}</span>
+          </div>
+          <div class="track"><div class="fill ${t.state === "done" ? "done" : ""}" style="width:${pct}%"></div></div>
+          <div class="row small muted">
+            <span data-role="stats">${fmtBytes(t.downloaded)} / ${fmtBytes(t.size)}</span>
+            <span style="flex:1"></span>
+            <span>${escapeHtml(t.label || "")}</span>
+          </div>
+          ${t.dest ? `<div class="dest muted small">${escapeHtml(t.dest)}</div>` : ""}
+          ${why}
+          ${t.disagreement ? `<div class="small" style="color:var(--warn)">the service lists this as ${escapeHtml(t.disagreement)}</div>` : ""}
+          ${t.error ? `<div class="small err">${escapeHtml(t.error)}</div>` : ""}
+          <div class="timing small muted">${timing.map((x) => `<span>${escapeHtml(x)}</span>`).join("")}</div>
+          ${triggers}
+          <div data-role="record"></div>
+        </div>
       </div>
-      <div class="track"><div class="fill ${t.state === "done" ? "done" : ""}" style="width:${pct}%"></div></div>
-      <div class="row small muted">
-        <span data-role="stats">${fmtBytes(t.downloaded)} / ${fmtBytes(t.size)}</span>
-        <span style="flex:1"></span>
-        <span>${escapeHtml(t.label || "")}</span>
-      </div>
-      ${t.dest ? `<div class="dest muted small">${escapeHtml(t.dest)}</div>` : ""}
-      ${why}
-      ${t.disagreement ? `<div class="small" style="color:var(--warn)">the service lists this as ${escapeHtml(t.disagreement)}</div>` : ""}
-      ${t.error ? `<div class="small err">${escapeHtml(t.error)}</div>` : ""}
-      <div class="timing small muted">${timing.map((x) => `<span>${escapeHtml(x)}</span>`).join("")}</div>
-      ${triggers}
-      <div data-role="record"></div>
     </div>`;
 }
 
 function escapeHtml(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// --- sample images ----------------------------------------------------------
+
+// What a model looks like is the fastest answer to "which of these is it", and the prompt
+// under the picture is the part that makes a LoRA usable. Both come from the service and
+// exist nowhere else once the model page is gone.
+//
+// Only the count travels with the task. The pictures themselves are asked for by the <img>
+// tags as they are drawn, and the server fetches each one once — so a queue of two hundred
+// finished downloads costs two hundred cache hits, not two hundred round trips to a CDN.
+
+const previewCache = new Map();
+// Covered pictures, uncovered by clicking, remembered for as long as the page is open. Not
+// stored: the point of the cover is the next person who walks past, and it should be back
+// tomorrow.
+const revealed = new Set();
+let blurNsfw = true;
+
+async function previewsFor(id) {
+  if (!previewCache.has(id)) previewCache.set(id, await api(`/api/tasks/${id}/previews`));
+  return previewCache.get(id);
+}
+
+const previewSrc = (id, index, width) =>
+  `/api/tasks/${id}/preview/${index}` + (width ? `?w=${width}` : "");
+
+// Widths are asked for explicitly, and they are the size the picture is actually drawn at:
+// the CDN resizes, so a row thumbnail costs about forty kilobytes instead of three megabytes.
+const covered = (id, nsfw) => nsfw && blurNsfw && !revealed.has(id);
+
+function thumbHtml(t, size) {
+  if (!t.previews) return "";
+  const more = t.previews > 1 ? ` (${t.previews} samples)` : "";
+  // Sized by attribute rather than by inline style: `.thumb` carries no width or height of
+  // its own, so this is the only source either way, and the browser gets the box before it
+  // has the image.
+  return `<img class="thumb ${covered(t.id, t.nsfw) ? "covered" : ""}"
+    width="${size}" height="${size}" src="${previewSrc(t.id, 0, 320)}"
+    loading="lazy" decoding="async" alt="" data-action="preview"
+    title="${covered(t.id, t.nsfw) ? "Marked adult — click to uncover" : `Click for the full size${more}`}">`;
+}
+
+// --- the lightbox -----------------------------------------------------------
+
+let viewing = null;
+
+async function openLightbox(id, index = 0) {
+  let body;
+  try { body = await previewsFor(id); }
+  catch (e) { message(e.message, true); return; }
+  if (!body.previews.length) { message("no sample images came with this one"); return; }
+
+  const task = tasks.get(id);
+  viewing = { id, index, items: body.previews };
+  $("preview-title").textContent = task ? (task.filename || task.source) : "Sample";
+  renderLightbox();
+  openModal("preview-backdrop");
+}
+
+function step(by) {
+  if (!viewing) return;
+  const count = viewing.items.length;
+  viewing.index = (viewing.index + by + count) % count;
+  renderLightbox();
+}
+
+function renderLightbox() {
+  if (!viewing) return;
+  const { id, index, items } = viewing;
+  const item = items[index];
+  const hidden = covered(id, item.nsfw);
+  $("preview-count").textContent = items.length > 1 ? `${index + 1} of ${items.length}` : "";
+
+  // Videos arrive in the same list as the pictures and have to be played rather than drawn.
+  // Asked for at full size, so this is the clip itself, not the poster frame the rows use.
+  const media = item.type === "video"
+    ? `<video src="${previewSrc(id, index)}" autoplay loop muted playsinline controls></video>`
+    : `<img src="${previewSrc(id, index, 1024)}" alt="">`;
+
+  $("preview-stage").innerHTML =
+    (items.length > 1 ? `<button class="nav" data-step="-1" title="Previous">‹</button>` : "")
+    + `<div class="frame ${hidden ? "covered" : ""}">${media}`
+    + (hidden ? `<button class="uncover">Marked adult — show it</button>` : "")
+    + `</div>`
+    + (items.length > 1 ? `<button class="nav" data-step="1" title="Next">›</button>` : "");
+
+  $("preview-strip").hidden = items.length < 2;
+  $("preview-strip").innerHTML = items.map((p, i) => `
+    <img class="shot ${i === index ? "current" : ""} ${covered(id, p.nsfw) ? "covered" : ""}"
+         src="${previewSrc(id, i, 160)}" data-index="${i}" loading="lazy" alt="">`).join("");
+
+  $("preview-meta").innerHTML = metaHtml(item);
+
+  $("preview-stage").querySelectorAll("[data-step]").forEach((b) => {
+    b.onclick = () => step(Number(b.dataset.step));
+  });
+  const uncover = $("preview-stage").querySelector(".uncover");
+  if (uncover) uncover.onclick = () => { revealed.add(id); renderLightbox(); render(); };
+  $("preview-strip").querySelectorAll(".shot").forEach((img) => {
+    img.onclick = () => { viewing.index = Number(img.dataset.index); renderLightbox(); };
+  });
+  wireCopies($("preview-meta"));
+}
+
+// The settings that produced the picture. A LoRA's trigger words say which tokens wake it
+// up and nothing about the prompt around them; this is that prompt, from someone who knew.
+function metaHtml(item) {
+  const meta = item.meta || {};
+  const rows = [];
+  const add = (label, value, copyable) => {
+    if (!value) return;
+    const text = escapeHtml(String(value));
+    rows.push(`<dt>${escapeHtml(label)}</dt><dd>`
+      + `<span data-role="${copyable || ""}">${text}</span>`
+      + (copyable ? ` <button class="mini" data-copy="${copyable}">Copy</button>` : "")
+      + `</dd>`);
+  };
+  add("Prompt", meta.prompt, "prompt");
+  add("Negative", meta.negative_prompt, "negative");
+  add("Settings", [
+    meta.model, meta.sampler,
+    meta.steps && `${meta.steps} steps`,
+    meta.cfg_scale && `cfg ${meta.cfg_scale}`,
+    meta.seed && `seed ${meta.seed}`,
+    meta.clip_skip && `clip skip ${meta.clip_skip}`,
+    meta.size,
+  ].filter(Boolean).join(" · "));
+  // rel=noreferrer for the same reason the record's link has it: the service has no
+  // business learning which of someone's downloads they were looking at.
+  if (item.url) {
+    rows.push(`<dt>Original</dt><dd><a href="${escapeHtml(item.url)}"
+      target="_blank" rel="noopener noreferrer">open it on the service</a></dd>`);
+  }
+  return rows.length ? rows.join("")
+    : `<dt></dt><dd class="muted">No generation settings were published with this one.</dd>`;
+}
+
+// Copy buttons, wherever they appear: the prompt is the thing people came for, and
+// selecting four hundred characters by hand is not a way to get it.
+function wireCopies(holder) {
+  holder.querySelectorAll("[data-copy]").forEach((button) => {
+    button.onclick = async () => {
+      const source = holder.querySelector(`[data-role="${button.dataset.copy}"]`);
+      if (!source) return;
+      await navigator.clipboard.writeText(source.textContent);
+      button.textContent = "Copied";
+      setTimeout(() => (button.textContent = "Copy"), 1500);
+    };
+  });
+}
+
+function closePreview() {
+  viewing = null;
+  $("preview-stage").innerHTML = "";   // stops a video that is still playing
+  closeModal("preview-backdrop");
 }
 
 // --- the stored record ------------------------------------------------------
@@ -315,39 +485,72 @@ function recordHtml(record, path) {
   if (words.length) {
     add("Triggers",
       `<span class="mono" data-role="triggers">${escapeHtml(words.join(", "))}</span>`
-      + ` <button data-action="copy-triggers" style="padding:1px 8px;font-size:11.5px">Copy</button>`);
+      + ` <button class="mini" data-copy="triggers">Copy</button>`);
   }
   add("Record", `<span class="mono">${escapeHtml(path)}</span>`);
 
   return `<dl class="record">${rows.join("")}
     <pre hidden data-role="raw">${escapeHtml(JSON.stringify(record, null, 2))}</pre>
-    <dt></dt><dd><button data-action="raw" style="padding:2px 9px;font-size:12px">Raw JSON</button></dd>
+    <dt></dt><dd><button class="mini" data-action="raw">Raw JSON</button></dd>
   </dl>`;
+}
+
+// Every sample, where the whole story of the file is already being told. One request, made
+// when the panel opens and never on the way past.
+async function galleryHtml(id) {
+  const task = tasks.get(id);
+  if (!task || !task.previews) return "";
+  let items;
+  try { ({ previews: items } = await previewsFor(id)); }
+  catch { return ""; }
+  return `<div class="strip inline">` + items.map((p, i) => `
+    <img class="shot ${covered(id, p.nsfw) ? "covered" : ""}" src="${previewSrc(id, i, 240)}"
+         data-index="${i}" loading="lazy" decoding="async" alt=""
+         title="Click for the full size">`).join("") + `</div>`;
 }
 
 async function toggleRecord(id, node) {
   const holder = node.querySelector('[data-role="record"]');
   if (holder.innerHTML) { holder.innerHTML = ""; return; }
-  const { record, path } = await api(`/api/tasks/${id}/record`);
-  holder.innerHTML = recordHtml(record, path);
 
-  holder.querySelector('[data-action="raw"]').onclick = (e) => {
-    const raw = holder.querySelector('[data-role="raw"]');
-    raw.hidden = !raw.hidden;
-    e.target.textContent = raw.hidden ? "Raw JSON" : "Hide JSON";
+  const gallery = await galleryHtml(id);
+  let written;
+  try {
+    const { record, path } = await api(`/api/tasks/${id}/record`);
+    written = recordHtml(record, path);
+  } catch (e) {
+    // Two separate things to have. A file downloaded with sidecars turned off still came
+    // with its pictures, and putting them behind a record that was never written would
+    // hide them for exactly the people who chose not to have the record.
+    if (!gallery) throw e;
+    written = `<div class="small muted" style="margin-top:8px">${escapeHtml(e.message)}</div>`;
+  }
+
+  holder.innerHTML = gallery + written;
+  holder.querySelectorAll(".shot").forEach((img) => {
+    img.onclick = () => openLightbox(id, Number(img.dataset.index));
+  });
+
+  const raw = holder.querySelector('[data-action="raw"]');
+  if (raw) raw.onclick = (e) => {
+    const json = holder.querySelector('[data-role="raw"]');
+    json.hidden = !json.hidden;
+    e.target.textContent = json.hidden ? "Raw JSON" : "Hide JSON";
   };
-  const copy = holder.querySelector('[data-action="copy-triggers"]');
-  if (copy) copy.onclick = async (e) => {
-    await navigator.clipboard.writeText(
-      holder.querySelector('[data-role="triggers"]').textContent);
-    e.target.textContent = "Copied";
-    setTimeout(() => (e.target.textContent = "Copy"), 1500);
-  };
+  wireCopies(holder);
 }
 
 async function act(id, action, node) {
   try {
     if (action === "record") { await toggleRecord(id, node); return; }
+    // A covered picture takes one click to uncover and the next one to open. Opening it
+    // full-screen on the first click is exactly what the cover exists to prevent.
+    if (action === "preview") {
+      const task = tasks.get(id);
+      if (task && covered(id, task.nsfw)) { revealed.add(id); render(); return; }
+      await openLightbox(id, 0);
+      return;
+    }
     if (action === "expand") {
       if (!expanded.delete(id)) expanded.add(id);
       render();
@@ -355,13 +558,15 @@ async function act(id, action, node) {
     }
     // The server knows where the file went; it does not need to be told by the page.
     if (action === "open-folder") { await api(`/api/tasks/${id}/reveal`, { method: "POST" }); return; }
+    if (action === "where") { await askWhere(id); return; }
+    // The same dialog, asked a different question. "Where should this go?" and "this went
+    // to the wrong place" want the identical ranked list of folders; only what happens on
+    // the click differs, so only that is passed in.
+    if (action === "move") { await askWhere(id, "move"); return; }
     if (action === "cancel") await api(`/api/tasks/${id}`, { method: "DELETE" });
-    else if (action === "confirm") {
-      const picked = node.querySelector('[data-role="category"]');
-      await api(`/api/tasks/${id}/confirm`, {
-        method: "POST", body: JSON.stringify({ category: picked ? picked.value : null }),
-      });
-    } else await api(`/api/tasks/${id}/${action}`, { method: "POST" });
+    // Accepting the placement the card already spells out: no correction to send with it.
+    else if (action === "confirm") await api(`/api/tasks/${id}/confirm`, { method: "POST", body: "{}" });
+    else await api(`/api/tasks/${id}/${action}`, { method: "POST" });
     message("");
   } catch (e) { message(e.message, true); }
 }
@@ -375,6 +580,16 @@ function connect() {
     if (data.type === "task") { if (upsert(data.task)) render(); }
     else if (data.type === "removed") { tasks.delete(data.id); render(); }
     else if (data.type === "reload") load();
+    // A move within a drive is a rename and reports nothing, because it is over before it
+    // could. This is the other kind: every byte of the file, read and written again.
+    else if (data.type === "moving") {
+      const share = data.total ? Math.round((data.copied / data.total) * 100) : 0;
+      message(`moving… ${fmtBytes(data.copied)} / ${fmtBytes(data.total)} (${share}%)`);
+      // Driven by the stream rather than by whoever started the move, so the button is
+      // there after a reload and in a second tab — the copy outlives both.
+      stoppable(data.id);
+    }
+    else if (data.type === "moved") stoppable(null);
     else if (data.type === "progress") {
       const task = tasks.get(data.id);
       if (!task) return;
@@ -427,6 +642,160 @@ function updateTotals() {
   node.textContent = `· ${parts.join(" · ")}`;
 }
 
+// --- choosing a folder ------------------------------------------------------
+
+// The answer to "where does this go?" is a folder in the library, not one of our internal
+// category names — the folder a model belongs in is often one we deliberately refuse to
+// claim automatically, and a list of categories cannot express it.
+let choosing = null;
+
+async function askWhere(id, mode = "confirm") {
+  const task = tasks.get(id);
+  if (!task) return;
+  let body;
+  try { body = await api(`/api/tasks/${id}/folders`); }
+  catch (e) { message(e.message, true); return; }
+
+  if (!body.root) {
+    message("No library root is set, so everything goes to one folder — set one in Settings.");
+    return;
+  }
+  choosing = { id, mode, ...body };
+  // The question here is what kind of thing this is, and the picture answers it faster than
+  // the filename ever does — this is the one dialog where a person is deciding, not reading.
+  $("folders-preview").innerHTML = task.previews ? thumbHtml(task, 120) : "";
+  const shown = $("folders-preview").querySelector(".thumb");
+  if (shown) shown.onclick = () => {
+    if (covered(id, task.nsfw)) { revealed.add(id); $("folders-preview").innerHTML = thumbHtml(task, 120); askWhere(id); }
+    else openLightbox(id, 0);
+  };
+  $("folders-file").textContent = mode === "move"
+    ? `${task.filename || task.source} → move it, and its sidecars, under ${body.root}`
+    : `${task.filename || task.source} → somewhere under ${body.root}`;
+  // Only offered after the fact. Before a download lands there is nothing to move, and a
+  // destination off the library would be a placement the layout cannot express.
+  $("folders-browse").hidden = mode !== "move";
+  $("folders-search").value = "";
+  $("folders-remember").checked = false;
+  renderFolders();
+  openModal("folders-backdrop", "folders-search");
+}
+
+// A typed path is offered as a row of its own: the folder a file needs may not exist yet,
+// and that is the case the old category list handled worst.
+const typeable = (text) =>
+  text && !text.startsWith("/") && !text.startsWith("\\")
+  && !/^[a-z]:/i.test(text) && !text.split(/[\\/]/).includes("..");
+
+function renderFolders() {
+  const typed = $("folders-search").value.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+  const wanted = typed.toLowerCase();
+  const rows = choosing.folders.filter((f) => f.relative.toLowerCase().includes(wanted));
+  const html = [];
+  if (typed && typeable(typed) && !rows.some((f) => f.relative.toLowerCase() === wanted)) {
+    html.push(folderRow(
+      { relative: typed, category: null,
+        reason: choosing.mode === "move" ? "created by the move" : "created when the file lands" },
+      "new"));
+  }
+  html.push(...rows.map((f) => folderRow(f, f.exists ? "" : "absent")));
+
+  $("folders-list").innerHTML = html.join("")
+    || `<div class="small muted">Nothing matches. Type a folder to use it anyway.</div>`;
+  $("folders-list").querySelectorAll(".folder").forEach((button) => {
+    button.onclick = () => useFolder(button.dataset.folder, button.dataset.kind);
+  });
+}
+
+function folderRow(folder, extra) {
+  const note = [folder.reason, folder.models ? `${folder.models} model${folder.models > 1 ? "s" : ""}` : ""]
+    .filter(Boolean).join(" · ");
+  return `
+    <button class="folder ${extra}" data-folder="${escapeHtml(folder.relative)}"
+            data-kind="${escapeHtml(folder.category || "")}">
+      <span class="path">${escapeHtml(folder.relative)}</span>
+      <span class="note">${escapeHtml(note)}</span>
+    </button>`;
+}
+
+async function useFolder(relative, kind) {
+  const asked = $("folders-remember").checked;
+  // Only a folder that names a kind can stand for that kind from now on. `checkpoints/Krea 2`
+  // as the home of every future checkpoint is not what anybody meant to ask for, so the
+  // request says so rather than the checkbox quietly doing nothing.
+  const remember = asked && !!kind;
+  const moving = choosing.mode === "move";
+  const endpoint = moving ? "move" : "confirm";
+  let result;
+  try {
+    // Across two drives this copies the whole file, so the dialog stays up and says so
+    // rather than closing on a request that has not finished. Closing first would leave
+    // the old folder on the card for however long the copy takes, which reads as a move
+    // that did nothing.
+    if (moving) message(`moving into ${relative}…`);
+    result = await api(`/api/tasks/${choosing.id}/${endpoint}`, {
+      method: "POST", body: JSON.stringify({ folder: relative, remember }),
+    });
+  } catch (e) { message(e.message, true); return; }
+
+  closeFolders();
+  if (result.stopped) { stopped(); return; }
+  if (moving) { reportMove(result, relative, asked); return; }
+  message(remember ? `filing into ${relative} — every ${kind} goes here now`
+    : asked ? `filing into ${relative} — it names no kind, so the mapping is unchanged`
+    : `filing into ${relative}`);
+  if (remember) loadSettings();
+}
+
+// The task whose move can be stopped right now, or null, and whether stopping it has
+// already been asked for. Held here rather than passed around because the button outlives
+// the call that started the move.
+let stopping = null;
+let stopAsked = false;
+
+function stoppable(id) {
+  // Progress keeps arriving after the ask — the block in flight still has to land — and
+  // redrawing the button from that would put it back to "Stop the move" moments after it
+  // was pressed, which reads as a press that did not register.
+  if (id !== stopping) stopAsked = false;
+  stopping = id;
+  const button = $("move-stop");
+  button.hidden = id === null;
+  button.disabled = stopAsked;
+  button.textContent = stopAsked ? "stopping…" : "Stop the move";
+}
+
+function stopped() {
+  stoppable(null);
+  message("the move was stopped — the file has not been touched");
+}
+
+function reportMove(result, label, asked) {
+  stoppable(null);
+  if (result.unchanged) { message(`already in ${label}`); return; }
+
+  // A companion left behind is the failure worth saying out loud: the model arrived, so
+  // nothing looks wrong until a model manager shows a card with no picture.
+  if (result.failed && result.failed.length) {
+    message(`moved into ${label}, but ${result.failed.length} file(s) stayed behind: `
+      + result.failed.map((f) => `${f.path} (${f.reason})`).join("; "), true);
+    return;
+  }
+  const also = result.moved ? ` with ${result.moved} sidecar${result.moved > 1 ? "s" : ""}` : "";
+  // Whether the mapping changed is the server's answer, not a guess from the folder name:
+  // only some folder names are a kind, and it is the side that knows which.
+  const kind = result.remembered;
+  message(kind ? `moved into ${label}${also} — every ${kind} goes here now`
+    : asked ? `moved into ${label}${also} — it names no kind, so the mapping is unchanged`
+    : `moved into ${label}${also}`);
+  if (kind) loadSettings();
+}
+
+function closeFolders() {
+  choosing = null;
+  closeModal("folders-backdrop");
+}
+
 // Said while the queue is being assembled, "this will not fit" is one line and a decision
 // about what to drop. Said by the disk at four in the morning, it is a row of failures.
 async function refreshSpace() {
@@ -448,31 +817,37 @@ const FIELDS = ["library_root", "profile", "connections", "concurrent_downloads"
                 "disk_kind", "sidecar_dir", "hf_engine", "queue_position", "max_speed_kb"];
 const CHECKS = ["group_by_base_model", "verify_hash", "write_sidecars",
                 "write_compat_files", "write_trigger_txt", "hf_fallback", "auto_start",
-                "auto_retry"];
+                "auto_retry", "fetch_previews", "blur_nsfw"];
 
-const settingsOpen = () => $("settings-backdrop").classList.contains("open");
+const modalOpen = (id) => $(id).classList.contains("open");
 
-function openSettings() {
-  $("settings-backdrop").classList.add("open");
+function openModal(id, focus) {
+  $(id).classList.add("open");
   // The queue behind the dialog must not scroll under it, and typing should land in the
   // dialog rather than in the link box it is covering.
   document.body.style.overflow = "hidden";
-  $("library_root").focus();
+  if (focus) $(focus).focus();
 }
 
+function closeModal(id, focus) {
+  $(id).classList.remove("open");
+  if (!document.querySelector(".modal-backdrop.open")) document.body.style.overflow = "";
+  if (focus) $(focus).focus();
+}
+
+function openSettings() { openModal("settings-backdrop", "library_root"); }
+
 function closeSettings() {
-  $("settings-backdrop").classList.remove("open");
-  document.body.style.overflow = "";
+  closeModal("settings-backdrop", "source");
   $("layout").textContent = "";
-  $("source").focus();
 }
 
 async function loadSettings() {
-  const { settings, categories: cats, error } = await api("/api/settings");
-  categories = cats;
+  const { settings, error } = await api("/api/settings");
   if (error) { message(error, true); openSettings(); }
   FIELDS.forEach((k) => { if ($(k)) $(k).value = settings[k] ?? ""; });
   CHECKS.forEach((k) => { if ($(k)) $(k).checked = !!settings[k]; });
+  blurNsfw = !!settings.blur_nsfw;
   $("hf_token").placeholder = settings.hf_token_from_env
     ? "set from $HF_TOKEN" : settings.hf_token_set ? "saved — leave blank to keep" : "not set";
   $("civitai_token").placeholder = settings.civitai_token_from_env
@@ -509,6 +884,52 @@ $("show-layout").onclick = async () => {
 $("toggle-settings").onclick = openSettings;
 $("close-settings").onclick = closeSettings;
 $("settings-backdrop").addEventListener("click", (e) => { if (e.target === $("settings-backdrop")) closeSettings(); });
+
+$("close-preview").onclick = closePreview;
+$("preview-backdrop").addEventListener("click", (e) => { if (e.target === $("preview-backdrop")) closePreview(); });
+
+$("folders-browse").onclick = async () => {
+  const asked = $("folders-remember").checked;
+  const id = choosing.id;
+  let result;
+  try {
+    // The dialog is the operating system's, so it stays up until it is answered and this
+    // request stays open with it. Nothing is sent but the checkbox: the folder is chosen
+    // on the other side of it and never travels through this page.
+    message("choose a folder…");
+    result = await api(`/api/tasks/${id}/move-anywhere`, {
+      method: "POST", body: JSON.stringify({ remember: asked }),
+    });
+  } catch (e) { message(e.message, true); return; }
+
+  if (result.cancelled) { message(""); return; }
+  closeFolders();
+  if (result.stopped) { stopped(); return; }
+  reportMove(result, result.folder, asked);
+};
+
+$("move-stop").onclick = async () => {
+  const id = stopping;
+  if (id === null) return;
+  // Left visible but dead: the copy stops between blocks, so there is a moment where the
+  // press has landed and nothing has happened yet, and a button that vanishes in it reads
+  // as one that did nothing.
+  stopAsked = true;
+  stoppable(id);
+  try { await api(`/api/tasks/${id}/move/stop`, { method: "POST" }); }
+  catch (e) { message(e.message, true); stopAsked = false; stoppable(id); }
+};
+
+$("close-folders").onclick = closeFolders;
+$("folders-backdrop").addEventListener("click", (e) => { if (e.target === $("folders-backdrop")) closeFolders(); });
+$("folders-search").oninput = () => renderFolders();
+$("folders-search").addEventListener("keydown", (e) => {
+  // Type enough to identify the folder, press Enter, done — the list is ranked, so the top
+  // row is the answer far more often than not.
+  if (e.key !== "Enter") return;
+  const first = $("folders-list").querySelector(".folder");
+  if (first) first.click();
+});
 
 $("add").onclick = async () => {
   const source = $("source").value.trim();
@@ -585,14 +1006,24 @@ document.querySelectorAll(".btn-browse").forEach((btn) => {
   };
 });
 
+const anyModalOpen = () => !!document.querySelector(".modal-backdrop.open");
+
 window.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
-    if (settingsOpen()) closeSettings();
+    // Innermost first: the lightbox can be opened from the folder dialog, and closing both
+    // with one press would throw away the question that was being answered.
+    if (modalOpen("preview-backdrop")) closePreview();
+    else if (modalOpen("folders-backdrop")) closeFolders();
+    else if (modalOpen("settings-backdrop")) closeSettings();
     else message("");
   }
+  if (modalOpen("preview-backdrop") && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+    e.preventDefault();
+    step(e.key === "ArrowLeft" ? -1 : 1);
+  }
   // Paste anywhere and the link lands in the box it was meant for — unless something is
-  // already taking the keystroke, or the settings dialog is what is in front of you.
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "v" && !settingsOpen()) {
+  // already taking the keystroke, or a dialog is what is in front of you.
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "v" && !anyModalOpen()) {
     const active = document.activeElement;
     if (!active || (active.tagName !== "INPUT" && active.tagName !== "TEXTAREA" && active.tagName !== "SELECT")) {
       $("source").focus();

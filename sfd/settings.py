@@ -68,7 +68,15 @@ class Settings:
     hf_xet_sequential_writes: bool = False
 
     write_sidecars: bool = True
+    # The sample images a model is published with: shown in the queue, and stored beside the
+    # model when the compatibility files are on. Turned off, no picture is ever requested.
     fetch_previews: bool = True
+    # Where fetched previews are kept. A cache, not a library: it holds thumbnails nobody
+    # asked to keep, and deleting it costs one round trip per picture.
+    preview_dir: str = "previews"
+    # Civitai marks its own samples, and a model's pictures appearing unasked in a queue on
+    # a shared screen is its own kind of problem. Covered until clicked.
+    blur_nsfw: bool = True
     # Where our own `<name>.json` records go. Empty keeps them beside the model; a path
     # collects them in one place, mirroring the library's folder structure so names cannot
     # collide. The compatibility files stay put regardless — see write_compat_files.

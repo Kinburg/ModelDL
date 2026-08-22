@@ -154,7 +154,7 @@ def open_system_path(path: str) -> bool:
 class ServerThread(threading.Thread):
     """Runs Uvicorn in a background thread with clean shutdown support."""
 
-    def __init__(self, app: FastAPI, host: str, port: int) -> None:
+    def __init__(self, app: FastAPI, host: str, port: int, sock: socket.socket | None = None) -> None:
         super().__init__(daemon=True, name="UvicornServerThread")
         config = uvicorn.Config(
             app=app,
@@ -164,12 +164,51 @@ class ServerThread(threading.Thread):
             access_log=False,
         )
         self.server = uvicorn.Server(config)
+        self._sockets = [sock] if sock is not None else None
 
     def run(self) -> None:
-        self.server.run()
+        self.server.run(sockets=self._sockets)
 
     def stop(self) -> None:
         self.server.should_exit = True
+
+
+def bind_local_port(host: str, port: int, tries: int = 12) -> tuple[socket.socket, int]:
+    """Claim the listening socket up front, and move off a port we cannot have.
+
+    Uvicorn binds *after* it has run the app's lifespan, so a port it cannot get leaves a
+    started-then-stopped app behind and reports only that the server never came up. Doing
+    it in this order surfaces the real error instead, before anything has been opened.
+
+    On Windows the port can be unusable through no fault of ours. Hyper-V, WSL and Docker
+    reserve blocks of ports at boot -- `netsh interface ipv4 show excludedportrange
+    protocol=tcp` lists them -- and binding inside one fails with WinError 10013,
+    "forbidden by its access permissions", rather than the "in use" you would expect. The
+    blocks move on every reboot, so a port that worked yesterday can be gone today with
+    nothing to show for it.
+
+    Those blocks are a hundred ports wide, so the next port up is no escape from one --
+    the candidates step over a whole block at a time. Port 0 is the last resort: the OS
+    picks, and it never picks a port it has reserved.
+    """
+    candidates = [port, *(port + 100 * step for step in range(1, tries)), 0]
+    first_error: OSError | None = None
+
+    for candidate in candidates:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            # Bound but deliberately not listening: asyncio calls listen() itself when
+            # uvicorn hands it the socket. Bind is the step that fails on a taken or
+            # reserved port, which is all we need to know here.
+            sock.bind((host, candidate))
+        except OSError as exc:
+            sock.close()
+            first_error = first_error or exc
+            continue
+        return sock, sock.getsockname()[1]
+
+    assert first_error is not None
+    raise RuntimeError(f"could not bind a port on {host}: {first_error}") from first_error
 
 
 def wait_for_server(host: str, port: int, timeout: float = 5.0) -> bool:
@@ -189,6 +228,21 @@ def is_gui_available() -> bool:
     return webview is not None
 
 
+def window_icon() -> str | None:
+    """The .ico for the window's title bar, taskbar button and Alt-Tab entry.
+
+    None is the right answer inside the built exe: the logo is not bundled as a file there,
+    and pywebview then takes the icon out of the running executable, which PyInstaller has
+    already stamped with this same image. From source there is no such thing to fall back
+    on -- without this the window would wear the Python logo.
+
+    Windows wants a real .ico here; this is handed to System.Drawing.Icon, which does not
+    read PNG.
+    """
+    icon = Path(__file__).parent / "logo" / "logo.ico"
+    return str(icon) if icon.is_file() else None
+
+
 def launch_desktop(
     app: FastAPI,
     host: str = "127.0.0.1",
@@ -196,6 +250,7 @@ def launch_desktop(
     width: int = 1120,
     height: int = 780,
     debug: bool = False,
+    sock: socket.socket | None = None,
 ) -> int:
     """Launch the FastAPI server and open the native pywebview desktop window."""
     if not is_gui_available():
@@ -203,7 +258,7 @@ def launch_desktop(
             "pywebview is not installed. Install it with: pip install pywebview"
         )
 
-    server_thread = ServerThread(app, host=host, port=port)
+    server_thread = ServerThread(app, host=host, port=port, sock=sock)
     server_thread.start()
 
     if not wait_for_server(host, port):
@@ -229,7 +284,7 @@ def launch_desktop(
     try:
         # On Windows, EdgeChromium (WebView2) provides full modern web support
         gui = "edgechromium" if sys.platform == "win32" else None
-        webview.start(debug=debug, gui=gui)
+        webview.start(debug=debug, gui=gui, icon=window_icon())
     finally:
         # Window closed by user -> cleanly shutdown backend server
         server_thread.stop()

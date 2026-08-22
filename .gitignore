@@ -11,6 +11,9 @@ settings.local.json
 queue.db
 queue.db-journal
 
+# Cached preview images — refetched on demand
+previews/
+
 # Python
 __pycache__/
 *.py[cod]

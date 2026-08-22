@@ -37,6 +37,7 @@ from .errors import (
     AuthRequired,
     ChecksumMismatch,
     NotBinaryContent,
+    RangeIgnored,
     RangeNotHonored,
     RemoteChanged,
     Retryable,
@@ -192,7 +193,7 @@ class Transfer:
                     # us a partial download. Restarting from zero is precisely the behaviour
                     # this project exists to prevent, so refuse and let the caller retry
                     # later against a node that behaves.
-                    raise RangeNotHonored(
+                    raise RangeIgnored(
                         "the server stopped honouring byte ranges while a partial download "
                         f"of {state.chunk_map.completed_prefix()} bytes exists — refusing to "
                         "restart from zero"
@@ -369,9 +370,13 @@ class Transfer:
             except Retryable as exc:
                 last = exc
                 attempts += 1
-                if isinstance(exc, SignatureExpired):
+                if isinstance(exc, (SignatureExpired, RangeIgnored)):
                     # Mint a replacement now, naming the URL that died so concurrent
                     # workers hitting the same wall do not each trigger a round trip.
+                    # An expired signature has to be replaced; a URL whose edge stopped
+                    # honouring Range does not, but retrying the same one is how you get
+                    # the same edge again, and a re-resolve is the only lever we have on
+                    # which node answers.
                     await self._resolve(client, stale_url=target.url)
             else:
                 # No exception but no progress either (server closed early). Still counts
@@ -485,17 +490,17 @@ class Transfer:
             # would corrupt the part file; truncating and restarting would throw away good
             # bytes. Refuse, and let the retry loop get a fresh URL.
             if start != 0 or (size is not None and end != size - 1):
-                raise RangeNotHonored(
+                raise RangeIgnored(
                     f"asked for bytes {start}-{end} but the server sent the whole file"
                 )
         elif status == 206:
             header = resp.headers.get("content-range", "")
             match = _CONTENT_RANGE.search(header)
             if not match:
-                raise RangeNotHonored(f"206 with unparsable Content-Range: {header!r}")
+                raise RangeIgnored(f"206 with unparsable Content-Range: {header!r}")
             got_start, _got_end, total = int(match.group(1)), match.group(2), match.group(3)
             if got_start != start:
-                raise RangeNotHonored(
+                raise RangeIgnored(
                     f"asked to resume at {start} but the server started at {got_start}"
                 )
             if size is not None and total != "*" and int(total) != size:

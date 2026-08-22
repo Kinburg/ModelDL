@@ -40,7 +40,8 @@ class Layout:
     ambiguities: dict[Category, list[str]] = field(default_factory=dict)
     group_by_base_model: bool = True
 
-    def destination(self, verdict: Verdict, filename: str) -> Path:
+    def directory_for(self, verdict: Verdict) -> Path:
+        """The folder this verdict files into, base-model grouping included."""
         directory = self.paths.get(verdict.category, self.root / "other")
         if (
             self.group_by_base_model
@@ -50,7 +51,10 @@ class Layout:
             group = _folder_safe(verdict.base_model)
             if group:
                 directory = directory / group
-        return directory / filename
+        return directory
+
+    def destination(self, verdict: Verdict, filename: str) -> Path:
+        return self.directory_for(verdict) / filename
 
     # --- persistence ------------------------------------------------------
 

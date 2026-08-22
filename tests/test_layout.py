@@ -175,6 +175,32 @@ def test_sidecar_keeps_the_things_that_are_otherwise_lost(tmp_path: Path):
     assert (tmp_path / "style.civitai.info").exists()
 
 
+def test_sidecar_keeps_the_prompts_the_samples_were_made_with(tmp_path: Path):
+    """Trigger words say which tokens wake a LoRA up. The sample prompts say what a working
+    prompt around them looks like, and they exist nowhere once the model page is gone."""
+    model = tmp_path / "ollie.safetensors"
+    model.write_bytes(b"weights")
+    record = Record(
+        filename=model.name,
+        provider="civitai",
+        meta={
+            "previews": [
+                {
+                    "url": "https://image.civitai.com/b/one/width=450/a.jpeg",
+                    "type": "image", "nsfw": False,
+                    "meta": {"prompt": "sick ollie, a cat on a skateboard", "seed": 1},
+                },
+                {"url": "https://image.civitai.com/b/two/width=450/b.mp4", "type": "video"},
+            ]
+        },
+    )
+    write(model, Verdict(Category.LORA, "high", "named as one"), record)
+
+    kept = read(model)["previews"]
+    assert kept[0]["meta"]["prompt"] == "sick ollie, a cat on a skateboard"
+    assert kept[1]["type"] == "video" and kept[1]["nsfw"] is False
+
+
 def test_sidecar_records_a_disagreement_for_later(tmp_path: Path):
     model = tmp_path / "ollie.safetensors"
     model.write_bytes(b"weights")

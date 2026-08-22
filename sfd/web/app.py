@@ -17,7 +17,8 @@ import sys
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Request
+import httpx
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -26,8 +27,8 @@ from ..core.diskinfo import free_bytes
 from ..jobs import db
 from ..jobs.db import Database
 from ..jobs.manager import Manager
-from ..library import sidecar
-from ..library.categories import Category
+from ..library import folders, previews, relocate, sidecar
+from ..library.categories import ALIASES, Category
 from ..library.layout import adopt
 from ..settings import Settings
 
@@ -45,6 +46,11 @@ def _get_static_dir() -> Path:
 
 STATIC = _get_static_dir()
 HEARTBEAT = 20.0
+
+# A preview never changes under its URL — the CDN path contains the image's own id — so the
+# browser is told not to ask again. Without this the queue would re-request every thumbnail
+# on every redraw, and the list redraws whenever any task changes state.
+IMAGE_CACHE = {"Cache-Control": "private, max-age=604800"}
 
 # Names this server answers to. Anything else arriving at the loopback socket got here under
 # a hostname that resolves to 127.0.0.1 but is not ours — see `_local_only` below.
@@ -65,6 +71,23 @@ class AddRequest(BaseModel):
 
 class ConfirmRequest(BaseModel):
     category: str | None = None
+    # A folder relative to the library root, as offered by /folders or typed by hand. It does
+    # not have to exist yet — the transfer creates it when the file lands.
+    folder: str | None = None
+    # Make this the home of the folder's kind from now on, not just for this file.
+    remember: bool = False
+
+
+class MoveRequest(BaseModel):
+    # A folder relative to the library root. Unlike ConfirmRequest's, this one takes effect
+    # immediately rather than when a download lands, so an empty value has nothing to mean.
+    folder: str
+    remember: bool = False
+
+
+class BrowseMoveRequest(BaseModel):
+    # No folder field, and that is the point — see the endpoint.
+    remember: bool = False
 
 
 class ReorderRequest(BaseModel):
@@ -114,6 +137,8 @@ class SettingsPatch(BaseModel):
 
     write_sidecars: bool | None = None
     fetch_previews: bool | None = None
+    blur_nsfw: bool | None = None
+    preview_dir: str | None = None
     sidecar_dir: str | None = None
     write_compat_files: bool | None = None
     write_trigger_txt: bool | None = None
@@ -124,6 +149,13 @@ class SettingsPatch(BaseModel):
 def create_app(settings: Settings, database: Database) -> FastAPI:
     manager = Manager(settings, database)
 
+    # One client for every preview this process ever fetches. Building one per request
+    # would open a fresh TLS session for each thumbnail in a screenful of them.
+    images = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=10.0, read=30.0, write=15.0, pool=10.0),
+        follow_redirects=True,
+    )
+
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI):
         await manager.start()
@@ -131,6 +163,7 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
             yield
         finally:
             await manager.stop()
+            await images.aclose()
             database.close()
 
     app = FastAPI(
@@ -193,12 +226,175 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
         manager.retry(task_id)
         return {"ok": True}
 
+    @app.get("/api/tasks/{task_id}/folders")
+    async def offer_folders(task_id: int) -> dict[str, Any]:
+        """Where this file could go, best guesses first.
+
+        The list is the library as it really is, not the canonical category names: the folder
+        a model actually belongs in is often one we deliberately refuse to claim
+        automatically, and until it is on the list the question cannot be answered correctly.
+        """
+        task = database.get(task_id)
+        if task is None:
+            raise HTTPException(404, "no such task")
+        if not settings.library_root:
+            return {"root": "", "folders": [], "category": None}
+
+        category = Category(task.category) if task.category in Category._value2member_map_ else None
+        offered = folders.offer(manager.layout(), category, task.base_model, task.filename)
+        return {
+            "root": settings.library_root,
+            "category": category.value if category else None,
+            "base_model": task.base_model,
+            "folders": [f.to_json() for f in offered],
+        }
+
     @app.post("/api/tasks/{task_id}/confirm")
     async def confirm(task_id: int, request: ConfirmRequest) -> dict[str, bool]:
         if request.category and request.category not in Category._value2member_map_:
             raise HTTPException(400, f"unknown category {request.category}")
-        manager.confirm(task_id, request.category)
+
+        chosen: Path | None = None
+        if request.folder:
+            chosen = folders.resolve_inside(Path(settings.library_root), request.folder)
+            if chosen is None:
+                raise HTTPException(400, f"{request.folder} is not inside the library root")
+
+        manager.confirm(task_id, request.category, chosen)
+
+        # "Always put this kind here" is a different statement from "put this file here", so
+        # it is only taken when the folder itself names a kind: remembering `checkpoints/Krea
+        # 2` would send every future checkpoint into one base model's folder.
+        if request.remember and chosen is not None:
+            kind = ALIASES.get(chosen.name.lower())
+            if kind is not None:
+                settings.layout_overrides[kind.value] = str(chosen)
+                settings.save()
         return {"ok": True}
+
+    async def _run_move(task_id: int, folder: Path) -> relocate.Move | None:
+        """Run a move, turning every way it can end into the right status code.
+
+        None is the one outcome that is not a failure: somebody pressed stop, and the file
+        is still exactly where it was.
+        """
+        try:
+            return await manager.move(task_id, folder)
+        except relocate.Cancelled:
+            return None
+        except LookupError:
+            raise HTTPException(404, "no such task") from None
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from None
+        except FileExistsError as exc:
+            raise HTTPException(409, str(exc)) from None
+        except OSError as exc:
+            raise HTTPException(500, f"could not move the file: {exc}") from None
+
+    @app.post("/api/tasks/{task_id}/move/stop")
+    async def stop_move(task_id: int) -> dict[str, bool]:
+        """Give up on a move that is still copying.
+
+        Only a move across drives can be stopped, and only because that one is a copy that
+        takes minutes. Within a drive the move is a rename that is over before this request
+        could be sent, which is why an answer of false is not an error: it means there was
+        nothing left to stop.
+        """
+        return {"ok": manager.stop_move(task_id)}
+
+    @app.post("/api/tasks/{task_id}/move")
+    async def move(task_id: int, request: MoveRequest) -> dict[str, Any]:
+        """Move a finished download into another folder of the library.
+
+        Like reveal, the file being moved is the task's own — the request says which folder,
+        never which file. And like confirm, the folder is refused unless it resolves inside
+        the library root: this endpoint moves data on a server with no authentication, so
+        the one string it accepts from the browser is confined before it becomes a path.
+        """
+        if not settings.library_root:
+            raise HTTPException(400, "no library root is set, so there is nowhere to move to")
+
+        chosen = folders.resolve_inside(Path(settings.library_root), request.folder)
+        if chosen is None:
+            raise HTTPException(400, f"{request.folder} is not inside the library root")
+
+        result = await _run_move(task_id, chosen)
+        if result is None:
+            return {"ok": False, "stopped": True}
+
+        remembered = None
+        if request.remember:
+            # Same rule as confirm: only a folder that names a kind can stand for that kind.
+            kind = ALIASES.get(chosen.name.lower())
+            if kind is not None:
+                settings.layout_overrides[kind.value] = str(chosen)
+                settings.save()
+                remembered = kind.value
+        return {
+            "ok": True,
+            "unchanged": result.unchanged,
+            "dest": str(result.path),
+            # What the mapping now says, or null when the folder named no kind and the
+            # checkbox therefore did nothing. The page has no business working that out.
+            "remembered": remembered,
+            "moved": len(result.companions),
+            # Named rather than counted: "two sidecars stayed behind" is not something a
+            # person can act on without knowing which ones.
+            "failed": [{"path": str(p), "reason": reason} for p, reason in result.failed],
+        }
+
+    @app.post("/api/tasks/{task_id}/move-anywhere")
+    async def move_anywhere(task_id: int, request: BrowseMoveRequest) -> dict[str, Any]:
+        """Move a finished download to a folder chosen in the system's own dialog.
+
+        The sibling of /move, and the reason it is a second endpoint rather than a flag: it
+        accepts a destination anywhere on the machine, including another drive, which is
+        precisely what /move refuses. What makes that safe is that the request never names
+        one. The path comes from a modal dialog the operating system put in front of whoever
+        is at the keyboard, so an attacker who can reach this unauthenticated API — a page
+        that resolved its own hostname to 127.0.0.1, say — can start a folder picker and
+        nothing else. It cannot answer it, and it cannot say where the file should land.
+
+        The dialog blocks until it is answered, so it runs on a thread; the queue keeps
+        going, and so does the download whose file this is not.
+        """
+        task = database.get(task_id)
+        if task is None:
+            raise HTTPException(404, "no such task")
+        if task.state != db.DONE or not task.dest:
+            raise HTTPException(409, "only a finished download can be moved")
+
+        from ..desktop import pick_system_folder
+
+        current = str(Path(task.dest).parent)
+        chosen = await asyncio.to_thread(pick_system_folder, current)
+        if not chosen:
+            return {"ok": False, "cancelled": True}
+
+        result = await _run_move(task_id, Path(chosen))
+        if result is None:
+            return {"ok": False, "stopped": True}
+
+        remembered = None
+        if request.remember:
+            # An absolute path outside the library is a legitimate mapping — a drive that
+            # holds nothing but checkpoints is the usual reason anyone moves one there.
+            kind = ALIASES.get(Path(chosen).name.lower())
+            if kind is not None:
+                settings.layout_overrides[kind.value] = chosen
+                settings.save()
+                remembered = kind.value
+        return {
+            "ok": True,
+            "unchanged": result.unchanged,
+            "dest": str(result.path),
+            "folder": chosen,
+            "remembered": remembered,
+            "moved": len(result.companions),
+            "failed": [{"path": str(p), "reason": reason} for p, reason in result.failed],
+        }
 
     @app.get("/api/tasks/{task_id}/record")
     async def record(task_id: int) -> dict[str, Any]:
@@ -223,6 +419,79 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
             "record": data,
             "path": str(sidecar.record_path(destination, directory, root)),
         }
+
+    @app.get("/api/tasks/{task_id}/previews")
+    async def list_previews(task_id: int) -> dict[str, Any]:
+        """What pictures this download has, and what made them.
+
+        The URLs are handed back too. They are what the page needs to offer "open the
+        original", and they are already public — this is the model's own page, not a
+        signed download link.
+        """
+        task = database.get(task_id)
+        if task is None:
+            raise HTTPException(404, "no such task")
+        return {
+            "blur_nsfw": settings.blur_nsfw,
+            "previews": [
+                {
+                    "index": index,
+                    "type": entry.get("type") or "image",
+                    "nsfw": bool(entry.get("nsfw")),
+                    "width": entry.get("width"),
+                    "height": entry.get("height"),
+                    "meta": entry.get("meta") or {},
+                    "url": entry.get("url"),
+                }
+                for index, entry in enumerate(previews.entries(task.meta))
+            ],
+        }
+
+    async def _serve_preview(task_id: int, index: int, width: int | None) -> FileResponse:
+        """Fetch a sample image once, then serve it from disk forever.
+
+        Which image is decided here, from the task, and never by the caller: the request
+        says *which of this download's previews*, an index into a list the service gave us,
+        and cannot say *this URL* or *this file*. Everything else in this server that
+        touches a path takes the same line, and an unauthenticated local server that
+        fetched arbitrary URLs on request would be a proxy into the machine it runs on.
+        """
+        if not settings.fetch_previews:
+            raise HTTPException(404, "previews are turned off")
+
+        task = database.get(task_id)
+        if task is None:
+            raise HTTPException(404, "no such task")
+        entries = previews.entries(task.meta)
+        if not 0 <= index < len(entries):
+            raise HTTPException(404, "no such preview")
+
+        entry = entries[index]
+        # A video asked for small is asked for as a still: a queue row wants a picture, not
+        # eight seconds of playback it never plays.
+        still = entry.get("type") == "video" and width is not None
+        url = previews.variant_url(str(entry["url"]), width, still=still)
+
+        directory = Path(settings.preview_dir or "previews")
+        path = previews.cache_path(directory, url)
+        if not path.exists():
+            fetched = await previews.fetch(url, directory, images)
+            if fetched is None:
+                raise HTTPException(502, "the preview could not be fetched")
+            path = fetched
+        return FileResponse(path, media_type=previews.media_type(path), headers=IMAGE_CACHE)
+
+    @app.get("/api/tasks/{task_id}/preview")
+    async def preview(
+        task_id: int, w: int | None = Query(None, ge=32, le=2048)
+    ) -> FileResponse:
+        return await _serve_preview(task_id, 0, w)
+
+    @app.get("/api/tasks/{task_id}/preview/{index}")
+    async def preview_at(
+        task_id: int, index: int, w: int | None = Query(None, ge=32, le=2048)
+    ) -> FileResponse:
+        return await _serve_preview(task_id, index, w)
 
     @app.post("/api/tasks/{task_id}/reveal")
     async def reveal(task_id: int) -> dict[str, bool]:
@@ -306,11 +575,15 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
 
     @app.get("/api/layout")
     async def get_layout() -> dict[str, Any]:
-        """What an adopted tree would look like, so the mapping can be checked."""
+        """What an adopted tree would look like, so the mapping can be checked.
+
+        Taken from the manager rather than adopted afresh, so that what is shown includes the
+        corrections made by hand — a mapping display that disagreed with where files actually
+        go would be worse than not offering one.
+        """
         if not settings.library_root:
             return {"root": None, "paths": {}, "ambiguities": {}}
-        layout = adopt(Path(settings.library_root), settings.profile)
-        data = layout.to_dict()
+        data = manager.layout().to_dict()
         data["exists"] = {
             category: Path(path).is_dir() for category, path in data["paths"].items()
         }

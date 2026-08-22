@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import socket
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -178,3 +179,73 @@ def test_two_dialogs_cannot_open_at_once():
             thread.join()
 
     assert order == ["enter", "leave", "enter", "leave"]
+
+
+def test_a_port_we_cannot_have_moves_us_to_another_one():
+    """Windows reserves blocks of ports for Hyper-V and WSL at boot, and a bind inside one
+    fails outright. The port the person asked for is a preference, not a requirement."""
+    from sfd import desktop
+
+    taken, port = desktop.bind_local_port("127.0.0.1", 0)
+    try:
+        moved, chosen = desktop.bind_local_port("127.0.0.1", port)
+        moved.close()
+        assert chosen != port
+    finally:
+        taken.close()
+
+
+def test_the_search_steps_over_a_whole_reserved_block():
+    """The reserved blocks are a hundred ports wide, so the next port up is inside the same
+    one. Stepping by a single port would scan the block instead of leaving it."""
+    from sfd import desktop
+
+    attempted = []
+    real_socket = socket.socket
+
+    class OnlyFarPortsWork(real_socket):
+        def bind(self, address):
+            attempted.append(address[1])
+            if address[1] and address[1] < 8000:
+                raise PermissionError(10013, "forbidden by its access permissions")
+            return super().bind(address)
+
+    with patch.object(desktop.socket, "socket", OnlyFarPortsWork):
+        sock, chosen = desktop.bind_local_port("127.0.0.1", 7788)
+    sock.close()
+
+    assert chosen >= 8000
+    assert max(attempted) - min(attempted) > 100
+
+
+def test_no_bindable_port_at_all_is_reported_as_such():
+    from sfd import desktop
+
+    real_socket = socket.socket
+
+    class NothingBinds(real_socket):
+        def bind(self, address):
+            raise PermissionError(10013, "forbidden by its access permissions")
+
+    with patch.object(desktop.socket, "socket", NothingBinds):
+        with pytest.raises(RuntimeError, match="could not bind a port"):
+            desktop.bind_local_port("127.0.0.1", 7788)
+
+
+def test_the_window_wears_the_application_icon():
+    """From source there is nothing to inherit an icon from, so the file has to be found."""
+    from sfd import desktop
+
+    icon = desktop.window_icon()
+    assert icon is not None and icon.endswith(".ico")
+    assert Path(icon).is_file()
+
+
+def test_a_missing_icon_leaves_the_choice_to_pywebview(monkeypatch, tmp_path):
+    """Inside the built exe the logo is not on disk; pywebview then takes the icon out of
+    the executable, which is the same image. Handing it a path that is not there would
+    only make it look."""
+    from sfd import desktop
+
+    monkeypatch.setattr(desktop, "__file__", str(tmp_path / "desktop.py"))
+    assert desktop.window_icon() is None

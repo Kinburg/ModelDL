@@ -12,7 +12,12 @@ from pathlib import Path
 
 import pytest
 
-from sfd.core.errors import ChecksumMismatch, NotBinaryContent, RangeNotHonored, TransferFailed
+from sfd.core.errors import (
+    ChecksumMismatch,
+    NotBinaryContent,
+    RangeIgnored,
+    TransferFailed,
+)
 from sfd.core.transfer import Transfer, TransferOptions
 from sfd.providers.direct import DirectProvider, make_identity
 from tests.http_stub import StubServer
@@ -160,7 +165,9 @@ async def test_refuses_to_write_when_the_server_ignores_range(tmp_path: Path):
         server.state.fail_times = 0
         server.state.ignore_range = True
 
-        with pytest.raises(RangeNotHonored):
+        # No chunk ever starts here — the server has stopped advertising range support at
+        # all, and run() refuses before the workers do. Nothing wraps it.
+        with pytest.raises(RangeIgnored):
             await download(server, tmp_path, connections=1, max_attempts=1)
 
         # The bytes we already trusted are exactly as they were.
@@ -189,11 +196,73 @@ async def test_refuses_a_200_in_place_of_a_206_mid_transfer(tmp_path: Path):
         server.state.fail_times = 0
         server.state.ignore_range_over = 1
 
-        with pytest.raises(RangeNotHonored):
+        with pytest.raises(TransferFailed) as failure:
             await download(server, tmp_path, connections=1, max_attempts=1)
+        assert isinstance(failure.value.__cause__, RangeIgnored)
 
         assert part.read_bytes()[:30_000] == good
         assert part.stat().st_size == len(DATA), "the preallocated file was resized"
+
+
+async def test_an_edge_that_ignores_range_once_does_not_lose_the_download(tmp_path: Path):
+    """The transient case, and by far the common one.
+
+    One CDN node answers a chunk request with the whole file instead of the range asked
+    for, and the next connection lands somewhere sane. Nothing was written from the bad
+    response — the check runs before the first byte — so there is nothing to recover and
+    nothing at risk. Failing the transfer over it strands a download that succeeds on the
+    very next attempt, which is what makes this so maddening to report: by the time anyone
+    looks, the edge is behaving again.
+    """
+    with StubServer(DATA) as server:
+        server.state.ignore_range_over = 1
+        server.state.ignore_range_over_times = 1
+
+        path = await download(server, tmp_path, connections=1)
+
+    assert path.read_bytes() == DATA
+    assert not list(tmp_path.glob("*.part"))
+
+
+async def test_a_partial_survives_an_edge_that_ignores_range_and_resumes_after(tmp_path: Path):
+    """The same misbehaviour with bytes already on disk — the case with something to lose.
+
+    The retry must resume from where the partial left off, not restart, and the bytes that
+    were already verified must be the same ones in the finished file.
+    """
+    with StubServer(DATA) as server:
+        server.state.fail_after = 30_000
+        server.state.fail_times = 1
+        with pytest.raises(TransferFailed):
+            await download(server, tmp_path, connections=1, max_attempts=1)
+
+        part = tmp_path / "model.safetensors.part"
+        good = part.read_bytes()[:30_000]
+        assert good == DATA[:30_000]
+
+        server.state.fail_after = None
+        server.state.fail_times = 0
+        server.state.ignore_range_over = 1
+        server.state.ignore_range_over_times = 2
+        served_before = server.state.ranged_bytes_served
+
+        path = await download(server, tmp_path, connections=1)
+
+    assert path.read_bytes() == DATA
+    resumed = server.state.ranged_bytes_served - served_before
+    assert resumed < len(DATA), "the retry restarted from zero instead of resuming"
+
+
+async def test_a_permanently_broken_edge_still_gives_up_with_the_reason(tmp_path: Path):
+    """Retrying must not turn a hopeless case into an endless one."""
+    with StubServer(DATA) as server:
+        server.state.ignore_range_over = 1
+
+        with pytest.raises(TransferFailed) as failure:
+            await download(server, tmp_path, connections=1, max_attempts=3)
+
+    assert isinstance(failure.value.__cause__, RangeIgnored)
+    assert "the server sent the whole file" in str(failure.value)
 
 
 async def test_idle_connections_steal_work_instead_of_waiting(tmp_path: Path):

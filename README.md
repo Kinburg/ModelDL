@@ -208,7 +208,65 @@ nothing to lose by pausing for an hour.
 
 Uncertain placements arrive **blocked** rather than filed. Adding one Civitai link that
 expands to five quantisations queues 67 GB that will not move until you accept or correct
-each one — with the category dropdown right there.
+each one, with the reason for the guess on the card.
+
+*Elsewhere…* answers the same question with your library instead of our category names. The
+list is the folders that are really there, best guesses first: the one the layout would have
+used (base-model grouping included, spelled out rather than implied), the runners-up for that
+kind, any folder whose name appears in the filename, then everything else by what is actually
+in it, and finally the canonical homes that have no folder yet. That last group matters
+because the file may be the first LoRA a library has ever had; the folder-name match matters
+because the categories deliberately do not claim `sams`, `insightface`, `reactor` and the
+rest — a bare `.pt` gives nothing to tell them apart — so until now the right answer for a
+SAM checkpoint was not on the list at all.
+
+Search narrows it, and typing a folder that does not exist offers it as a choice. Nothing is
+created at that moment: the folder appears when the file lands, so a download that fails
+leaves no empty folders behind. The one thing that does create a directory on request is
+*Move to…* below, and only ever inside the library root. What you pick is taken exactly as
+given — nothing is appended underneath you, which is how a
+successful download goes missing. Tick **send this kind of model here from now on** and the
+choice becomes the mapping for that kind; a base-model folder like `checkpoints/Krea 2` names
+no kind, so it files the one file and leaves the mapping alone.
+
+*Move to…* on a finished download is the same dialog asked after the fact, for when the
+guess was accepted and turned out wrong anyway. It moves the model **and everything named
+after it** — the `.json` record, `.civitai.info`, the trigger-word `.txt` and
+`.preview.png` — because a model manager that finds a checkpoint without its preview shows
+a blank card, and dragging one file in Explorer is exactly how that happens. Sidecars
+collected elsewhere with **keep sidecars in** follow the mirror of the library tree rather
+than being dumped beside the model they were deliberately kept away from.
+
+Nothing is overwritten: if the destination already holds a file of that name the move is
+refused before anything is touched. The model goes first and the companions follow, so a
+companion that cannot move leaves the model where you asked for it and names the ones that
+stayed behind — reporting the model as stuck when it moved perfectly well would send you
+hunting in the wrong folder.
+
+The list in that dialog is the library and nothing else, so another drive is unreachable
+from it by construction. **Another drive…** opens the system's own folder dialog instead,
+and accepts anywhere on the machine. What makes that safe is that the request never names a
+destination: the path is chosen in a modal window the OS put in front of whoever is at the
+keyboard, and is never sent by the page. Something reaching this unauthenticated API that
+is not a person — a web page that pointed its own hostname at 127.0.0.1, say — can make a
+folder picker appear and nothing else. It cannot answer one, and it cannot say where a file
+should land.
+
+Across a drive boundary a rename cannot exist, so the move becomes what it really is: every
+byte copied, then the original deleted. That takes as long as downloading the file did, so
+it reports its progress and the queue keeps running throughout. The copy lands under a
+`.moving` name and is renamed into place only once it is whole — the destination never holds
+a half-written model that looks finished — and if it fails partway the fragment goes and the
+original is still sitting where it was, untouched.
+
+**Stop the move** appears beside the progress while that copy runs, and the same applies to
+giving up as to failing: the fragment is deleted and the original has not been touched, so
+there is nothing to put back. The stop is a request rather than a kill, because a thread
+copying a file cannot be interrupted — only asked between blocks — so expect it to take
+until the current 4 MB is written. It follows the event stream rather than the tab that
+started the move, so the button is there after a reload and in a second window. Once the
+last byte is across there is nothing left to stop: the sidecars that follow are far too
+small to wait for, and stopping between them would strand the model away from them.
 
 Turn off **start downloads on add** and links pile up paused instead, so an afternoon of
 collecting them costs no bandwidth until you press *Start all*. That releases what is merely
@@ -345,6 +403,24 @@ on the way in.
 `scripts/backfill_triggers.py <library> [--apply]` writes those files for anything downloaded
 before the feature existed, reading the words back out of the JSON records.
 
+### Sample images
+
+The pictures a model is published with are shown in the queue: a thumbnail on every row,
+the full set behind it, and under each one the prompt, sampler, steps, cfg and seed that
+produced it. Trigger words say which tokens wake a LoRA up and nothing about the prompt
+around them; the samples were made by someone who knew, and those settings are published by
+the service and lost by every plain download. They are written into the `.json` record too.
+
+Nothing is fetched ahead of time. A picture is requested when the page first draws it,
+kept in `preview_dir` — a cache, deletable at any time — and served from there afterwards,
+including for every other file of the same model version, which shares the images. Rows ask
+for a 320-pixel copy from the CDN rather than shrinking the original, so a thumbnail costs
+about forty kilobytes rather than three megabytes.
+
+Samples the service marks as adult are covered until clicked. The URLs come from an API
+response, which is remote data, so only `https` and only the hosts we download from are
+ever requested.
+
 Base-model subfolders come from the service, not the file — the opposite of the category
 rule, and deliberately. A Pony LoRA records `sdxl_base_v1-0` in its training metadata:
 true, and useless for filing, because Pony LoRAs do not work on plain SDXL.
@@ -364,7 +440,10 @@ or PowerShell:
 Optional flags:
 - `--browser`: open in default web browser instead of standalone desktop window.
 - `--no-gui`: run headless backend server without opening a window or browser.
-- `--port 7788`: change port.
+- `--port 7788`: change port. If that port is unavailable another is picked automatically
+  and printed on startup — on Windows, Hyper-V and WSL reserve blocks of ports at boot
+  (`netsh interface ipv4 show excludedportrange protocol=tcp`), and a reserved port refuses
+  the bind rather than reporting itself as in use.
 
 ### Building standalone ModelDL.exe
 To build a single-file executable that does not require Python or any dependencies:

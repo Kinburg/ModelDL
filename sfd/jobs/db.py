@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+from ..library import previews
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,6 +165,12 @@ class Task:
             "duration": self.duration,
             "average_speed": self.average_speed,
             "trigger_words": self.meta.get("trained_words") or [],
+            # A count, not the pictures and not their prompts: this payload is sent again
+            # on every state change of every task, and a queue of two hundred models would
+            # be carrying two hundred prompt collections through it. The page asks for the
+            # details of the one it is showing.
+            "previews": len(previews.entries(self.meta)),
+            "nsfw": bool(self.meta.get("nsfw")),
         }
         if self.size:
             data["fraction"] = min(1.0, self.downloaded / self.size)

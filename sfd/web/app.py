@@ -602,6 +602,26 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
         from ..desktop import pick_system_folder
         return {"path": pick_system_folder(request.initial)}
 
+    @app.post("/api/utils/clipboard")
+    def clipboard() -> dict[str, str]:
+        """What is on the clipboard, for the page's Paste button.
+
+        Only reached when the webview refuses the browser's own clipboard API, which it is
+        entitled to do — the button would otherwise be dead with nothing to explain it.
+
+        Synchronous for the same reason as the picker above: reading the clipboard means
+        waiting on another process, and doing that on the event loop would stall every
+        running download for as long as it takes.
+
+        This is the one endpoint here that hands back something the page did not already
+        know, and the clipboard is the user's rather than the library's. What keeps it theirs
+        is the Host check every request goes through: a page served under someone else's
+        name is refused before it gets here, and no reply on this server carries a CORS
+        header for another origin to read one with.
+        """
+        from ..desktop import read_system_clipboard
+        return {"text": read_system_clipboard()}
+
     # --- progress ---------------------------------------------------------
 
     @app.get("/api/events")

@@ -521,6 +521,79 @@ def test_progress_fraction_is_reported(database: Database):
     assert database.get(task.id).to_json()["fraction"] == 0.25
 
 
+def test_trigger_words_reach_the_page_as_the_txt_file_has_them(database: Database):
+    """Civitai often returns them comma-joined inside a single string. Passed through as it
+    came, the card shows one chip with commas in it, and the words copied off that card would
+    disagree with the `.txt` sitting beside the model."""
+    task = add(database, meta={"trained_words": ["ohwx style, ohwx", "  spare  ", "OHWX"]})
+    assert task.to_json()["trigger_words"] == ["ohwx style", "ohwx", "spare"]
+
+
+def test_a_model_with_no_triggers_offers_none(database: Database):
+    """Nothing for the page to copy, and nothing for it to draw a chip row for."""
+    assert add(database).to_json()["trigger_words"] == []
+
+
+# --- where a file came from -------------------------------------------------
+
+
+def test_the_queue_says_which_service_each_file_came_off(database: Database):
+    """The card header names the site rather than our provider name. Two files of the same
+    name are told apart by where they came from before anything else about them."""
+    assert add(database).to_json()["origin"] == "example.com"
+
+    hub = add(
+        database,
+        provider="huggingface",
+        identity={
+            "provider": "huggingface",
+            "ref": {"repo_id": "org/name", "repo_type": "model",
+                    "revision": "main", "path": "model.safetensors"},
+        },
+        filename="hub.safetensors",
+    )
+    assert hub.to_json()["origin"] == "huggingface.co"
+
+
+def test_a_mirror_is_named_as_itself(database: Database):
+    """`civitai.red` is a mirror, and the task keeps talking to the domain the link came
+    from — calling it "civitai" would hide the one thing that explains the difference."""
+    task = add(
+        database,
+        provider="civitai",
+        identity={"provider": "civitai", "ref": {"version_id": 1, "file_id": 2}},
+        meta={"host": "civitai.red"},
+    )
+    assert task.to_json()["origin"] == "civitai.red"
+    plain = add(
+        database,
+        provider="civitai",
+        identity={"provider": "civitai", "ref": {"version_id": 3, "file_id": 4}},
+        filename="other.safetensors",
+    )
+    assert plain.to_json()["origin"] == "civitai.com"
+
+
+def test_a_direct_link_is_named_by_its_host_alone(database: Database):
+    """Userinfo and the port are noise here, and a `user:pass@` left in would put a
+    credential on screen next to the filename."""
+    task = add(
+        database,
+        identity={
+            "provider": "direct",
+            "ref": {"url": "https://user:secret@www.files.example.com:8443/a/model.bin"},
+        },
+    )
+    assert task.to_json()["origin"] == "files.example.com"
+
+
+def test_a_row_with_no_service_to_name_says_nothing(database: Database):
+    """A queue row from an older build carries no identity worth reading. A missing label is
+    a missing badge on a card, not an error on the page."""
+    task = add(database, provider="", identity={})
+    assert task.to_json()["origin"] == ""
+
+
 # --- HTTP -------------------------------------------------------------------
 
 

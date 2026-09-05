@@ -98,7 +98,7 @@ function matches(task) {
   const wanted = $("filter-text").value.trim().toLowerCase();
   if (!(STATES[$("filter-state").value] || STATES.all)(task)) return false;
   if (!wanted) return true;
-  return [task.filename, task.label, task.source, task.dest]
+  return [task.filename, task.label, task.source, task.dest, task.origin]
     .some((field) => (field || "").toLowerCase().includes(wanted));
 }
 
@@ -197,10 +197,16 @@ function taskHtml(t, pinned = false) {
           <div class="main">
             <div class="task-head">
               <span class="name">${escapeHtml(t.filename || t.source)}</span>
+              ${originHtml(t)}
               <span class="state done">done</span>
               <span class="small muted">${fmtBytes(t.size)}</span>
               <span class="actions">
                 <button data-action="expand" title="Show the details">⌄</button>
+                <!-- The row a finished LoRA spends its life as, and the words are the whole
+                     reason to come back to it. Behind the collapse they would need two
+                     clicks to reach, one of which is a card nobody wanted opened. -->
+                ${(t.trigger_words || []).length ? `<button data-action="triggers"
+                  title="Copy the trigger words, ready for a prompt">Triggers</button>` : ""}
                 ${t.dest ? `<button data-action="open-folder" title="Show in File Explorer">Folder</button>` : ""}
                 ${t.dest ? `<button data-action="move" title="Move it somewhere else in the library">Move to…</button>` : ""}
                 <button class="danger" data-action="cancel">Remove</button>
@@ -237,8 +243,13 @@ function taskHtml(t, pinned = false) {
          ${t.confidence ? `(${t.confidence})` : ""} — ${escapeHtml(t.reason)}</div>`
     : "";
 
+  // A LoRA that cannot be triggered might as well not have been downloaded, and these words
+  // are published by the service and nowhere else. Reading them off the card and typing them
+  // back into the prompt is how one gets misspelt, so they are one click from the clipboard.
   const triggers = (t.trigger_words || []).length
-    ? `<div class="tags">${t.trigger_words.map((w) => `<span class="tag">${escapeHtml(w)}</span>`).join("")}</div>`
+    ? `<div class="tags">${t.trigger_words.map((w) => `<span class="tag">${escapeHtml(w)}</span>`).join("")}
+         <button class="mini" data-action="triggers"
+                 title="Copy the trigger words, ready for a prompt">Copy</button></div>`
     : "";
 
   // What actually happened, once it has. Average speed is computed from bytes really
@@ -269,6 +280,7 @@ function taskHtml(t, pinned = false) {
         <div class="main">
           <div class="task-head">
             <span class="name">${escapeHtml(t.filename || t.source)}</span>
+            ${originHtml(t)}
             <span class="state ${t.state}">${t.state}</span>
             <span class="actions">${picker}${buttons.join("")}</span>
           </div>
@@ -289,6 +301,13 @@ function taskHtml(t, pinned = false) {
       </div>
     </div>`;
 }
+
+// Which service a file came off, in the header where its name is. With forty rows on
+// screen, "where did this one come from" is a question answered by looking rather than by
+// opening anything — and it is the difference between two files of the same name.
+const originHtml = (t) => t.origin
+  ? `<span class="origin" title="downloaded from ${escapeHtml(t.origin)}">${escapeHtml(t.origin)}</span>`
+  : "";
 
 function escapeHtml(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) =>
@@ -328,7 +347,7 @@ function thumbHtml(t, size) {
   if (!t.previews) return "";
   const more = t.previews > 1 ? ` (${t.previews} samples)` : "";
   // Sized by attribute rather than by inline style: `.thumb` carries no width or height of
-  // its own, so this is the only source either way, and the browser gets the box before it
+  // its own, so this is the only source  either way, and the browser gets the box before it
   // has the image.
   return `<img class="thumb ${covered(t.id, t.nsfw) ? "covered" : ""}"
     width="${size}" height="${size}" src="${previewSrc(t.id, 0, 320)}"
@@ -431,6 +450,36 @@ function metaHtml(item) {
     : `<dt></dt><dd class="muted">No generation settings were published with this one.</dd>`;
 }
 
+// Putting something on the clipboard is allowed straight off a click and asks nobody, but a
+// webview told otherwise makes it throw — and a copy button that silently does nothing is
+// worse than one that says so. The textarea is how this was done before there was an API
+// for it, and it still works where the API is refused.
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch { /* refused or absent — the old way below */ }
+  const holder = document.createElement("textarea");
+  holder.value = text;
+  holder.setAttribute("readonly", "");
+  holder.style.cssText = "position:fixed;top:0;left:0;opacity:0";
+  document.body.appendChild(holder);
+  holder.select();
+  let copied = false;
+  try { copied = document.execCommand("copy"); } catch { copied = false; }
+  holder.remove();
+  return copied;
+}
+
+// Said on the button that was pressed rather than in the message line: with several copy
+// buttons on screen, the one that answers is the answer to which of them landed.
+function flash(button, said = "Copied") {
+  if (!button) return;
+  const was = button.textContent;
+  button.textContent = said;
+  setTimeout(() => { button.textContent = was; }, 1500);
+}
+
 // Copy buttons, wherever they appear: the prompt is the thing people came for, and
 // selecting four hundred characters by hand is not a way to get it.
 function wireCopies(holder) {
@@ -438,9 +487,8 @@ function wireCopies(holder) {
     button.onclick = async () => {
       const source = holder.querySelector(`[data-role="${button.dataset.copy}"]`);
       if (!source) return;
-      await navigator.clipboard.writeText(source.textContent);
-      button.textContent = "Copied";
-      setTimeout(() => (button.textContent = "Copy"), 1500);
+      if (await copyText(source.textContent)) flash(button);
+      else message("the clipboard would not take it", true);
     };
   });
 }
@@ -543,6 +591,16 @@ async function toggleRecord(id, node) {
 async function act(id, action, node) {
   try {
     if (action === "record") { await toggleRecord(id, node); return; }
+    // Comma-joined, which is the form a prompt wants and the form the `.txt` beside the
+    // model already holds — the two saying different things would be a bug nobody could see.
+    if (action === "triggers") {
+      const words = (tasks.get(id) || {}).trigger_words || [];
+      if (!words.length) return;
+      const button = node.querySelector('[data-action="triggers"]');
+      if (await copyText(words.join(", "))) flash(button);
+      else message("the clipboard would not take it", true);
+      return;
+    }
     // A covered picture takes one click to uncover and the next one to open. Opening it
     // full-screen on the first click is exactly what the cover exists to prevent.
     if (action === "preview") {
@@ -947,6 +1005,37 @@ $("add").onclick = async () => {
     refreshSpace();
   } catch (e) { message(e.message, true); }
   finally { $("add").disabled = false; }
+};
+
+// Reading the clipboard is a permission, in a webview as much as in a browser, and it can
+// be refused or simply absent. The server is on this very machine, so it can ask the system
+// itself when the page is not allowed to — the same layering as the folder picker above.
+async function clipboardText() {
+  let text = "";
+  try {
+    if (navigator.clipboard && navigator.clipboard.readText) {
+      text = await navigator.clipboard.readText();
+    }
+  } catch { /* refused, or no clipboard API here — ask the server instead */ }
+  if (!text.trim()) {
+    try { ({ text } = await api("/api/utils/clipboard", { method: "POST", body: "{}" })); }
+    catch { text = ""; }
+  }
+  // A copied block of text can hold a link and a paragraph around it, and the box is one
+  // line: whatever the newlines are, an <input> drops them and glues the rest together
+  // into something no provider can parse. The first line that has anything on it is the
+  // one that was meant.
+  return (text || "").split("\n").map((line) => line.trim()).find(Boolean) || "";
+}
+
+$("paste").onclick = async () => {
+  const text = await clipboardText();
+  if (!text) { message("nothing to paste — the clipboard holds no text", true); return; }
+  $("source").value = text;
+  // Focused rather than added: what was copied is not always what was wanted, and the box
+  // is where that is noticed. Enter from here adds it.
+  $("source").focus();
+  message("");
 };
 
 $("source").addEventListener("keydown", (e) => { if (e.key === "Enter") $("add").click(); });

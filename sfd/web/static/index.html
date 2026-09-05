@@ -13,6 +13,9 @@
   <h1>ModelDL</h1>
   <input id="source" aria-label="Link to download"
          placeholder="Paste a HuggingFace or Civitai link, or org/repo" autofocus>
+  <!-- The link is already in the clipboard: it was copied off the model page a moment ago.
+       Ctrl+V still works and needs nobody's permission; this is for the hand on the mouse. -->
+  <button id="paste" title="Put the link from the clipboard in the box">Paste</button>
   <button class="primary" id="add">Add</button>
   <button id="toggle-settings">Settings</button>
 </header>

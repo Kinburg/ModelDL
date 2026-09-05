@@ -94,7 +94,9 @@ summary { cursor: pointer; color: var(--muted); }
    it can see, and the ones hidden behind the filter would be renumbered around them. */
 .task.pinned .grip { cursor: default; opacity: .35; }
 .task.compact { padding-top: 9px; padding-bottom: 9px; }
-.tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+/* The chips and the copy button that follows them sit on one baseline-agnostic line: a
+   button is taller than a chip, and centring is what keeps the row from looking dropped. */
+.tags { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 6px; }
 .tag { font-size: 11.5px; background: var(--line-soft); border-radius: 5px; padding: 1px 7px; color: var(--muted); }
 .record {
   margin-top: 10px; border-top: 1px solid var(--line-soft); padding-top: 10px;
@@ -206,3 +208,11 @@ header, .grip, button, label, .state { user-select: none; }
 .input-with-btn { display: flex; gap: 6px; width: 100%; }
 .input-with-btn input { flex: 1; min-width: 0; }
 .btn-browse { padding: 7px 12px; white-space: nowrap; font-size: 13px; }
+
+/* Where a file came from, in the header beside its name. Short, muted and never a link:
+   the header is for recognising a row at a glance, and the page it came off is one click
+   away in the record. */
+.origin {
+  flex: none; font-size: 11.5px; color: var(--muted); background: var(--line-soft);
+  border-radius: 5px; padding: 1px 7px; white-space: nowrap;
+}

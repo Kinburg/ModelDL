@@ -304,6 +304,30 @@ The filter box and the state dropdown narrow a long list; finished downloads col
 one line each until opened. Dragging is disabled while a filter is on, because the reorder
 would only see the rows on screen and would shuffle them around the ones it cannot.
 
+Every card says which site its file came off, next to the name: `civitai.com`,
+`huggingface.co`, or the host of a plain link. It is the domain rather than our provider
+name, so a mirror reads as itself — `civitai.red` is a different host that the download
+keeps talking to, and calling it "civitai" would hide the only thing that explains the
+difference. The filter box matches it too, so one word narrows the queue to a single
+service. Where the file *went* is the path under it; this is where it came *from*.
+
+**Paste** beside the box puts the clipboard in it, for when the link was copied off the
+model page a second ago and the mouse is still in your hand. Ctrl+V anywhere on the page
+does the same and needs nobody's permission — which the button may: reading the clipboard
+is a permission in a webview as much as in a browser, and when the window refuses it the
+server reads the clipboard from the machine it is already running on instead. Only the
+first line with anything on it is taken: a copied paragraph with a link in it would
+otherwise arrive as one unparseable line, because a single-line box throws the newlines
+away and glues the rest together.
+
+A LoRA's trigger words sit on its card as chips with a **Copy** button after them, and a
+finished one collapsed to a single line keeps a **Triggers** button in the row — which is
+where they are actually wanted, weeks later, with the prompt box already open. What lands on
+the clipboard is comma-joined, exactly what the `.txt` beside the model holds, so the two
+cannot drift apart; the words are split and de-duplicated on the way to the page for the
+same reason, since Civitai often returns them already joined inside one string and that
+would otherwise show as a single chip with commas in it.
+
 **Info** on a finished task opens its stored record in the card — page link, hash, why it
 was filed where it was, and the trigger words with a copy button. Worth having once records
 are collected into their own directory, where they are tidy and hard to find.

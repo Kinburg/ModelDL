@@ -21,8 +21,9 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import urlsplit
 
-from ..library import previews
+from ..library import previews, sidecar
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -164,7 +165,15 @@ class Task:
             "retry_at": self.retry_at,
             "duration": self.duration,
             "average_speed": self.average_speed,
-            "trigger_words": self.meta.get("trained_words") or [],
+            # Split and tidied the same way the `.txt` beside the model is, because the page
+            # offers them for copying and the two must not disagree. Civitai often returns
+            # them already comma-joined inside one string, which as one chip on a card reads
+            # as a trigger word with commas in it.
+            "trigger_words": sidecar.normalise_triggers(self.meta.get("trained_words")),
+            # Which service this came off, short enough for the header of a card. The
+            # provider name alone is in `provider`; this is the domain, which is the part
+            # a person recognises.
+            "origin": _origin(self.provider, self.identity, self.meta),
             # A count, not the pictures and not their prompts: this payload is sent again
             # on every state change of every task, and a queue of two hundred models would
             # be carrying two hundred prompt collections through it. The page asks for the
@@ -381,6 +390,32 @@ class Database:
         task = _to_task(row)
         task.state = RUNNING
         return task
+
+
+def _origin(provider: str, identity: dict[str, Any], meta: dict[str, Any]) -> str:
+    """Where a file came from, in the few characters a card header has room for.
+
+    The service's own domain rather than our provider name: `civitai.red` is a mirror of
+    Civitai, and calling it "civitai" would hide the one thing that explains why this
+    download talks to a different host than the row above it. A direct link has no service
+    to name, so it is named by its host — which is what anyone reading the queue is looking
+    for anyway.
+
+    Deliberately not a URL. The identity holds no link by design, and this is a label, not
+    somewhere to click: the page link belongs to the record, which has one already.
+    """
+    if provider == "civitai":
+        return str(meta.get("host") or "civitai.com")
+    if provider == "huggingface":
+        return "huggingface.co"
+    url = (identity.get("ref") or {}).get("url")
+    if isinstance(url, str) and url:
+        # Userinfo and port are noise here, and a `user:pass@` left in would put a
+        # credential on screen next to the filename.
+        host = urlsplit(url).netloc.rsplit("@", 1)[-1].split(":")[0]
+        if host:
+            return host.removeprefix("www.")
+    return provider
 
 
 def _to_task(row: sqlite3.Row) -> Task:

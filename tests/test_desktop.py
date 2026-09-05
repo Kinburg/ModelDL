@@ -145,6 +145,39 @@ def test_the_folder_picker_endpoint(client):
     mock_pick.assert_called_once_with("C:\\")
 
 
+def test_the_clipboard_endpoint(client):
+    """What the Paste button falls back on when the webview refuses the page its own
+    clipboard. Nothing is sent with the request: there is only one clipboard to read."""
+    link = "https://civitai.com/models/1234"
+    with patch("sfd.desktop.read_system_clipboard", return_value=link) as mock_read:
+        response = client.post("/api/utils/clipboard")
+
+    assert response.status_code == 200
+    assert response.json() == {"text": link}
+    mock_read.assert_called_once_with()
+
+
+def test_a_clipboard_nobody_can_read_is_empty_rather_than_an_error(monkeypatch):
+    """On Linux the tool that reads it may simply not be installed, and a paste that cannot
+    happen is not a failure of the download queue."""
+    from sfd import desktop
+
+    def missing(*args, **kwargs):
+        raise FileNotFoundError("no such tool")
+
+    monkeypatch.setattr(desktop.subprocess, "run", missing)
+    assert desktop.read_system_clipboard() == ""
+
+
+def test_the_clipboard_stays_off_the_event_loop(client):
+    """Reading it waits on another process; awaiting that on the loop would stall every
+    running download for as long as it takes."""
+    import inspect
+
+    route = next(r for r in client.app.routes if getattr(r, "path", "") == "/api/utils/clipboard")
+    assert not inspect.iscoroutinefunction(route.endpoint)
+
+
 def test_the_folder_picker_stays_off_the_event_loop(client):
     """The dialog blocks until someone answers it. Awaiting that on the loop freezes every
     running download for as long as the window is open; a sync handler gets a worker thread.

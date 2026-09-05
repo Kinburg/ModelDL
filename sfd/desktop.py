@@ -118,6 +118,55 @@ def _pick_folder(initial_dir: str, window: Any) -> str | None:
     return None
 
 
+def read_system_clipboard() -> str:
+    """Whatever text is on the system clipboard, or an empty string.
+
+    What stands behind the page's *Paste* button. Reading the clipboard is a permission in a
+    webview as much as in a browser — WebView2 can refuse `navigator.clipboard` outright,
+    and the button would then do nothing, with nothing to say about why. This process runs
+    on the same machine as the clipboard, so it can ask the system itself.
+
+    Not tkinter, unlike the folder picker's second choice: this answers an HTTP request from
+    a worker thread, and a Tk root created off the main thread is a coin flip between
+    working and hanging the request.
+    """
+    system = platform.system()
+    if system == "Windows":
+        # OutputEncoding is set because the default is the console codepage, which turns
+        # every non-ASCII character of whatever was copied into a question mark.
+        candidates = [[
+            "powershell", "-NoProfile", "-Command",
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Clipboard -Raw",
+        ]]
+    elif system == "Darwin":
+        candidates = [["pbpaste"]]
+    else:
+        # Wayland first, then X11: whichever session is running, the other's tool is either
+        # missing or answering for a clipboard nobody is looking at.
+        candidates = [
+            ["wl-paste", "--no-newline"],
+            ["xclip", "-selection", "clipboard", "-o"],
+            ["xsel", "-b"],
+        ]
+
+    for command in candidates:
+        try:
+            proc = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout
+    return ""
+
+
 def open_system_path(path: str) -> bool:
     """Reveal a file in Explorer or open a directory in the default file manager."""
     try:

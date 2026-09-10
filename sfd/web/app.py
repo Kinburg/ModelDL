@@ -27,7 +27,7 @@ from ..core.diskinfo import free_bytes
 from ..jobs import db
 from ..jobs.db import Database
 from ..jobs.manager import Manager
-from ..library import folders, previews, relocate, sidecar
+from ..library import erase, folders, previews, relocate, sidecar
 from ..library.categories import ALIASES, Category
 from ..library.layout import adopt
 from ..settings import Settings
@@ -88,6 +88,18 @@ class MoveRequest(BaseModel):
 class BrowseMoveRequest(BaseModel):
     # No folder field, and that is the point — see the endpoint.
     remember: bool = False
+
+
+class RenameRequest(BaseModel):
+    # A filename, and only ever a filename. What that means — and what happens to anything
+    # that is not one — is `relocate.intended_name`.
+    name: str
+
+
+class NoteRequest(BaseModel):
+    # Long enough for a paragraph about what a model actually turned out to be like; short
+    # enough that the record stays a record. An empty string is how a note is removed.
+    note: str = Field("", max_length=4000)
 
 
 class ReorderRequest(BaseModel):
@@ -393,6 +405,123 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
             "folder": chosen,
             "remembered": remembered,
             "moved": len(result.companions),
+            "failed": [{"path": str(p), "reason": reason} for p, reason in result.failed],
+        }
+
+    @app.post("/api/tasks/{task_id}/rename")
+    async def rename(task_id: int, request: RenameRequest) -> dict[str, Any]:
+        """Give a finished download a different filename, sidecars and all.
+
+        The one endpoint here that takes a name from the browser and puts it on the disk,
+        which is why `intended_name` is strict about what a name is: everything else on this
+        server derives its paths from the task. A separator, a `..`, a drive letter — none of
+        them are a filename, so all of them are refused as one rather than quietly becoming
+        a move to somewhere nobody asked for. The folder is never part of the question.
+        """
+        try:
+            result = await manager.rename(task_id, request.name)
+        except LookupError:
+            raise HTTPException(404, "no such task") from None
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from None
+        except FileExistsError as exc:
+            raise HTTPException(409, str(exc)) from None
+        except OSError as exc:
+            raise HTTPException(500, f"could not rename the file: {exc}") from None
+
+        return {
+            "ok": True,
+            "unchanged": result.unchanged,
+            "dest": str(result.path),
+            "filename": result.path.name,
+            "renamed": len(result.companions),
+            "failed": [{"path": str(p), "reason": reason} for p, reason in result.failed],
+        }
+
+    @app.post("/api/tasks/{task_id}/note")
+    async def note(task_id: int, request: NoteRequest) -> dict[str, Any]:
+        """Write your own note about a finished download, or clear it.
+
+        The note is the one thing in a record that no service can supply and nothing can
+        fetch again — which is why an emptied box removes it rather than storing a blank,
+        and why a file downloaded with sidecars turned off gets a record written to hold it
+        rather than being told there is nowhere to put it.
+        """
+        try:
+            written, record_written = await manager.set_note(task_id, request.note)
+        except LookupError:
+            raise HTTPException(404, "no such task") from None
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from None
+        except OSError as exc:
+            raise HTTPException(500, f"could not write the note: {exc}") from None
+
+        return {"ok": True, "note": written, "record_written": record_written}
+
+    @app.get("/api/tasks/{task_id}/files")
+    async def files(task_id: int) -> dict[str, Any]:
+        """Everything on disk that belongs to this download, with sizes.
+
+        Asked for before a delete, and the reason the delete can be a single click: what is
+        about to go permanently is a list a person can read, not a number they have to take
+        on trust. A finished model brings four sidecars; an abandoned one brings a `.part`
+        that is most of the file's size and the whole reason to be deleting anything.
+        """
+        task = database.get(task_id)
+        if task is None:
+            raise HTTPException(404, "no such task")
+        if not task.dest:
+            return {"files": [], "total": 0}
+
+        found = await asyncio.to_thread(
+            erase.belongings,
+            Path(task.dest),
+            Path(settings.sidecar_dir) if settings.sidecar_dir else None,
+            Path(settings.library_root) if settings.library_root else None,
+        )
+        listed = []
+        for path in found:
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = None
+            listed.append({"path": str(path), "name": path.name, "size": size})
+        return {
+            "files": listed,
+            "total": sum(f["size"] or 0 for f in listed),
+            # The model itself is always first when it is there at all, so the page can say
+            # "and 4 others" without working out which one is the model.
+            "model": str(task.dest) if listed and listed[0]["path"] == task.dest else None,
+        }
+
+    @app.delete("/api/tasks/{task_id}/files")
+    async def delete_files(task_id: int) -> dict[str, Any]:
+        """Delete this download's files from the disk, and the task with them.
+
+        Permanent — there is no recycle bin behind this — so the page asks first, with the
+        list from /files in front of whoever is answering. Which files is decided here from
+        the task, exactly as reveal and move decide it: the request names a task and can
+        never name a path.
+        """
+        try:
+            result = await manager.delete_files(task_id)
+        except LookupError:
+            raise HTTPException(404, "no such task") from None
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+        except OSError as exc:
+            # The model would not go, so nothing else was touched — see `erase`. On Windows
+            # this is almost always a loader holding the weights open.
+            raise HTTPException(500, f"could not delete the file: {exc}") from None
+
+        return {
+            "ok": True,
+            "deleted": [str(p) for p in result.deleted],
+            "missing": result.missing,
             "failed": [{"path": str(p), "reason": reason} for p, reason in result.failed],
         }
 

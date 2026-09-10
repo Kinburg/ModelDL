@@ -78,9 +78,17 @@ def source_url(identity: FileIdentity, host: str | None = None) -> str | None:
 
     Identities deliberately hold no URL — that is what makes them survive re-signing and
     token rotation — so the link has to be reconstructed when one is needed for a record.
+
+    None when a stored ref is missing the pieces the link is made of, rather than an error.
+    A row written by an older build with a different ref shape is not a reason to refuse to
+    write a record — the URL is the one field in it that can be looked up again by hand, and
+    raising here once cost a note its 404, reported as a task that did not exist.
     """
     ref = identity.ref
     if identity.provider == "huggingface":
+        wanted = ("repo_id", "repo_type", "revision", "path")
+        if any(ref.get(key) is None for key in wanted):
+            return None
         return hf.HfRef(
             repo_id=str(ref["repo_id"]),
             repo_type=str(ref["repo_type"]),
@@ -88,12 +96,17 @@ def source_url(identity: FileIdentity, host: str | None = None) -> str | None:
             path=str(ref["path"]),
         ).download_url()
     if identity.provider == "civitai":
+        if ref.get("version_id") is None or ref.get("file_id") is None:
+            return None
         return (
             f"https://{host or cv.DEFAULT_HOST}/api/download/models/{ref['version_id']}"
             f"?fileId={ref['file_id']}"
         )
     if identity.provider == "direct":
-        return str(ref.get("url")) or None
+        # `str(None)` is the string "None", which is truthy, so the guard that was here
+        # never fired: a ref with no url put the word None in a record as the link.
+        url = ref.get("url")
+        return str(url) if url else None
     return None
 
 

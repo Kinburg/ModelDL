@@ -24,6 +24,11 @@ attention:
   did. It belongs on a thread, not on the event loop, and it reports its progress — a
   6 GB checkpoint crossing from one drive to another is minutes of an application that
   would otherwise look like it had hung.
+
+Renaming is the same problem with the axes swapped — the folder stays and the name changes —
+and it is here for the same reason: `pytorch_lora_weights.safetensors`, which is what half of
+HuggingFace calls its LoRAs, is unreadable in a folder of two hundred, and renaming it in
+Explorer orphans four files at a stroke.
 """
 
 from __future__ import annotations
@@ -36,11 +41,15 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .sidecar import PREVIEW_SUFFIX, record_path
+from .sidecar import PREVIEW_SUFFIX, record_path, retitle
 
 # Read size for the copy a cross-volume move turns into. Large enough that the progress
 # callback fires a few times a second on a slow drive rather than a few thousand.
 COPY_CHUNK = 4 * 1024 * 1024
+
+# What a filename may not contain: the separators, which would make a rename into a move,
+# and the characters Windows refuses outright.
+FORBIDDEN = frozenset(r'\/:*?"<>|')
 
 # Called with (bytes copied, total) while a move is copying. Never called for a move that
 # is a rename, because there is nothing to report: it is instant.
@@ -147,6 +156,92 @@ def move(
     return result
 
 
+def intended_name(path: Path, name: str) -> str:
+    """The filename a rename really means, or a refusal saying why it cannot be one.
+
+    Two things are settled here rather than left to the filesystem to complain about later.
+
+    A name is a name and not a path. Anything with a separator in it is a move disguised as
+    a rename, and this function is reached from a server with no authentication: `../../id_rsa`
+    typed into a rename box must fail as a bad name, not succeed as a relocation. The
+    characters Windows refuses outright go the same way, because "the system cannot find the
+    file specified" is not an answer anyone can act on.
+
+    And the extension is kept, always. `.safetensors` is not decoration — it is what every
+    loader dispatches on, and a model renamed to `.ckpt` would be a file claiming to be a
+    format it is not. Typing the extension is allowed and typing it wrong is not: whatever
+    is given, the model's own suffix is what ends up on the end.
+    """
+    wanted = name.strip().rstrip(". ")
+    if not wanted:
+        raise ValueError("a file needs a name")
+    if wanted in {".", ".."} or FORBIDDEN.intersection(wanted) or any(
+        ord(c) < 32 for c in wanted
+    ):
+        raise ValueError(f"{name!r} is not a filename")
+
+    suffix = path.suffix
+    if suffix and wanted.lower().endswith(suffix.lower()):
+        wanted = wanted[: -len(suffix)].rstrip(". ")
+        if not wanted:
+            raise ValueError("a file needs more of a name than its extension")
+    return wanted + suffix
+
+
+def rename(
+    path: Path,
+    name: str,
+    sidecar_dir: Path | None = None,
+    library_root: Path | None = None,
+) -> Move:
+    """Give `path` a new name, and every file named after it the matching one.
+
+    The correction for a filename rather than for a folder — `pytorch_lora_weights.safetensors`,
+    which is what half of HuggingFace calls its LoRAs, tells you nothing in a folder of two
+    hundred. It is the same operation as a move and shares its rules: nothing is overwritten,
+    the model goes first, and a companion that will not go is named rather than swallowed.
+
+    What it does not share is the drive boundary. A rename stays in the folder it started
+    in, so it is always the instant kind — there is no copy here to report on or to stop.
+    """
+    if not path.is_file():
+        raise FileNotFoundError(f"{path} is not there any more")
+
+    target = path.with_name(intended_name(path, name))
+    if target == path:
+        return Move(path=path, unchanged=True)
+    if target.exists():
+        # Including a difference of case only, on the filesystems that cannot tell them
+        # apart. Refusing is the wrong answer for `Model.safetensors` -> `model.safetensors`
+        # and the right one for everything else, and the two are indistinguishable from
+        # here — so the safe reading wins, as it does for a move.
+        raise FileExistsError(f"{path.parent} already holds a {target.name}")
+
+    followers = [
+        (source, _renamed(source, path, target, sidecar_dir, library_root))
+        for source in companions(path, sidecar_dir, library_root)
+    ]
+
+    _transfer(path, target)
+
+    result = Move(path=target)
+    for source, destination in followers:
+        if destination.exists():
+            result.failed.append((source, "a file of that name is already there"))
+            continue
+        try:
+            _transfer(source, destination)
+        except OSError as exc:
+            result.failed.append((source, str(exc)))
+        else:
+            result.companions.append(destination)
+
+    # The record names the file it describes. Leaving the old name in it would make the one
+    # document that explains where a model came from disagree with the model.
+    retitle(record_path(target, sidecar_dir, library_root), target.name)
+    return result
+
+
 def _transfer(
     source: Path,
     target: Path,
@@ -211,3 +306,24 @@ def _destination(
     if source == record_path(path, sidecar_dir, library_root):
         return record_path(target, sidecar_dir, library_root)
     return target.with_name(source.name)
+
+
+def _renamed(
+    source: Path,
+    path: Path,
+    target: Path,
+    sidecar_dir: Path | None,
+    library_root: Path | None,
+) -> Path:
+    """What one companion of `path` is called once the model is called `target`.
+
+    Not the same calculation as a move's. There the name is what stays fixed and the folder
+    changes; here it is the other way about, and the companions do not all take the model's
+    name the same way — the record is `<model>.safetensors.json`, everything else is
+    `<model>.txt`. Splitting on the stem rather than rebuilding from a guess keeps
+    `.civitai.info` and `.preview.png` intact, both of which look like two extensions to
+    anything that reasons in suffixes.
+    """
+    if source == record_path(path, sidecar_dir, library_root):
+        return record_path(target, sidecar_dir, library_root)
+    return source.with_name(target.stem + source.name[len(path.stem):])

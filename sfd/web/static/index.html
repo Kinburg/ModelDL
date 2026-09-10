@@ -182,6 +182,78 @@
   </div>
 </div>
 
+<!-- Renaming, for a file the service named something nobody can scan -->
+<div class="modal-backdrop" id="rename-backdrop">
+  <div class="modal" id="rename" role="dialog" aria-modal="true" aria-labelledby="rename-title">
+    <div class="modal-header">
+      <strong id="rename-title">Rename</strong>
+      <button class="modal-close" id="close-rename" title="Close">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="small muted" id="rename-where"></div>
+      <div class="input-with-btn" style="margin:12px 0 8px">
+        <input id="rename-input" aria-label="New name" spellcheck="false" autocomplete="off">
+        <span class="suffix" id="rename-suffix"></span>
+      </div>
+      <div class="small muted" id="rename-also"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="primary" id="rename-go">Rename</button>
+      <span style="flex:1"></span>
+      <!-- Not a restriction anyone has to work around: every loader dispatches on the
+           extension, so changing it would make the file lie about its own format. -->
+      <span class="small muted">The extension stays as it is.</span>
+    </div>
+  </div>
+</div>
+
+<!-- Your own note. The one thing in a record that no service can supply -->
+<div class="modal-backdrop" id="note-backdrop">
+  <div class="modal" id="note" role="dialog" aria-modal="true" aria-labelledby="note-title">
+    <div class="modal-header">
+      <strong id="note-title">Note</strong>
+      <button class="modal-close" id="close-note" title="Close">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="small muted" id="note-file"></div>
+      <textarea id="note-text" rows="6" maxlength="4000" spellcheck="false"
+                aria-label="Your note about this file"
+                placeholder="What you will want to know the next time you find this file — the weight that works, what it clashes with, why you kept it."></textarea>
+      <!-- Said here because it is the question a note raises: the queue row is cleared by
+           Clear finished and the record is not. -->
+      <div class="small muted">Kept in the file's <code>.json</code> record, so it survives
+        <em>Clear finished</em> and follows the file through a move or a rename.</div>
+    </div>
+    <div class="modal-footer">
+      <button class="primary" id="note-save">Save</button>
+      <button id="note-clear" hidden>Remove the note</button>
+      <span style="flex:1"></span>
+      <span class="small muted" id="note-count"></span>
+    </div>
+  </div>
+</div>
+
+<!-- What a delete would take, before it takes it -->
+<div class="modal-backdrop" id="delete-backdrop">
+  <div class="modal" id="delete" role="dialog" aria-modal="true" aria-labelledby="delete-title">
+    <div class="modal-header">
+      <strong id="delete-title">Delete from disk</strong>
+      <button class="modal-close" id="close-delete" title="Close">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="small muted" id="delete-intro"></div>
+      <div class="dest muted small" id="delete-where"></div>
+      <ul class="filelist" id="delete-list"></ul>
+      <div class="small warn">Deleted for good — nothing here goes to a recycle bin.</div>
+    </div>
+    <div class="modal-footer">
+      <button class="danger" id="delete-go">Delete</button>
+      <span style="flex:1"></span>
+      <span class="small muted" id="delete-total"></span>
+    </div>
+  </div>
+</div>
+
 <!-- Sample images, full size, with the prompt that produced each one -->
 <div class="modal-backdrop" id="preview-backdrop">
   <div class="modal wide" id="preview-modal" role="dialog" aria-modal="true" aria-labelledby="preview-title">

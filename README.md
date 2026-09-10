@@ -268,6 +268,63 @@ started the move, so the button is there after a reload and in a second window. 
 last byte is across there is nothing left to stop: the sidecars that follow are far too
 small to wait for, and stopping between them would strand the model away from them.
 
+*Rename…* is the same correction applied to the name rather than the folder, and it exists
+because `pytorch_lora_weights.safetensors` — what half of HuggingFace calls its LoRAs — is
+unreadable in a folder of two hundred, and renaming it in Explorer orphans four files at a
+stroke. Everything named after the model takes the new name with it, the collected `.json`
+record included, and the record's own `filename` field is rewritten so the one document
+that explains where a model came from does not go on naming a file that no longer exists.
+A name already taken in that folder is refused before anything is touched, exactly as a
+move is.
+
+The extension is not part of the question: it sits outside the box, because every loader
+dispatches on it and a model renamed to `.ckpt` would be a file lying about its own format.
+Type it or leave it out — either way the model keeps the one it has. A name that is really
+a path is refused as a name rather than quietly becoming a move: this is the one place in
+the server where a string from the browser becomes a filename on disk, so `../` and a drive
+letter are not filenames and are answered as such.
+
+*Delete files* is the other thing Explorer does badly, and it is deliberately only on an
+open card — *Remove* on a collapsed row takes a download off the list and leaves every byte
+where it is. Delete takes the set: the model, the four files named after it, and the
+`.part`, `.part.json` and `.part.corrupt` of a download that never finished. That last group
+is usually the reason anyone is here — a 40 GB fragment from an evening abandoned in March
+is named after a model that does not exist, so nothing else will ever clear it — and it is
+why the button is offered on a paused or failed download too, not only a finished one.
+
+You are shown the actual list, with sizes, before any of it goes, because this is permanent:
+there is no recycle bin behind it. The model is deleted first and on its own terms — if it
+will not go, which on Windows means a loader has the weights open, nothing else is touched
+either, since a model still sitting there without its record, triggers and preview is worse
+than a delete that did nothing. Past that point the set is gone whatever happens, so a
+sidecar that will not go is named rather than raised. The queue row goes with the files:
+everything a finished card shows is about a file on disk, and without one there is nothing
+left for it to say.
+
+*Note…* is for the thing about a model that only you know. Not what the service published —
+that is already in the record — but what you found out: the weight past which it burns, the
+LoRA it fights, why you kept this quantisation and not the other one. A folder of
+`.safetensors` cannot hold that, and neither can a memory of an evening six weeks ago.
+
+It lives in the `.json` record rather than in the queue, and that is the whole of the design.
+The queue row is deleted by *Clear finished*, which is the button anyone presses after an
+evening of collecting; the record is not. It follows the file through *Move to…* and
+*Rename…*, it goes when *Delete files* goes, and the column beside the queue is only a copy
+of it — the same relationship `downloaded` has with the `.part.json` beside a half-finished
+file. Emptying the box removes the note rather than storing a blank one.
+
+A file downloaded with **write metadata sidecars** turned off has nowhere to keep a note, so
+one is written — the record it would have had, and only that: the `.civitai.info` and the
+trigger `.txt` are a separate choice and adding a note is not the moment to overrule it. The
+page says so when it happens, because a new file appearing beside a model is not something
+to find out about later. Everything else in a record can be fetched from the service again;
+this is the one field that cannot, which is why it is worth a file of its own.
+
+On an open card the note is shown in full. On a collapsed row it is a short amber chip
+between the origin and the state — abbreviated, the whole of it on hover, and a click opens
+it for editing. It is also searched by the filter box, which is the point: *which of these
+was the one that did hands properly* is a question about a note, not about a filename.
+
 Turn off **start downloads on add** and links pile up paused instead, so an afternoon of
 collecting them costs no bandwidth until you press *Start all*. That releases what is merely
 waiting; blocked tasks stay blocked, because they are waiting on a decision rather than on

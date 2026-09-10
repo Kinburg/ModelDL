@@ -98,7 +98,7 @@ function matches(task) {
   const wanted = $("filter-text").value.trim().toLowerCase();
   if (!(STATES[$("filter-state").value] || STATES.all)(task)) return false;
   if (!wanted) return true;
-  return [task.filename, task.label, task.source, task.dest, task.origin]
+  return [task.filename, task.label, task.source, task.dest, task.origin, task.note]
     .some((field) => (field || "").toLowerCase().includes(wanted));
 }
 
@@ -198,6 +198,7 @@ function taskHtml(t, pinned = false) {
             <div class="task-head">
               <span class="name">${escapeHtml(t.filename || t.source)}</span>
               ${originHtml(t)}
+              ${noteHtml(t)}
               <span class="state done">done</span>
               <span class="small muted">${fmtBytes(t.size)}</span>
               <span class="actions">
@@ -209,7 +210,9 @@ function taskHtml(t, pinned = false) {
                   title="Copy the trigger words, ready for a prompt">Triggers</button>` : ""}
                 ${t.dest ? `<button data-action="open-folder" title="Show in File Explorer">Folder</button>` : ""}
                 ${t.dest ? `<button data-action="move" title="Move it somewhere else in the library">Move to…</button>` : ""}
-                <button class="danger" data-action="cancel">Remove</button>
+                ${t.dest ? `<button data-action="rename" title="Rename it, and every file named after it">Rename…</button>` : ""}
+                <button class="danger" data-action="cancel"
+                        title="Take it off the list. The files stay on the disk">Remove</button>
               </span>
             </div>
           </div>
@@ -229,9 +232,19 @@ function taskHtml(t, pinned = false) {
     buttons.push(`<button data-action="expand" title="Collapse">⌃</button>`);
     if (t.dest) buttons.push(`<button data-action="open-folder" title="Show in File Explorer">Folder</button>`);
     if (t.dest) buttons.push(`<button data-action="move" title="Move it somewhere else in the library">Move to…</button>`);
+    if (t.dest) buttons.push(`<button data-action="rename" title="Rename it, and every file named after it">Rename…</button>`);
+    if (t.dest) buttons.push(`<button data-action="note" title="What you want to know about this file next time">Note…</button>`);
     buttons.push(`<button data-action="record">Info</button>`);
   }
-  buttons.push(`<button class="danger" data-action="cancel">Remove</button>`);
+  // Only on an open card, never on a collapsed row. It is the one button here that destroys
+  // something, and having to open the card first is the cheapest possible way of making it
+  // a decision rather than a mis-click in a list of forty.
+  if (t.dest) {
+    buttons.push(`<button class="danger" data-action="delete-files"
+      title="Delete the file and its sidecars from the disk, for good">Delete files</button>`);
+  }
+  buttons.push(`<button class="danger" data-action="cancel"
+    title="Take it off the list. The files stay on the disk">Remove</button>`);
 
   // No category dropdown any more: *Accept* takes the guess the card already explains, and
   // *Elsewhere…* opens the library itself. A list of our internal category names could not
@@ -292,6 +305,7 @@ function taskHtml(t, pinned = false) {
           </div>
           ${t.dest ? `<div class="dest muted small">${escapeHtml(t.dest)}</div>` : ""}
           ${why}
+          ${t.note ? `<div class="note small">${escapeHtml(t.note)}</div>` : ""}
           ${t.disagreement ? `<div class="small" style="color:var(--warn)">the service lists this as ${escapeHtml(t.disagreement)}</div>` : ""}
           ${t.error ? `<div class="small err">${escapeHtml(t.error)}</div>` : ""}
           <div class="timing small muted">${timing.map((x) => `<span>${escapeHtml(x)}</span>`).join("")}</div>
@@ -305,6 +319,11 @@ function taskHtml(t, pinned = false) {
 // Which service a file came off, in the header where its name is. With forty rows on
 // screen, "where did this one come from" is a question answered by looking rather than by
 // opening anything — and it is the difference between two files of the same name.
+const noteHtml = (t) => t.note
+  ? `<button class="has-note" data-action="note"
+             title="${escapeHtml(t.note)}">${escapeHtml(t.note)}</button>`
+  : "";
+
 const originHtml = (t) => t.origin
   ? `<span class="origin" title="downloaded from ${escapeHtml(t.origin)}">${escapeHtml(t.origin)}</span>`
   : "";
@@ -621,6 +640,9 @@ async function act(id, action, node) {
     // to the wrong place" want the identical ranked list of folders; only what happens on
     // the click differs, so only that is passed in.
     if (action === "move") { await askWhere(id, "move"); return; }
+    if (action === "rename") { await askRename(id); return; }
+    if (action === "delete-files") { await askDelete(id); return; }
+    if (action === "note") { askNote(id); return; }
     if (action === "cancel") await api(`/api/tasks/${id}`, { method: "DELETE" });
     // Accepting the placement the card already spells out: no correction to send with it.
     else if (action === "confirm") await api(`/api/tasks/${id}/confirm`, { method: "POST", body: "{}" });
@@ -853,6 +875,237 @@ function closeFolders() {
   choosing = null;
   closeModal("folders-backdrop");
 }
+
+// --- your own note ----------------------------------------------------------
+
+// The one field in a record nothing can fill in for you, and therefore the one worth the
+// most care: it lives on the disk and the queue row only carries a copy, because the row
+// is cleared by Clear finished and the record is not.
+const NOTE_MAX = 4000;
+
+let noting = null;
+
+function askNote(id) {
+  const task = tasks.get(id);
+  if (!task || !task.dest) return;
+  noting = id;
+  $("note-file").textContent = task.filename || task.source;
+  $("note-text").value = task.note || "";
+  // Nothing to remove until there is something to remove.
+  $("note-clear").hidden = !task.note;
+  countNote();
+  openModal("note-backdrop", "note-text");
+  // At the end rather than the start: opening a note you already wrote is almost always
+  // about adding to it.
+  const box = $("note-text");
+  box.setSelectionRange(box.value.length, box.value.length);
+}
+
+function closeNote() {
+  noting = null;
+  closeModal("note-backdrop");
+}
+
+// Quiet until it is nearly full, then it says so. A paste that runs into the cap is
+// silently truncated by the textarea, which is the one moment a counter earns its place.
+function countNote() {
+  const left = NOTE_MAX - $("note-text").value.length;
+  $("note-count").textContent = left <= 400 ? `${left} characters left` : "";
+}
+
+async function saveNote(text) {
+  const id = noting;
+  if (id === null) return;
+  let result;
+  $("note-save").disabled = $("note-clear").disabled = true;
+  try {
+    result = await api(`/api/tasks/${id}/note`, {
+      method: "POST", body: JSON.stringify({ note: text }),
+    });
+  } catch (e) { message(e.message, true); return; }
+  finally { $("note-save").disabled = $("note-clear").disabled = false; }
+
+  closeNote();
+  // The stream carries the new row a moment later; patching here is what keeps the card
+  // from showing the old note for the length of the round trip.
+  const task = tasks.get(id);
+  if (task) { task.note = result.note; render(); }
+
+  if (!result.note) { message("the note is gone"); return; }
+  // Worth saying out loud: sidecars were turned off, so there was nowhere for a note to
+  // live and a record was written to make somewhere. A new file appearing beside a model
+  // is not something to discover later.
+  message(result.record_written
+    ? "note saved — a .json record was written beside the model to hold it"
+    : "note saved");
+}
+
+$("note-save").onclick = () => saveNote($("note-text").value);
+$("note-clear").onclick = () => saveNote("");
+$("note-text").oninput = countNote;
+$("note-text").addEventListener("keydown", (e) => {
+  // Enter belongs to the note; the shortcut has to be the other one.
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) $("note-save").click();
+});
+$("close-note").onclick = closeNote;
+$("note-backdrop").addEventListener("click", (e) => {
+  if (e.target === $("note-backdrop")) closeNote();
+});
+
+// --- renaming and deleting --------------------------------------------------
+
+// Both dialogs ask the server what is on disk before they say anything, because both are
+// about the set of files rather than the one the card names. Guessing the set from the
+// filename would be right until a download was made with sidecars turned off, which is
+// exactly when a wrong count matters.
+const folderOf = (path) => String(path || "").replace(/[\\/][^\\/]*$/, "");
+
+async function belongings(id) {
+  try { return await api(`/api/tasks/${id}/files`); }
+  catch { return null; }
+}
+
+// --- renaming
+
+let renaming = null;
+
+async function askRename(id) {
+  const task = tasks.get(id);
+  if (!task || !task.dest) return;
+  const name = task.filename || "";
+  // The extension is not part of the answer, so it is not in the box: `lastIndexOf` rather
+  // than a split, because `add_detail_v1.5.safetensors` has two dots and only one suffix.
+  const dot = name.lastIndexOf(".");
+  const stem = dot > 0 ? name.slice(0, dot) : name;
+
+  renaming = id;
+  $("rename-where").textContent = `${name} — in ${folderOf(task.dest)}`;
+  $("rename-suffix").textContent = dot > 0 ? name.slice(dot) : "";
+  $("rename-input").value = stem;
+  $("rename-also").textContent = "";
+  openModal("rename-backdrop", "rename-input");
+  $("rename-input").select();
+
+  // After the dialog is up, not before it: the count is worth having and never worth
+  // waiting on, and a dialog that opens a beat late reads as a click that missed.
+  const found = await belongings(id);
+  if (renaming !== id || !found) return;
+  const others = found.files.length - 1;
+  $("rename-also").textContent = others > 0
+    ? `${others} file${others > 1 ? "s" : ""} named after it get the new name too`
+    : "nothing else on disk carries this name";
+}
+
+function closeRename() {
+  renaming = null;
+  closeModal("rename-backdrop");
+}
+
+$("rename-go").onclick = async () => {
+  const id = renaming;
+  if (id === null) return;
+  const name = $("rename-input").value.trim();
+  if (!name) { message("a file needs a name", true); return; }
+
+  let result;
+  $("rename-go").disabled = true;
+  try {
+    result = await api(`/api/tasks/${id}/rename`, {
+      method: "POST", body: JSON.stringify({ name }),
+    });
+  } catch (e) { message(e.message, true); return; }
+  finally { $("rename-go").disabled = false; }
+
+  closeRename();
+  if (result.unchanged) { message("that is already its name"); return; }
+  // The same rule as a move reports by: a companion left behind under the old name is the
+  // failure worth saying out loud, because nothing about the folder shows it.
+  if (result.failed.length) {
+    message(`renamed to ${result.filename}, but ${result.failed.length} file(s) kept the old `
+      + `name: ` + result.failed.map((f) => `${f.path} (${f.reason})`).join("; "), true);
+    return;
+  }
+  const also = result.renamed
+    ? ` with ${result.renamed} file${result.renamed > 1 ? "s" : ""} named after it` : "";
+  message(`renamed to ${result.filename}${also}`);
+};
+
+$("close-rename").onclick = closeRename;
+$("rename-backdrop").addEventListener("click", (e) => {
+  if (e.target === $("rename-backdrop")) closeRename();
+});
+$("rename-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") $("rename-go").click();
+});
+
+// --- deleting
+
+let deleting = null;
+
+async function askDelete(id) {
+  const task = tasks.get(id);
+  if (!task) return;
+  const found = await belongings(id);
+  if (!found) { message("could not read what is on disk for this one", true); return; }
+  if (!found.files.length) {
+    // Nothing to delete is not an error and not a dialog. Remove is the button they want,
+    // and saying so is more use than an empty list with a Delete button under it.
+    message("nothing of this download is on the disk — Remove takes it off the list");
+    return;
+  }
+
+  deleting = id;
+  $("delete-intro").textContent =
+    `${task.filename || task.source} and everything named after it:`;
+  $("delete-where").textContent = folderOf(task.dest);
+  $("delete-list").innerHTML = found.files.map((file) => `
+    <li class="${file.path === found.model ? "model" : ""}">
+      <span class="path">${escapeHtml(file.name)}</span>
+      <span class="size">${fmtBytes(file.size)}</span>
+    </li>`).join("");
+  $("delete-total").textContent =
+    `${found.files.length} file${found.files.length > 1 ? "s" : ""} · ${fmtBytes(found.total)}`;
+  $("delete-go").textContent = `Delete ${found.files.length} file${found.files.length > 1 ? "s" : ""}`;
+  // Nothing is focused on purpose. The one button here deletes a file permanently, and a
+  // dialog that opens with it under the cursor's Enter is a dialog that deletes by reflex.
+  openModal("delete-backdrop");
+}
+
+function closeDelete() {
+  deleting = null;
+  closeModal("delete-backdrop");
+}
+
+$("delete-go").onclick = async () => {
+  const id = deleting;
+  if (id === null) return;
+  let result;
+  $("delete-go").disabled = true;
+  try {
+    result = await api(`/api/tasks/${id}/files`, { method: "DELETE" });
+  } catch (e) { message(e.message, true); return; }
+  finally { $("delete-go").disabled = false; }
+
+  closeDelete();
+  // The stream says the same thing a moment later; doing it here as well is what keeps the
+  // row from sitting there through the round trip looking like a delete that did nothing.
+  tasks.delete(id);
+  render();
+
+  if (result.failed.length) {
+    message(`the model is gone, but ${result.failed.length} file(s) stayed behind: `
+      + result.failed.map((f) => `${f.path} (${f.reason})`).join("; "), true);
+    return;
+  }
+  const count = result.deleted.length;
+  message(`deleted ${count} file${count === 1 ? "" : "s"}`
+    + (result.missing ? " — the model itself was already gone" : ""));
+};
+
+$("close-delete").onclick = closeDelete;
+$("delete-backdrop").addEventListener("click", (e) => {
+  if (e.target === $("delete-backdrop")) closeDelete();
+});
 
 // Said while the queue is being assembled, "this will not fit" is one line and a decision
 // about what to drop. Said by the disk at four in the morning, it is a row of failures.
@@ -1102,6 +1355,9 @@ window.addEventListener("keydown", (e) => {
     // Innermost first: the lightbox can be opened from the folder dialog, and closing both
     // with one press would throw away the question that was being answered.
     if (modalOpen("preview-backdrop")) closePreview();
+    else if (modalOpen("delete-backdrop")) closeDelete();
+    else if (modalOpen("note-backdrop")) closeNote();
+    else if (modalOpen("rename-backdrop")) closeRename();
     else if (modalOpen("folders-backdrop")) closeFolders();
     else if (modalOpen("settings-backdrop")) closeSettings();
     else message("");

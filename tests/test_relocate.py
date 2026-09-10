@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import json
 import os
 import threading
 from pathlib import Path
@@ -501,3 +502,152 @@ async def test_one_file_cannot_be_moved_twice_at_once(tmp_path: Path, monkeypatc
     release.set()
     await first
     database.close()
+
+
+# --- the same correction, applied to the name -------------------------------
+
+
+def test_everything_named_after_the_model_takes_the_new_name(tmp_path: Path):
+    path = place(tmp_path / "loras", "pytorch_lora_weights.safetensors")
+
+    result = relocate.rename(path, "detail slider v3")
+
+    folder = tmp_path / "loras"
+    assert result.path == folder / "detail slider v3.safetensors"
+    assert not result.failed
+    assert sorted(p.name for p in folder.iterdir()) == [
+        "detail slider v3.civitai.info",
+        "detail slider v3.preview.png",
+        "detail slider v3.safetensors",
+        "detail slider v3.safetensors.json",
+        "detail slider v3.txt",
+    ]
+
+
+def test_the_extension_is_kept_however_it_is_typed(tmp_path: Path):
+    """Every loader dispatches on it, so a model renamed to `.ckpt` would be a file lying
+    about its own format. Typing it is allowed; changing it is not."""
+    path = place(tmp_path / "loras")
+
+    for typed, expected in [
+        ("other", "other.safetensors"),
+        ("other.safetensors", "other.safetensors"),
+        ("other.SAFETENSORS", "other.safetensors"),
+        ("other.ckpt", "other.ckpt.safetensors"),
+        # Two dots and one suffix: the version number is part of the name, not an extension.
+        ("add_detail_v1.5", "add_detail_v1.5.safetensors"),
+    ]:
+        assert relocate.intended_name(path, typed) == expected, typed
+
+
+def test_a_name_that_is_really_a_path_is_refused(tmp_path: Path):
+    """This is reached from a server with no authentication, and it is the one place a
+    string from the browser becomes a filename on disk."""
+    path = place(tmp_path / "loras")
+
+    for escape in ("../elsewhere", "sub/other", r"C:\Windows\evil", "", "  ", "..", "a?b"):
+        with pytest.raises(ValueError):
+            relocate.rename(path, escape)
+
+    assert path.is_file()
+
+
+def test_a_file_of_that_name_already_there_stops_everything(tmp_path: Path):
+    path = place(tmp_path / "loras")
+    place(tmp_path / "loras", "taken.safetensors").write_bytes(b"the other one")
+
+    with pytest.raises(FileExistsError):
+        relocate.rename(path, "taken")
+
+    assert path.is_file()
+    assert (tmp_path / "loras" / "taken.safetensors").read_bytes() == b"the other one"
+    assert (tmp_path / "loras" / f"{MODEL}.json").is_file(), "no sidecar was renamed either"
+
+
+def test_the_record_stops_naming_a_file_that_no_longer_exists(tmp_path: Path):
+    """The record opens with the name of the file it describes, and that name is how a
+    collected `sidecar_dir` is matched back to a model."""
+    path = place(tmp_path / "loras", sidecars=False)
+    record = path.with_name(path.name + ".json")
+    record.write_text(json.dumps({"schema": 1, "filename": MODEL}), encoding="utf-8")
+
+    relocate.rename(path, "renamed")
+
+    written = json.loads(
+        (tmp_path / "loras" / "renamed.safetensors.json").read_text("utf-8")
+    )
+    assert written["filename"] == "renamed.safetensors"
+
+
+def test_a_collected_record_is_renamed_inside_its_mirror(tmp_path: Path):
+    library = tmp_path / "library"
+    collected = tmp_path / "meta"
+    path = place(library / "loras", sidecars=False)
+    record = collected / "loras" / f"{MODEL}.json"
+    record.parent.mkdir(parents=True)
+    record.write_text('{"schema": 1}', encoding="utf-8")
+
+    result = relocate.rename(path, "renamed", sidecar_dir=collected, library_root=library)
+
+    assert result.companions == [collected / "loras" / "renamed.safetensors.json"]
+    assert not record.exists()
+    assert not (library / "loras" / "renamed.safetensors.json").exists()
+
+
+def test_renaming_a_file_to_what_it_is_called_changes_nothing(tmp_path: Path):
+    path = place(tmp_path / "loras")
+
+    result = relocate.rename(path, "mystery")
+
+    assert result.unchanged
+    assert path.is_file()
+
+
+def test_renaming_a_file_that_is_gone_says_so(tmp_path: Path):
+    with pytest.raises(FileNotFoundError):
+        relocate.rename(tmp_path / "loras" / MODEL, "anything")
+
+
+def test_the_page_can_rename_a_finished_download(client):
+    task = finished(client)
+
+    body = client.post(f"/api/tasks/{task.id}/rename", json={"name": "renamed"}).json()
+
+    assert body["ok"] and body["renamed"] == 4 and not body["failed"]
+    renamed = client.library / "loras" / "renamed.safetensors"
+    assert renamed.is_file()
+    after = client.database.get(task.id)
+    # Both, or the row lies twice: `dest` is what Folder opens, `filename` is what the card
+    # shows and what the queue is searched by.
+    assert after.dest == str(renamed)
+    assert after.filename == "renamed.safetensors"
+
+
+def test_the_page_cannot_rename_a_file_into_another_folder(client):
+    task = finished(client)
+
+    for escape in ("../escaped", "sub/other", "", r"C:\Windows\evil"):
+        response = client.post(f"/api/tasks/{task.id}/rename", json={"name": escape})
+        assert response.status_code == 400, escape
+
+    assert (client.library / "loras" / MODEL).is_file()
+    assert client.database.get(task.id).filename == MODEL
+
+
+def test_only_a_finished_download_can_be_renamed(client):
+    task = finished(client, state="running")
+
+    response = client.post(f"/api/tasks/{task.id}/rename", json={"name": "renamed"})
+
+    assert response.status_code == 400
+    assert (client.library / "loras" / MODEL).is_file()
+
+
+def test_an_occupied_name_is_reported_not_overwritten(client):
+    task = finished(client)
+    place(client.library / "loras", "taken.safetensors").write_bytes(b"the other one")
+
+    response = client.post(f"/api/tasks/{task.id}/rename", json={"name": "taken"})
+
+    assert response.status_code == 409
+    assert (client.library / "loras" / "taken.safetensors").read_bytes() == b"the other one"

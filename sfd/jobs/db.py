@@ -58,7 +58,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Automatic retries. `attempts` counts the ones already spent, `retry_at` is when the
     -- next one is due; both are cleared when a person presses Retry themselves.
     attempts      INTEGER NOT NULL DEFAULT 0,
-    retry_at      REAL
+    retry_at      REAL,
+    -- What you wrote about the file yourself. A cache of the `note` in the `.json` record,
+    -- which is where it actually lives: this row is cleared by `Clear finished` and the
+    -- record is not, and a note that survives only until the list is tidied is no note.
+    note          TEXT
 );
 """
 
@@ -117,6 +121,7 @@ class Task:
     transferred: int = 0
     attempts: int = 0
     retry_at: float | None = None
+    note: str | None = None
 
     @property
     def duration(self) -> float | None:
@@ -163,6 +168,7 @@ class Task:
             "transferred": self.transferred,
             "attempts": self.attempts,
             "retry_at": self.retry_at,
+            "note": self.note,
             "duration": self.duration,
             "average_speed": self.average_speed,
             # Split and tidied the same way the `.txt` beside the model is, because the page
@@ -215,6 +221,7 @@ class Database:
             "transferred": "INTEGER NOT NULL DEFAULT 0",
             "attempts": "INTEGER NOT NULL DEFAULT 0",
             "retry_at": "REAL",
+            "note": "TEXT",
         }
         for column, definition in additions.items():
             if column not in existing:
@@ -446,4 +453,5 @@ def _to_task(row: sqlite3.Row) -> Task:
         transferred=row["transferred"] or 0,
         attempts=row["attempts"] or 0,
         retry_at=row["retry_at"],
+        note=row["note"],
     )

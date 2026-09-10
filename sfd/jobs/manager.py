@@ -36,7 +36,7 @@ from ..core.state import PartState
 from ..core.transfer import Transfer, TransferOptions, hash_file
 from ..engines.hf_hub import HfHubEngine, HfHubOptions
 from ..core.types import FileIdentity, ProgressSnapshot
-from ..library import relocate, sidecar
+from ..library import erase, relocate, sidecar
 from ..library.categories import ALIASES
 from ..library.classify import Verdict, classify
 from ..library.inspect import sniff_remote
@@ -434,6 +434,136 @@ class Manager:
 
         return report
 
+    async def rename(self, task_id: int, name: str) -> relocate.Move:
+        """Give a finished download a different filename, sidecars and all.
+
+        The other half of the correction `move` makes. A file lands under whatever the
+        service happened to call it, and `pytorch_lora_weights.safetensors` — HuggingFace's
+        own default — is four files that all have to change together, in a folder where
+        several downloads may already be carrying that exact name.
+
+        On a thread like a move, though for a different reason: a rename within a folder is
+        instant, and it is the four `stat` calls that find the companions which have no
+        business happening on the event loop while a download is running.
+        """
+        task = self.db.get(task_id)
+        if task is None:
+            raise LookupError("no such task")
+        if task.state != db.DONE or not task.dest:
+            raise ValueError("only a finished download can be renamed")
+        if task_id in self._moves:
+            raise ValueError("this file is being moved right now")
+
+        result = await asyncio.to_thread(
+            relocate.rename,
+            Path(task.dest),
+            name,
+            sidecar_dir=Path(self.settings.sidecar_dir) if self.settings.sidecar_dir else None,
+            library_root=Path(self.settings.library_root) if self.settings.library_root else None,
+        )
+        if result.unchanged:
+            return result
+
+        # Both, and never just the path: `filename` is what the card shows, what the queue
+        # is searched by, and what a future download checks against to decide it is already
+        # here. A row where the two disagree is a row that lies twice.
+        self.db.update(task_id, dest=str(result.path), filename=result.path.name)
+        self._emit_task(task_id)
+        return result
+
+    async def set_note(self, task_id: int, note: str) -> tuple[str | None, bool]:
+        """Write your own note about a finished download, or clear it.
+
+        Returns what the record now says and whether a record had to be written to hold it.
+
+        The note goes on the disk first and into the queue second, and that order is the
+        whole design: this row is deleted by `Clear finished` and the record is not, so the
+        record is where the note actually lives and the column is a copy for the card to
+        draw and the filter box to search. The same relationship `downloaded` has with the
+        `.part.json` beside the file.
+        """
+        task = self.db.get(task_id)
+        if task is None:
+            raise LookupError("no such task")
+        if task.state != db.DONE or not task.dest:
+            raise ValueError("only a finished download can be annotated")
+        if task_id in self._moves:
+            raise ValueError("this file is being moved right now")
+
+        written, created = await asyncio.to_thread(self._annotate, Path(task.dest), task, note)
+        self.db.update(task_id, note=written)
+        self._emit_task(task_id)
+        return written, created
+
+    def _annotate(self, path: Path, task: Task, note: str) -> tuple[str | None, bool]:
+        """Put the note in the record, writing the record first if there is not one yet."""
+        if not path.is_file():
+            raise FileNotFoundError(f"{path} is not there any more")
+
+        directory = Path(self.settings.sidecar_dir) if self.settings.sidecar_dir else None
+        root = Path(self.settings.library_root) if self.settings.library_root else None
+        record = sidecar.record_path(path, directory, root)
+
+        if not record.is_file():
+            # Clearing a note that was never written: there is nothing to do, and writing a
+            # whole record to hold `null` would be an odd way to do nothing.
+            if not note.strip():
+                return None, False
+            # Sidecars are turned off, so the note has nowhere to live. Written rather than
+            # refused: everything else in a record can be fetched again from the service,
+            # and this is the one field that cannot — losing it to a checkbox is the wrong
+            # outcome. Only the record, though. The compatibility files and the trigger
+            # `.txt` are a separate choice, and adding a note is not the moment to overrule
+            # it.
+            identity = FileIdentity(
+                provider=task.identity.get("provider", task.provider),
+                ref=task.identity.get("ref", {}),
+            )
+            verdict, built = self._record_for(path, task, identity)
+            sidecar.write(
+                path, verdict, built,
+                sidecar_dir=directory, library_root=root, compat=False, triggers=False,
+            )
+            return sidecar.annotate(record, note), True
+
+        return sidecar.annotate(record, note), False
+
+    async def delete_files(self, task_id: int) -> erase.Erased:
+        """Delete what this download put on disk, and drop it from the queue.
+
+        Permanent, and therefore only ever reached from a question already answered — see
+        the endpoint. The row goes with the files because the alternative is a card offering
+        Folder, Move and Info for a file that is not there: everything a finished task shows
+        is about a file on disk, and without one there is nothing left for it to be.
+
+        A download still running is paused first and waited for. Pulling a `.part` out from
+        under a transfer that is still writing to it is the one way this could damage
+        something other than what it was pointed at.
+        """
+        task = self.db.get(task_id)
+        if task is None:
+            raise LookupError("no such task")
+        if task_id in self._moves:
+            raise ValueError("this file is being moved right now")
+        if not task.dest:
+            raise ValueError("this download never got as far as a file")
+
+        running = self._running.get(task_id)
+        if running is not None:
+            running.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await running
+
+        result = await asyncio.to_thread(
+            erase.erase,
+            Path(task.dest),
+            sidecar_dir=Path(self.settings.sidecar_dir) if self.settings.sidecar_dir else None,
+            library_root=Path(self.settings.library_root) if self.settings.library_root else None,
+        )
+        self.db.delete(task_id)
+        self.emit({"type": "removed", "id": task_id})
+        return result
+
     def cancel(self, task_id: int) -> None:
         running = self._running.get(task_id)
         if running is not None:
@@ -688,7 +818,15 @@ class Manager:
             await self._write_preview(path, task)
         self._emit_task(task.id)
 
-    async def _write_sidecar(self, path: Path, task: Task, identity: FileIdentity) -> None:
+    def _record_for(
+        self, path: Path, task: Task, identity: FileIdentity
+    ) -> tuple[Verdict, sidecar.Record]:
+        """The record a task would write, without writing it.
+
+        Split out because a note needs one too: a file downloaded with sidecars off has
+        nowhere to keep a note, and what it needs then is the record it would have had, not
+        a stub holding one field.
+        """
         verdict = Verdict(
             _category(task.category or "other"),
             task.confidence or "low",
@@ -704,6 +842,10 @@ class Manager:
             size=task.size,
             meta=task.meta,
         )
+        return verdict, record
+
+    async def _write_sidecar(self, path: Path, task: Task, identity: FileIdentity) -> None:
+        verdict, record = self._record_for(path, task, identity)
         sidecar.write(
             path,
             verdict,

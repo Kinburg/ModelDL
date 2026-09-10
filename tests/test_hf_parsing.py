@@ -172,6 +172,17 @@ def test_a_link_can_be_rebuilt_from_an_identity():
     assert source_url(direct_identity("https://example.com/x.bin")) == "https://example.com/x.bin"
 
 
+def test_a_ref_missing_its_pieces_gives_no_link_rather_than_an_error():
+    """A row written by an older build with a different ref shape is not a reason to refuse
+    to write a record. The link is the one field in one that can be found again by hand."""
+    from sfd.core.types import FileIdentity
+    from sfd.providers.registry import source_url
+
+    assert source_url(FileIdentity(provider="civitai", ref={"version_id": 1})) is None
+    assert source_url(FileIdentity(provider="huggingface", ref={"repo_id": "org/name"})) is None
+    assert source_url(FileIdentity(provider="direct", ref={})) is None
+
+
 def test_identity_excludes_the_token_and_the_url():
     """Resume must survive a re-signed URL and a rotated token."""
     identity = make_identity(parse_ref("https://huggingface.co/org/name/blob/main/f.gguf"))

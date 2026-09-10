@@ -64,6 +64,9 @@ class Record:
                 "version_name": meta.get("version_name"),
             },
             "integrity": {"sha256": self.sha256, "size": self.size},
+            # Yours, and empty until you write one. Nothing here fills it in: it is the one
+            # field in the record that no service and no heuristic can supply.
+            "note": None,
             "classification": {
                 "category": verdict.category.value,
                 "confidence": verdict.confidence,
@@ -199,6 +202,61 @@ async def fetch_preview(
     target = path.with_name(path.stem + PREVIEW_SUFFIX)
     _atomic_write(target, response.content)
     return target
+
+
+def annotate(record: Path, note: str) -> str | None:
+    """Put your own note in the record, or take it out. Returns what the record now says.
+
+    The record is where a note belongs because it is already the document about the model:
+    it survives the queue being tidied, it follows the file through a move and a rename, and
+    it is deleted with it. A note kept anywhere else would need every one of those wired
+    again, and would be wrong the first time one of them was missed.
+
+    Strict, unlike `retitle`, because here the write *is* the operation. A record that
+    cannot be read is refused rather than replaced — it is more likely to be one somebody
+    edited by hand than one that is genuinely broken, and overwriting it would throw away
+    the very thing this field is for.
+    """
+    try:
+        data = json.loads(record.read_text("utf-8"))
+    except OSError as exc:
+        raise OSError(f"the record could not be read: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{record} is not readable as JSON, so it was left alone") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{record} does not hold a record, so it was left alone")
+
+    # An emptied box means "take the note off", not "store the empty string": a record
+    # carrying `""` would put a blank note chip on the card forever.
+    data["note"] = note.strip() or None
+    _write_json(record, data)
+    return data["note"]
+
+
+def retitle(record: Path, filename: str) -> bool:
+    """Point an already-written record at the file's new name.
+
+    The record opens with the name of the file it describes, and that name is how anything
+    reading a collected `sidecar_dir` matches a record back to a model. A rename that left
+    it saying `pytorch_lora_weights.safetensors` would turn the one document explaining
+    where a model came from into a document about a file that no longer exists.
+
+    Best effort by design: this is called after the rename has already happened, so failing
+    loudly here would report a rename that did work as one that did not. A record that was
+    never written, or one hand-edited into something that is no longer JSON, is left alone.
+    """
+    try:
+        data = json.loads(record.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict) or data.get("filename") == filename:
+        return False
+    data["filename"] = filename
+    try:
+        _write_json(record, data)
+    except OSError:
+        return False
+    return True
 
 
 def read(

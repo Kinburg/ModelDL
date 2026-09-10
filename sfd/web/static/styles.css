@@ -216,3 +216,49 @@ header, .grip, button, label, .state { user-select: none; }
   flex: none; font-size: 11.5px; color: var(--muted); background: var(--line-soft);
   border-radius: 5px; padding: 1px 7px; white-space: nowrap;
 }
+
+/* Renaming. The extension sits outside the box because it is not part of the answer:
+   a loader dispatches on it, so it is shown rather than offered. */
+#rename-input { flex: 1; }
+.suffix {
+  align-self: center; color: var(--muted); white-space: nowrap;
+  font-family: ui-monospace, Consolas, monospace; font-size: 12.5px;
+}
+
+/* What a delete is about to take. A permanent delete of a set of files is a question
+   nobody should have to answer from memory, so the set is on screen while it is asked. */
+.filelist { list-style: none; margin: 12px 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.filelist li {
+  display: flex; gap: 12px; align-items: baseline; padding: 6px 10px;
+  background: var(--bg); border: 1px solid var(--line-soft); border-radius: 7px;
+}
+.filelist .path { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; word-break: break-all; }
+.filelist .size { color: var(--muted); font-size: 12px; margin-left: auto; white-space: nowrap; }
+/* The model itself, told apart from the files named after it — it is the one whose size
+   is the reason anyone is here. */
+.filelist li.model { border-color: var(--line); }
+.filelist li.model .path { font-weight: 600; }
+#delete-where { margin-top: 4px; }
+
+/* Your own note. On an open card it is shown in full, because it is the reason you opened
+   the card; on a collapsed row there is only space for the fact that there is one, which
+   is still the thing that answers "which of these was the good one". */
+#note-text {
+  width: 100%; margin: 12px 0 8px; resize: vertical; min-height: 120px; line-height: 1.5;
+}
+.note {
+  margin-top: 8px; padding: 8px 10px; border-radius: 7px;
+  background: var(--line-soft); border: 1px solid var(--line);
+  white-space: pre-wrap; word-break: break-word;
+}
+.has-note {
+  /* Gives up its width long before anything else does — the high shrink factor against
+     the filename's default of 1. A chip that shrank at the same rate pushed the row past
+     its own edge on a narrow window, and one that refused to shrink at all made the
+     filename wrap down four lines to make room. Both are a strange price for a line of
+     text that is already abbreviated. */
+  flex: 0 200 auto; min-width: 0; max-width: 200px; padding: 1px 7px; font-size: 11.5px;
+  color: var(--warn); background: var(--line-soft); border: none; border-radius: 5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.has-note:hover { color: var(--text); }

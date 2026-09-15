@@ -45,6 +45,9 @@ class Record:
     size: int | None = None
     provider: str | None = None
     meta: dict[str, Any] | None = None
+    # Written before the file landed: a note can be added to a download while it is still
+    # running, and it waits in the queue row until there is a record to put it in.
+    note: str | None = None
 
     def build(self, verdict: Verdict) -> dict[str, Any]:
         meta = self.meta or {}
@@ -64,9 +67,11 @@ class Record:
                 "version_name": meta.get("version_name"),
             },
             "integrity": {"sha256": self.sha256, "size": self.size},
-            # Yours, and empty until you write one. Nothing here fills it in: it is the one
-            # field in the record that no service and no heuristic can supply.
-            "note": None,
+            # Yours, and empty unless you wrote one: it is the one field in the record
+            # that no service and no heuristic can supply. Taken from the caller rather
+            # than always written blank, because a note written while the file was still
+            # downloading has been waiting for this record to exist.
+            "note": self.note,
             "classification": {
                 "category": verdict.category.value,
                 "confidence": verdict.confidence,

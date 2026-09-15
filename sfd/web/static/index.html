@@ -13,9 +13,6 @@
   <h1>ModelDL</h1>
   <input id="source" aria-label="Link to download"
          placeholder="Paste a HuggingFace or Civitai link, or org/repo" autofocus>
-  <!-- The link is already in the clipboard: it was copied off the model page a moment ago.
-       Ctrl+V still works and needs nobody's permission; this is for the hand on the mouse. -->
-  <button id="paste" title="Put the link from the clipboard in the box">Paste</button>
   <button class="primary" id="add">Add</button>
   <button id="toggle-settings">Settings</button>
 </header>
@@ -220,9 +217,9 @@
                 aria-label="Your note about this file"
                 placeholder="What you will want to know the next time you find this file — the weight that works, what it clashes with, why you kept it."></textarea>
       <!-- Said here because it is the question a note raises: the queue row is cleared by
-           Clear finished and the record is not. -->
-      <div class="small muted">Kept in the file's <code>.json</code> record, so it survives
-        <em>Clear finished</em> and follows the file through a move or a rename.</div>
+           Clear finished and the record is not. Written by askNote, which knows whether the
+           file this is about exists yet. -->
+      <div class="small muted" id="note-where"></div>
     </div>
     <div class="modal-footer">
       <button class="primary" id="note-save">Save</button>

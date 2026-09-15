@@ -145,39 +145,6 @@ def test_the_folder_picker_endpoint(client):
     mock_pick.assert_called_once_with("C:\\")
 
 
-def test_the_clipboard_endpoint(client):
-    """What the Paste button falls back on when the webview refuses the page its own
-    clipboard. Nothing is sent with the request: there is only one clipboard to read."""
-    link = "https://civitai.com/models/1234"
-    with patch("sfd.desktop.read_system_clipboard", return_value=link) as mock_read:
-        response = client.post("/api/utils/clipboard")
-
-    assert response.status_code == 200
-    assert response.json() == {"text": link}
-    mock_read.assert_called_once_with()
-
-
-def test_a_clipboard_nobody_can_read_is_empty_rather_than_an_error(monkeypatch):
-    """On Linux the tool that reads it may simply not be installed, and a paste that cannot
-    happen is not a failure of the download queue."""
-    from sfd import desktop
-
-    def missing(*args, **kwargs):
-        raise FileNotFoundError("no such tool")
-
-    monkeypatch.setattr(desktop.subprocess, "run", missing)
-    assert desktop.read_system_clipboard() == ""
-
-
-def test_the_clipboard_stays_off_the_event_loop(client):
-    """Reading it waits on another process; awaiting that on the loop would stall every
-    running download for as long as it takes."""
-    import inspect
-
-    route = next(r for r in client.app.routes if getattr(r, "path", "") == "/api/utils/clipboard")
-    assert not inspect.iscoroutinefunction(route.endpoint)
-
-
 def test_the_folder_picker_stays_off_the_event_loop(client):
     """The dialog blocks until someone answers it. Awaiting that on the loop freezes every
     running download for as long as the window is open; a sync handler gets a worker thread.
@@ -282,3 +249,125 @@ def test_a_missing_icon_leaves_the_choice_to_pywebview(monkeypatch, tmp_path):
 
     monkeypatch.setattr(desktop, "__file__", str(tmp_path / "desktop.py"))
     assert desktop.window_icon() is None
+
+
+class _Event:
+    """Stands in for a .NET event: `core.ContextMenuRequested += handler`."""
+
+    def __init__(self) -> None:
+        self.handlers: list = []
+
+    def __iadd__(self, handler):
+        self.handlers.append(handler)
+        return self
+
+
+def _fake_webview():
+    from types import SimpleNamespace
+
+    core = SimpleNamespace(
+        Settings=SimpleNamespace(AreDefaultContextMenusEnabled=False),
+        ContextMenuRequested=_Event(),
+    )
+    return SimpleNamespace(CoreWebView2=core), SimpleNamespace(IsSuccess=True)
+
+
+def _fake_edge():
+    from types import SimpleNamespace
+
+    class EdgeChrome:
+        def on_webview_ready(self, sender, args):
+            self.pywebview_ran = True
+
+    return SimpleNamespace(EdgeChrome=EdgeChrome)
+
+
+def test_a_text_field_gets_its_right_click_menu_back():
+    """pywebview ties WebView2's default context menus to debug mode, so a normal run has
+    none at all and copy/paste are keyboard-only. The setting is flipped where pywebview
+    flips it — on the UI thread, once the WebView2 core exists — without losing the rest of
+    what that handler does."""
+    from sfd import desktop
+
+    edge = _fake_edge()
+    assert desktop.enable_text_context_menus(edge) is True
+
+    chrome = edge.EdgeChrome()
+    sender, args = _fake_webview()
+    chrome.on_webview_ready(sender, args)
+
+    assert chrome.pywebview_ran is True
+    assert sender.CoreWebView2.Settings.AreDefaultContextMenusEnabled is True
+    assert desktop.suppress_page_context_menu in sender.CoreWebView2.ContextMenuRequested.handlers
+
+
+def test_the_right_click_menu_is_the_editing_one_not_the_browsers():
+    """Over a text field or a selection the menu is what the right-click was reached for;
+    on the page itself it is Edge's own — reload, save as, print — in a window that is not
+    a browser."""
+    from types import SimpleNamespace
+
+    from sfd import desktop
+
+    def menu_for(**target):
+        args = SimpleNamespace(ContextMenuTarget=SimpleNamespace(**target), Handled=False)
+        desktop.suppress_page_context_menu(None, args)
+        return not args.Handled
+
+    assert menu_for(IsEditable=True, HasSelection=False) is True
+    assert menu_for(IsEditable=False, HasSelection=True) is True
+    assert menu_for(IsEditable=False, HasSelection=False) is False
+
+
+def test_a_right_click_we_cannot_read_keeps_the_default_menu():
+    """Whatever this is, a menu nobody asked for is a smaller thing than an exception
+    thrown back into the UI thread."""
+    from types import SimpleNamespace
+
+    from sfd import desktop
+
+    class Unreadable:
+        @property
+        def ContextMenuTarget(self):
+            raise RuntimeError("interop said no")
+
+    desktop.suppress_page_context_menu(None, Unreadable())
+    desktop.suppress_page_context_menu(None, SimpleNamespace())
+
+
+def test_a_webview_that_will_not_answer_still_opens_the_window():
+    """The menu is worth a try and nothing more: if the core or the event is not there —
+    an older WebView2 runtime has the setting but not the filter — the window opens anyway."""
+    from types import SimpleNamespace
+
+    from sfd import desktop
+
+    edge = _fake_edge()
+    desktop.enable_text_context_menus(edge)
+    chrome = edge.EdgeChrome()
+
+    class NoCore:
+        @property
+        def CoreWebView2(self):
+            raise RuntimeError("initialization raced us")
+
+    chrome.on_webview_ready(NoCore(), SimpleNamespace(IsSuccess=True))
+    assert chrome.pywebview_ran is True
+
+
+def test_the_menu_is_only_wired_once():
+    """launch_desktop can run twice in a process — tests do it — and a handler wrapped
+    around itself would set the same settings again on every navigation."""
+    from sfd import desktop
+
+    edge = _fake_edge()
+    assert desktop.enable_text_context_menus(edge) is True
+    assert desktop.enable_text_context_menus(edge) is False
+
+
+def test_no_webview2_interop_leaves_the_window_as_it_was():
+    """On a machine where the interop DLLs will not import — or a pywebview that has moved
+    on from this handler — there is nothing to patch and nothing to report."""
+    from sfd import desktop
+
+    assert desktop.enable_text_context_menus(object()) is False

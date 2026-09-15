@@ -442,12 +442,16 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
 
     @app.post("/api/tasks/{task_id}/note")
     async def note(task_id: int, request: NoteRequest) -> dict[str, Any]:
-        """Write your own note about a finished download, or clear it.
+        """Write your own note about a download, or clear it.
 
         The note is the one thing in a record that no service can supply and nothing can
         fetch again — which is why an emptied box removes it rather than storing a blank,
         and why a file downloaded with sidecars turned off gets a record written to hold it
         rather than being told there is nowhere to put it.
+
+        Taken before the file lands, too, and for the same reason: what is worth writing
+        down is known while the download is being queued. It waits in the row until there
+        is a record for it, so `record_written` is False then — nothing was put on disk.
         """
         try:
             written, record_written = await manager.set_note(task_id, request.note)
@@ -730,26 +734,6 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
         """
         from ..desktop import pick_system_folder
         return {"path": pick_system_folder(request.initial)}
-
-    @app.post("/api/utils/clipboard")
-    def clipboard() -> dict[str, str]:
-        """What is on the clipboard, for the page's Paste button.
-
-        Only reached when the webview refuses the browser's own clipboard API, which it is
-        entitled to do — the button would otherwise be dead with nothing to explain it.
-
-        Synchronous for the same reason as the picker above: reading the clipboard means
-        waiting on another process, and doing that on the event loop would stall every
-        running download for as long as it takes.
-
-        This is the one endpoint here that hands back something the page did not already
-        know, and the clipboard is the user's rather than the library's. What keeps it theirs
-        is the Host check every request goes through: a page served under someone else's
-        name is refused before it gets here, and no reply on this server carries a CORS
-        header for another origin to read one with.
-        """
-        from ..desktop import read_system_clipboard
-        return {"text": read_system_clipboard()}
 
     # --- progress ---------------------------------------------------------
 

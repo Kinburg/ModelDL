@@ -472,23 +472,35 @@ class Manager:
         return result
 
     async def set_note(self, task_id: int, note: str) -> tuple[str | None, bool]:
-        """Write your own note about a finished download, or clear it.
+        """Write your own note about a download, or clear it.
 
-        Returns what the record now says and whether a record had to be written to hold it.
+        Returns what the note now says and whether a record had to be written to hold it.
 
         The note goes on the disk first and into the queue second, and that order is the
         whole design: this row is deleted by `Clear finished` and the record is not, so the
         record is where the note actually lives and the column is a copy for the card to
         draw and the filter box to search. The same relationship `downloaded` has with the
         `.part.json` beside the file.
+
+        Until the file lands there is no record to be the note's home, and refusing one
+        until then would ask for it at the one moment it is hardest to write: what you know
+        about a model is in your head while you are queueing it, not an hour later when the
+        bytes stop. So a note on a download that has not finished waits in the row, and the
+        write that lands the file is the write that puts it in the record. It is the row's
+        for that stretch, which means `Clear finished` and `Remove` take it — but nothing
+        else exists yet for it to be taken from.
         """
         task = self.db.get(task_id)
         if task is None:
             raise LookupError("no such task")
-        if task.state != db.DONE or not task.dest:
-            raise ValueError("only a finished download can be annotated")
         if task_id in self._moves:
             raise ValueError("this file is being moved right now")
+
+        if task.state != db.DONE or not task.dest:
+            written = note.strip() or None
+            self.db.update(task_id, note=written)
+            self._emit_task(task_id)
+            return written, False
 
         written, created = await asyncio.to_thread(self._annotate, Path(task.dest), task, note)
         self.db.update(task_id, note=written)
@@ -749,11 +761,10 @@ class Manager:
             task.id, state=db.DONE, downloaded=path.stat().st_size, dest=str(path),
             error=None, finished_at=time.time(), transferred=result.transferred,
         )
-        if self.settings.write_sidecars:
-            await self._write_sidecar(path, task, identity)
-        # Deliberately not inside the branch above. The preview beside the model is read by
-        # the model managers, and someone who turned our JSON records off did not thereby
-        # ask their model manager to stop showing pictures.
+        await self._write_sidecar(path, task, identity)
+        # Deliberately not tied to the records setting the write above answers to. The
+        # preview beside the model is read by the model managers, and someone who turned our
+        # JSON records off did not thereby ask their model manager to stop showing pictures.
         if self.settings.fetch_previews and self.settings.write_compat_files:
             await self._write_preview(path, task)
         self._emit_task(task.id)
@@ -812,8 +823,7 @@ class Manager:
             # and only the remainder for a resumed one.
             transferred=transfer.bytes_transferred,
         )
-        if self.settings.write_sidecars:
-            await self._write_sidecar(path, task, identity)
+        await self._write_sidecar(path, task, identity)
         if self.settings.fetch_previews and self.settings.write_compat_files:
             await self._write_preview(path, task)
         self._emit_task(task.id)
@@ -841,10 +851,32 @@ class Manager:
             sha256=task.sha256,
             size=task.size,
             meta=task.meta,
+            # Whatever was written about this download before it had a record to be written
+            # in. Empty for a file annotated the usual way, which annotates the record
+            # itself a moment later.
+            note=task.note,
         )
         return verdict, record
 
     async def _write_sidecar(self, path: Path, task: Task, identity: FileIdentity) -> None:
+        """The record beside a finished file — and, with records turned off, the one a note
+        needs anyway.
+
+        Records off is a choice about clutter, not a choice to lose the one field no service
+        can supply and nothing can fetch again: a download annotated while it was still
+        running would otherwise land and drop the note on the floor. Only the record, though
+        — the compatibility files and the trigger `.txt` are a separate choice, and a note
+        is not the moment to overrule it. The same reasoning as annotating a file that was
+        downloaded with them off.
+        """
+        # The row rather than the snapshot this download started from: a note written while
+        # the bytes were moving is in the queue and nowhere else, and this is the write that
+        # gives it a home.
+        task = self.db.get(task.id) or task
+        records = self.settings.write_sidecars
+        if not records and not task.note:
+            return
+
         verdict, record = self._record_for(path, task, identity)
         sidecar.write(
             path,
@@ -852,8 +884,8 @@ class Manager:
             record,
             sidecar_dir=Path(self.settings.sidecar_dir) if self.settings.sidecar_dir else None,
             library_root=Path(self.settings.library_root) if self.settings.library_root else None,
-            compat=self.settings.write_compat_files,
-            triggers=self.settings.write_trigger_txt,
+            compat=records and self.settings.write_compat_files,
+            triggers=records and self.settings.write_trigger_txt,
         )
 
     async def _write_preview(self, path: Path, task: Task) -> None:

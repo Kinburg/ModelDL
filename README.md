@@ -320,6 +320,16 @@ page says so when it happens, because a new file appearing beside a model is not
 to find out about later. Everything else in a record can be fetched from the service again;
 this is the one field that cannot, which is why it is worth a file of its own.
 
+The button is on every card, not only a finished one. What you know about a model is in your
+head while you are queueing it — this is the quantised one, this is the version the comments
+said to take — and an hour later, when the bytes stop, it is not. A note written before the
+file lands waits in the queue row, and the write that lands the file is the write that puts
+it in the record; the dialog says which of the two it is about to do. Until then the row is
+the only copy there is, so *Remove* takes the note with it — but there is nothing else yet
+for it to be taken from. This is also the one case where a download with sidecars turned off
+writes a record on its own: dropping the note on the floor at the moment the file arrives
+would be a strange reading of a checkbox about clutter.
+
 On an open card the note is shown in full. On a collapsed row it is a short amber chip
 between the origin and the state — abbreviated, the whole of it on hover, and a click opens
 it for editing. It is also searched by the filter box, which is the point: *which of these
@@ -368,14 +378,11 @@ keeps talking to, and calling it "civitai" would hide the only thing that explai
 difference. The filter box matches it too, so one word narrows the queue to a single
 service. Where the file *went* is the path under it; this is where it came *from*.
 
-**Paste** beside the box puts the clipboard in it, for when the link was copied off the
-model page a second ago and the mouse is still in your hand. Ctrl+V anywhere on the page
-does the same and needs nobody's permission — which the button may: reading the clipboard
-is a permission in a webview as much as in a browser, and when the window refuses it the
-server reads the clipboard from the machine it is already running on instead. Only the
-first line with anything on it is taken: a copied paragraph with a link in it would
-otherwise arrive as one unparseable line, because a single-line box throws the newlines
-away and glues the rest together.
+Ctrl+V anywhere on the page puts the cursor in the link box first, so a link copied off a
+model page a second ago goes in without aiming for the box; the mouse gets there by the
+right-click menu, which is the usual editing one. Only the first line with anything on it
+is taken: a copied paragraph with a link in it would otherwise arrive as one unparseable
+line, because a single-line box throws the newlines away and glues the rest together.
 
 A LoRA's trigger words sit on its card as chips with a **Copy** button after them, and a
 finished one collapsed to a single line keeps a **Triggers** button in the row — which is
@@ -509,6 +516,11 @@ true, and useless for filing, because Pony LoRAs do not work on plain SDXL.
 ## Desktop Application & Standalone Executable
 
 ModelDL runs as a standalone desktop window on Windows (powered by Microsoft Edge WebView2 via `pywebview`), macOS (WKWebView), and Linux (WebKitGTK).
+
+Right-clicking a text field opens the usual editing menu — undo, cut, copy, paste, select
+all. pywebview ties WebView2's context menus to debug mode, so the setting is turned on by
+itself at startup; the page's own menu, the browser one with reload and save-as in it, stays
+off, because this window is not a browser. Keyboard copy and paste work regardless.
 
 ### Running locally
 ```cmd

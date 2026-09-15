@@ -118,55 +118,6 @@ def _pick_folder(initial_dir: str, window: Any) -> str | None:
     return None
 
 
-def read_system_clipboard() -> str:
-    """Whatever text is on the system clipboard, or an empty string.
-
-    What stands behind the page's *Paste* button. Reading the clipboard is a permission in a
-    webview as much as in a browser — WebView2 can refuse `navigator.clipboard` outright,
-    and the button would then do nothing, with nothing to say about why. This process runs
-    on the same machine as the clipboard, so it can ask the system itself.
-
-    Not tkinter, unlike the folder picker's second choice: this answers an HTTP request from
-    a worker thread, and a Tk root created off the main thread is a coin flip between
-    working and hanging the request.
-    """
-    system = platform.system()
-    if system == "Windows":
-        # OutputEncoding is set because the default is the console codepage, which turns
-        # every non-ASCII character of whatever was copied into a question mark.
-        candidates = [[
-            "powershell", "-NoProfile", "-Command",
-            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Clipboard -Raw",
-        ]]
-    elif system == "Darwin":
-        candidates = [["pbpaste"]]
-    else:
-        # Wayland first, then X11: whichever session is running, the other's tool is either
-        # missing or answering for a clipboard nobody is looking at.
-        candidates = [
-            ["wl-paste", "--no-newline"],
-            ["xclip", "-selection", "clipboard", "-o"],
-            ["xsel", "-b"],
-        ]
-
-    for command in candidates:
-        try:
-            proc = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                timeout=10,
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if proc.returncode == 0 and proc.stdout.strip():
-            return proc.stdout
-    return ""
-
-
 def open_system_path(path: str) -> bool:
     """Reveal a file in Explorer or open a directory in the default file manager."""
     try:
@@ -277,6 +228,81 @@ def is_gui_available() -> bool:
     return webview is not None
 
 
+def _set_handled(args: Any) -> None:
+    """Mark a WebView2 event as answered, whichever way this pythonnet exposes the setter."""
+    try:
+        args.Handled = True
+    except (AttributeError, TypeError):
+        args.set_Handled(True)
+
+
+def suppress_page_context_menu(sender: Any, args: Any) -> None:
+    """Let the editing menu through and drop the browser's own.
+
+    Edge's menu for the page itself is a browser's menu -- reload, save as, print, view
+    source -- in a window that is not a browser. Over a text field or a selection it is
+    instead exactly what a right-click is reached for, so that one is kept.
+
+    Anything unexpected here leaves the default menu alone: a missed right-click is a far
+    smaller thing than an exception thrown back into the UI thread.
+    """
+    try:
+        target = args.ContextMenuTarget
+        if target.IsEditable or target.HasSelection:
+            return
+        _set_handled(args)
+    except Exception:
+        pass
+
+
+def enable_text_context_menus(edge: Any = None) -> bool:
+    """Give the desktop window back its right-click menu: undo, cut, copy, paste, select all.
+
+    pywebview ties WebView2's default context menus to debug mode, so in a normal run a
+    right-click anywhere does nothing at all and copy/paste are keyboard-only -- which is
+    not where most people look for them. Turning debug on to buy the menu back would also
+    open devtools and the status bar, so the setting is flipped on its own instead.
+
+    It has to be flipped where pywebview flips it: in `EdgeChrome.on_webview_ready`, which
+    runs on the UI thread and only once the WebView2 core exists. Reaching for the control
+    from outside would mean marshalling the call back onto that thread anyway, so this
+    wraps the handler rather than racing it.
+
+    Windows only -- WKWebView and WebKitGTK already come with the menu. Returns whether the
+    wrap went in; a pywebview that has moved on from this handler, or a machine where the
+    WebView2 interop will not import, is simply left as it was.
+    """
+    if edge is None:
+        try:
+            # Pulls in pythonnet and the WebView2 interop DLLs. pywebview imports this same
+            # module a moment later from webview.start(), so the cost is paid either way.
+            from webview.platforms import edgechromium as edge  # type: ignore[no-redef]
+        except Exception:
+            return False
+
+    original = getattr(getattr(edge, "EdgeChrome", None), "on_webview_ready", None)
+    if original is None or getattr(original, "_context_menus", False):
+        return False
+
+    def on_webview_ready(self: Any, sender: Any, args: Any) -> None:
+        original(self, sender, args)
+        try:
+            if not args.IsSuccess:
+                return
+            core = sender.CoreWebView2
+            core.Settings.AreDefaultContextMenusEnabled = True
+            # Older WebView2 runtimes have the setting but not the event. Losing the filter
+            # only means the browser menu shows on the page too, so it is not worth
+            # refusing the menu over -- hence one try, with the setting first.
+            core.ContextMenuRequested += suppress_page_context_menu
+        except Exception:
+            pass
+
+    on_webview_ready._context_menus = True  # type: ignore[attr-defined]
+    edge.EdgeChrome.on_webview_ready = on_webview_ready
+    return True
+
+
 def window_icon() -> str | None:
     """The .ico for the window's title bar, taskbar button and Alt-Tab entry.
 
@@ -333,6 +359,10 @@ def launch_desktop(
     try:
         # On Windows, EdgeChromium (WebView2) provides full modern web support
         gui = "edgechromium" if sys.platform == "win32" else None
+        if gui == "edgechromium" and not debug:
+            # In debug the menu is already there, and there it is the whole browser one,
+            # Inspect included -- which is the point of debug and not ours to trim.
+            enable_text_context_menus()
         webview.start(debug=debug, gui=gui, icon=window_icon())
     finally:
         # Window closed by user -> cleanly shutdown backend server

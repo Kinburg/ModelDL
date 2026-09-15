@@ -235,12 +235,94 @@ def test_a_collected_record_holds_the_note_in_its_mirror(client):
     assert not (client.library / "loras" / f"{MODEL}.json").exists()
 
 
-def test_only_a_finished_download_can_be_annotated(client):
-    task = finished(client, state="running")
+# --- before the file exists ---------------------------------------------------
 
-    response = client.post(f"/api/tasks/{task.id}/note", json={"note": NOTE})
+IDENTITY = {"provider": "direct", "ref": {"url": "https://example.com/m"}}
 
-    assert response.status_code == 409
+
+def queued(client, **overrides):
+    """A download that has not landed: no file, no record, nowhere yet to keep a note."""
+    values = {
+        "state": "running",
+        "source": "https://example.com/model.safetensors",
+        "provider": "direct",
+        "identity": IDENTITY,
+        "filename": MODEL,
+        "category": "lora",
+    }
+    values.update(overrides)
+    return client.database.add(**values)
+
+
+def test_a_download_that_has_not_landed_yet_takes_a_note(client):
+    """What you know about a model is in your head while you are queueing it, not an hour
+    later when the bytes stop — so the note is taken then and waits in the row."""
+    task = queued(client)
+
+    body = client.post(f"/api/tasks/{task.id}/note", json={"note": NOTE}).json()
+
+    assert body == {"ok": True, "note": NOTE, "record_written": False}
+    assert client.database.get(task.id).note == NOTE
+    # Nothing was invented on disk to hold it: there is no file yet to put a record beside.
+    assert not (client.library / "loras").exists()
+
+
+def test_a_note_on_a_download_that_has_not_landed_can_be_taken_off_again(client):
+    task = queued(client)
+    client.post(f"/api/tasks/{task.id}/note", json={"note": NOTE})
+
+    body = client.post(f"/api/tasks/{task.id}/note", json={"note": "   "}).json()
+
+    assert body == {"ok": True, "note": None, "record_written": False}
+    assert client.database.get(task.id).note is None
+
+
+async def test_the_note_written_while_it_downloaded_is_in_the_record_it_lands_with(client):
+    """And it is read from the row, not from the snapshot the download started with: the
+    note was written while the bytes were moving, long after that copy was taken."""
+    task = queued(client)
+    client.post(f"/api/tasks/{task.id}/note", json={"note": NOTE})
+    path = place(client.library / "loras", record=False)
+
+    await client.app.state.manager._write_sidecar(path, task, _identity())
+
+    stored = written(client.library / "loras" / f"{MODEL}.json")
+    assert stored["note"] == NOTE
+    assert stored["filename"] == MODEL, "a real record, not a stub holding one field"
+
+
+async def test_records_turned_off_still_leaves_the_note_somewhere_to_land(client):
+    """Records off is a choice about clutter, not a choice to lose the one field that
+    cannot be fetched again."""
+    client.settings.write_sidecars = False
+    task = queued(client)
+    client.post(f"/api/tasks/{task.id}/note", json={"note": NOTE})
+    path = place(client.library / "loras", record=False)
+
+    await client.app.state.manager._write_sidecar(path, task, _identity())
+
+    assert written(client.library / "loras" / f"{MODEL}.json")["note"] == NOTE
+    # Only the record. The compatibility files and the trigger .txt are a separate choice.
+    assert sorted(p.name for p in (client.library / "loras").iterdir()) == [
+        MODEL, f"{MODEL}.json",
+    ]
+
+
+async def test_records_turned_off_and_nothing_written_stays_off(client):
+    """No note, no record: the checkbox means what it says for every other download."""
+    client.settings.write_sidecars = False
+    task = queued(client)
+    path = place(client.library / "loras", record=False)
+
+    await client.app.state.manager._write_sidecar(path, task, _identity())
+
+    assert sorted(p.name for p in (client.library / "loras").iterdir()) == [MODEL]
+
+
+def _identity():
+    from sfd.core.types import FileIdentity
+
+    return FileIdentity(provider="direct", ref={"url": "https://example.com/m"})
 
 
 def test_a_note_about_a_file_that_is_gone_is_refused(client):

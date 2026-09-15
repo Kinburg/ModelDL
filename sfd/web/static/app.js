@@ -221,6 +221,11 @@ function taskHtml(t, pinned = false) {
   }
 
   const buttons = [];
+  // Not only on a finished download. The moment to write down what a model is and why you
+  // wanted it is while you are queueing it, which is the moment it is still in your head;
+  // an hour later, when the bytes stop, it is not. Until the file lands the note lives in
+  // the queue row alone, and the download that lands it puts it in the record.
+  const noteButton = `<button data-action="note" title="What you want to know about this file next time">Note…</button>`;
   if (t.state === "blocked") {
     buttons.push(`<button data-action="confirm">Accept</button>`);
     buttons.push(`<button data-action="where" title="Choose a folder in the library">Elsewhere…</button>`);
@@ -233,8 +238,10 @@ function taskHtml(t, pinned = false) {
     if (t.dest) buttons.push(`<button data-action="open-folder" title="Show in File Explorer">Folder</button>`);
     if (t.dest) buttons.push(`<button data-action="move" title="Move it somewhere else in the library">Move to…</button>`);
     if (t.dest) buttons.push(`<button data-action="rename" title="Rename it, and every file named after it">Rename…</button>`);
-    if (t.dest) buttons.push(`<button data-action="note" title="What you want to know about this file next time">Note…</button>`);
+    if (t.dest) buttons.push(noteButton);
     buttons.push(`<button data-action="record">Info</button>`);
+  } else {
+    buttons.push(noteButton);
   }
   // Only on an open card, never on a collapsed row. It is the one button here that destroys
   // something, and having to open the card first is the cheapest possible way of making it
@@ -887,9 +894,17 @@ let noting = null;
 
 function askNote(id) {
   const task = tasks.get(id);
-  if (!task || !task.dest) return;
+  if (!task) return;
   noting = id;
   $("note-file").textContent = task.filename || task.source;
+  // Where the note will actually live, which is a different answer before the file exists:
+  // until then the queue row is the only copy there is, and Remove takes it.
+  $("note-where").innerHTML = task.state === "done" && task.dest
+    ? `Kept in the file's <code>.json</code> record, so it survives <em>Clear finished</em>
+       and follows the file through a move or a rename.`
+    : `The file is not here yet, so this waits with the download and goes into its
+       <code>.json</code> record the moment it lands — until then, taking the row off the
+       list takes the note with it.`;
   $("note-text").value = task.note || "";
   // Nothing to remove until there is something to remove.
   $("note-clear").hidden = !task.note;
@@ -1260,36 +1275,22 @@ $("add").onclick = async () => {
   finally { $("add").disabled = false; }
 };
 
-// Reading the clipboard is a permission, in a webview as much as in a browser, and it can
-// be refused or simply absent. The server is on this very machine, so it can ask the system
-// itself when the page is not allowed to — the same layering as the folder picker above.
-async function clipboardText() {
-  let text = "";
-  try {
-    if (navigator.clipboard && navigator.clipboard.readText) {
-      text = await navigator.clipboard.readText();
-    }
-  } catch { /* refused, or no clipboard API here — ask the server instead */ }
-  if (!text.trim()) {
-    try { ({ text } = await api("/api/utils/clipboard", { method: "POST", body: "{}" })); }
-    catch { text = ""; }
+// A copied block of text can hold the link and a paragraph around it, and the box is one
+// line: whatever the newlines are, an <input> drops them and glues the rest together into
+// something no provider can parse. The first line with anything on it is the one that was
+// meant. This was the Paste button's doing until the right-click menu made the button
+// redundant; here it covers Ctrl+V and the menu too, which the button never could.
+$("source").addEventListener("paste", (e) => {
+  const text = e.clipboardData && e.clipboardData.getData("text");
+  if (!text || !text.includes("\n")) return;
+  const line = text.split("\n").map((s) => s.trim()).find(Boolean) || "";
+  e.preventDefault();
+  // insertText rather than setting the value: it lands on the selection the way a real
+  // paste does, and leaves Ctrl+Z something to undo.
+  if (!document.execCommand("insertText", false, line)) {
+    $("source").setRangeText(line, $("source").selectionStart, $("source").selectionEnd, "end");
   }
-  // A copied block of text can hold a link and a paragraph around it, and the box is one
-  // line: whatever the newlines are, an <input> drops them and glues the rest together
-  // into something no provider can parse. The first line that has anything on it is the
-  // one that was meant.
-  return (text || "").split("\n").map((line) => line.trim()).find(Boolean) || "";
-}
-
-$("paste").onclick = async () => {
-  const text = await clipboardText();
-  if (!text) { message("nothing to paste — the clipboard holds no text", true); return; }
-  $("source").value = text;
-  // Focused rather than added: what was copied is not always what was wanted, and the box
-  // is where that is noticed. Enter from here adds it.
-  $("source").focus();
-  message("");
-};
+});
 
 $("source").addEventListener("keydown", (e) => { if (e.key === "Enter") $("add").click(); });
 $("clear-done").onclick = async () => { await api("/api/tasks/clear", { method: "POST" }); await load(); };

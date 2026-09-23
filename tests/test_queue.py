@@ -620,10 +620,33 @@ def test_the_page_is_served(client):
 
 
 def test_the_stylesheet_and_script_are_served(client):
-    """The page is three files now. A missing mount leaves it rendering as plain text with
-    no behaviour at all — which the page-is-served test above would not notice."""
-    for asset in ("/static/styles.css", "/static/app.js"):
+    """A missing mount leaves the page rendering as plain text with no behaviour at all —
+    which the page-is-served test above would not notice."""
+    for asset in ("/static/styles.css", "/static/app.js", "/static/js/store.js"):
         assert client.get(asset).status_code == 200, asset
+
+
+def test_the_scripts_are_served_as_scripts(client):
+    """The page is ES modules, and a browser refuses to run a module served as anything but
+    JavaScript. Windows keeps its own idea of `.js` in the registry — `text/plain` on more
+    machines than one would like — so the type must not depend on it."""
+    response = client.get("/static/js/actions.js")
+    assert response.headers["content-type"].startswith("text/javascript")
+    assert client.get("/static/styles.css").headers["content-type"].startswith("text/css")
+    # Revalidated on every load, so an updated app never runs yesterday's page.
+    assert response.headers["cache-control"] == "no-cache"
+
+
+def test_every_module_the_page_imports_is_there():
+    """No build step means nothing checks the imports but the browser, at the worst time."""
+    import re
+
+    from sfd.web.app import STATIC
+
+    for script in [STATIC / "app.js", *(STATIC / "js").glob("*.js")]:
+        text = script.read_text("utf-8")
+        for target in re.findall(r"""from\s+["'](\.{1,2}/[^"']+)["']""", text):
+            assert (script.parent / target).resolve().is_file(), f"{script.name} imports {target}"
 
 
 def test_a_request_under_someone_elses_name_is_refused(client):

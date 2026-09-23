@@ -37,11 +37,29 @@ import errno
 import os
 import shutil
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .sidecar import PREVIEW_SUFFIX, record_path, retitle
+from .files import is_model_file
+from .sidecar import PREVIEW_SUFFIX, find_record, record_path, retitle
+
+# What other tools write beside a model, named after it. Ours first, then the conventions a
+# library collects from everything else that has touched it: A1111 keeps a description in
+# `<model>.json` and a checkpoint's config in `<model>.yaml`, ComfyUI's LoRA Manager writes
+# `<model>.metadata.json`, Stability Matrix `<model>.cm-info.json`, and nearly every model
+# manager looks for a picture under the model's own name. A move that left any of these
+# behind would be the half-move this module exists to prevent, for somebody else's tool.
+COMPANION_SUFFIXES = (
+    ".civitai.info",
+    ".txt",
+    PREVIEW_SUFFIX,
+    ".preview.jpg", ".preview.jpeg", ".preview.webp", ".preview.gif",
+    ".preview.mp4", ".preview.webm",
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".webm",
+    ".json", ".yaml", ".yml",
+    ".metadata.json", ".cm-info.json", ".sha256",
+)
 
 # Read size for the copy a cross-volume move turns into. Large enough that the progress
 # callback fires a few times a second on a slow drive rather than a few thousand.
@@ -78,7 +96,10 @@ class Move:
 
 
 def companions(
-    path: Path, sidecar_dir: Path | None = None, library_root: Path | None = None
+    path: Path,
+    sidecar_dir: Path | None = None,
+    library_root: Path | None = None,
+    roots: Iterable[Path] = (),
 ) -> list[Path]:
     """The files written alongside `path` that mean nothing without it.
 
@@ -87,13 +108,57 @@ def companions(
     library tree, and the mirror has to be followed to the new location rather than the file
     dumped beside the model it was deliberately kept away from.
     """
-    found = [
-        record_path(path, sidecar_dir, library_root),
-        path.with_name(path.stem + ".civitai.info"),
-        path.with_name(path.stem + ".txt"),
-        path.with_name(path.stem + PREVIEW_SUFFIX),
-    ]
-    return [p for p in found if p.is_file()]
+    record = find_record(path, sidecar_dir, library_root, roots)
+    found = [record] if record is not None else []
+    for other in named_companions(path):
+        if other not in found:
+            found.append(other)
+    return found
+
+
+def named_companions(path: Path) -> list[Path]:
+    """The files beside `path` that are named after it and exist — unless its name is
+    shared.
+
+    `model.safetensors` beside `model.ckpt`: whose is `model.png`? There is no telling, and
+    taking it with one of them strips it from the other. Only the record, which carries the
+    model's whole name, is unambiguously its own, and that is `find_record`'s to find.
+    """
+    if _stem_is_shared(path):
+        return []
+    return [other for other in named_after(path) if other.is_file()]
+
+
+def _stem_is_shared(path: Path) -> bool:
+    """Whether another model file in the same folder has this one's name before the dot."""
+    try:
+        siblings = list(path.parent.iterdir())
+    except OSError:
+        return False
+    stem = path.stem.lower()
+    return any(
+        other.stem.lower() == stem
+        and other.name.lower() != path.name.lower()
+        and is_model_file(other.name)
+        for other in siblings
+    )
+
+
+def named_after(path: Path) -> list[Path]:
+    """Every name a companion of `path` could have beside it, whether or not it exists.
+
+    A model is never its own companion — `<stem>.json` for a model that is itself a
+    `.json` would be — and the record is left to `find_record`, which knows where it lives.
+    """
+    own = path.name.lower()
+    record = (path.name + ".json").lower()
+    names = []
+    for suffix in COMPANION_SUFFIXES:
+        candidate = path.stem + suffix
+        if candidate.lower() in (own, record):
+            continue
+        names.append(path.with_name(candidate))
+    return names
 
 
 def move(
@@ -103,6 +168,7 @@ def move(
     library_root: Path | None = None,
     progress: Progress | None = None,
     stop: threading.Event | None = None,
+    roots: Iterable[Path] = (),
 ) -> Move:
     """Move `path` and its companions into `folder`.
 
@@ -114,7 +180,7 @@ def move(
         raise FileNotFoundError(f"{path} is not there any more")
 
     target = folder / path.name
-    if target == path:
+    if _same_path(target, path):
         return Move(path=path, unchanged=True)
     if target.exists():
         raise FileExistsError(f"{folder} already holds a {path.name}")
@@ -129,9 +195,11 @@ def move(
     # Where each companion has to end up is worked out before anything moves, so that the
     # record's mirrored path is derived from the model's new home rather than from a model
     # that is by then no longer where the calculation assumes.
+    roots = tuple(roots)
+    record = find_record(path, sidecar_dir, library_root, roots)
     followers = [
-        (source, _destination(source, path, target, sidecar_dir, library_root))
-        for source in companions(path, sidecar_dir, library_root)
+        (source, _destination(source, record, target, sidecar_dir, library_root, roots))
+        for source in companions(path, sidecar_dir, library_root, roots)
     ]
 
     # Only the model's own copy is interruptible. Past this line the file is across and
@@ -140,7 +208,52 @@ def move(
     _transfer(path, target, progress, stop)
 
     result = Move(path=target)
+    _follow(followers, result)
+    return result
+
+
+def strays(
+    old: Path,
+    new: Path,
+    sidecar_dir: Path | None = None,
+    library_root: Path | None = None,
+    roots: Iterable[Path] = (),
+) -> list[tuple[Path, Path]]:
+    """What a model moved outside the app left behind, and where each piece belongs now.
+
+    Dragged in Explorer, a model goes and its preview, its trigger words and its record
+    stay in the folder it left. Each of those is paired with where it would be had the
+    model been moved here by this app: the record into its place in the mirror, everything
+    else beside the model under the model's current name — which after a rename is not the
+    name the stray still carries.
+    """
+    roots = tuple(roots)
+    record = find_record(old, sidecar_dir, library_root, roots)
+    pairs: list[tuple[Path, Path]] = []
+    if record is not None:
+        pairs.append((record, record_path(new, sidecar_dir, library_root, roots)))
+    for other in named_companions(old):
+        pairs.append((other, new.with_name(new.stem + other.name[len(old.stem):])))
+    return [(a, b) for a, b in pairs if not _same_path(a, b)]
+
+
+def bring(path: Path, pairs: Iterable[tuple[Path, Path]]) -> Move:
+    """Move each (stray, destination) pair, never over a file that is already there.
+
+    The other half of `strays`: that one says what would move, this one moves it, once a
+    person has said yes.
+    """
+    if not path.is_file():
+        raise FileNotFoundError(f"{path} is not there any more")
+    result = Move(path=path)
+    _follow([(a, b) for a, b in pairs if a.is_file()], result)
+    return result
+
+
+def _follow(followers: list[tuple[Path, Path]], result: Move) -> None:
     for source, destination in followers:
+        if _same_path(source, destination):
+            continue
         if destination.exists():
             # Not fatal. The model is already across, and a stale sidecar at the
             # destination is a smaller problem than a half-moved set of them.
@@ -153,7 +266,12 @@ def move(
             result.failed.append((source, str(exc)))
         else:
             result.companions.append(destination)
-    return result
+
+
+def _same_path(a: Path, b: Path) -> bool:
+    """The same file, however each was spelt — `Loras` and `loras` are one folder on
+    Windows, and moving a file onto itself must not be refused as a collision."""
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
 
 def intended_name(path: Path, name: str) -> str:
@@ -193,6 +311,7 @@ def rename(
     name: str,
     sidecar_dir: Path | None = None,
     library_root: Path | None = None,
+    roots: Iterable[Path] = (),
 ) -> Move:
     """Give `path` a new name, and every file named after it the matching one.
 
@@ -217,28 +336,21 @@ def rename(
         # here — so the safe reading wins, as it does for a move.
         raise FileExistsError(f"{path.parent} already holds a {target.name}")
 
+    roots = tuple(roots)
+    record = find_record(path, sidecar_dir, library_root, roots)
     followers = [
-        (source, _renamed(source, path, target, sidecar_dir, library_root))
-        for source in companions(path, sidecar_dir, library_root)
+        (source, _renamed(source, path, record, target, sidecar_dir, library_root, roots))
+        for source in companions(path, sidecar_dir, library_root, roots)
     ]
 
     _transfer(path, target)
 
     result = Move(path=target)
-    for source, destination in followers:
-        if destination.exists():
-            result.failed.append((source, "a file of that name is already there"))
-            continue
-        try:
-            _transfer(source, destination)
-        except OSError as exc:
-            result.failed.append((source, str(exc)))
-        else:
-            result.companions.append(destination)
+    _follow(followers, result)
 
     # The record names the file it describes. Leaving the old name in it would make the one
     # document that explains where a model came from disagree with the model.
-    retitle(record_path(target, sidecar_dir, library_root), target.name)
+    retitle(record_path(target, sidecar_dir, library_root, roots), target.name)
     return result
 
 
@@ -297,23 +409,31 @@ def _transfer(
 
 def _destination(
     source: Path,
-    path: Path,
+    record: Path | None,
     target: Path,
     sidecar_dir: Path | None,
     library_root: Path | None,
+    roots: tuple[Path, ...] = (),
 ) -> Path:
-    """Where one companion of `path` belongs once the model is at `target`."""
-    if source == record_path(path, sidecar_dir, library_root):
-        return record_path(target, sidecar_dir, library_root)
+    """Where one companion belongs once the model is at `target`.
+
+    The record goes where a record for `target` is written today, which is not always the
+    mirror of where it was found: one left beside the model before `sidecar_dir` was set
+    is collected on the way past, the same as a fresh download's would be.
+    """
+    if record is not None and source == record:
+        return record_path(target, sidecar_dir, library_root, roots)
     return target.with_name(source.name)
 
 
 def _renamed(
     source: Path,
     path: Path,
+    record: Path | None,
     target: Path,
     sidecar_dir: Path | None,
     library_root: Path | None,
+    roots: tuple[Path, ...] = (),
 ) -> Path:
     """What one companion of `path` is called once the model is called `target`.
 
@@ -324,6 +444,6 @@ def _renamed(
     `.civitai.info` and `.preview.png` intact, both of which look like two extensions to
     anything that reasons in suffixes.
     """
-    if source == record_path(path, sidecar_dir, library_root):
-        return record_path(target, sidecar_dir, library_root)
+    if record is not None and source == record:
+        return record_path(target, sidecar_dir, library_root, roots)
     return source.with_name(target.stem + source.name[len(path.stem):])

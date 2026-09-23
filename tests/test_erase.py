@@ -183,15 +183,33 @@ def test_the_page_is_told_what_a_delete_would_take(client):
     assert body["model"] == str(client.library / "loras" / MODEL)
 
 
-def test_deleting_takes_the_files_and_the_row(client):
+def test_deleting_takes_the_files_and_leaves_the_history(client):
     task = finished(client)
 
     body = client.request("DELETE", f"/api/tasks/{task.id}/files").json()
 
     assert body["ok"] and len(body["deleted"]) == 5 and not body["failed"]
     assert list((client.library / "loras").iterdir()) == []
-    # The card is entirely about a file on disk; without one there is nothing left for it
-    # to say, so it goes with them.
+    # Off the Downloads list, since there is no file left for its card to be about — but
+    # still in the history, which is about what arrived and when, and which is what
+    # "download it again" needs.
+    after = client.database.get(task.id)
+    assert after.fate == "deleted" and after.archived
+    assert after.model_id is None
+    assert client.database.list_models() == [], "and the library forgot the model"
+
+
+def test_deleting_a_download_that_never_finished_takes_its_row(client):
+    """Never history: nothing arrived, so there is nothing to remember it by."""
+    path = client.library / "loras" / MODEL
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.with_name(MODEL + ".part").write_bytes(b"half")
+    task = finished(client, state="failed")
+    path.unlink()
+
+    body = client.request("DELETE", f"/api/tasks/{task.id}/files").json()
+
+    assert body["ok"]
     assert client.database.get(task.id) is None
 
 

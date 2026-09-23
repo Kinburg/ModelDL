@@ -198,211 +198,291 @@ unsorted. Tokens and a library path go in the Settings panel — or in `$HF_TOKE
 python scripts/serve.py --open
 ```
 
-A single page on `http://127.0.0.1:7788`: paste a link, watch the queue, adjust settings.
-It binds to localhost only and has no authentication, because it holds your tokens.
+A single page on `http://127.0.0.1:7788`, in three panes: the views and the library's folders
+on the left, a list in the middle, and everything about whatever is selected on the right.
+The dividers between them are dragged to taste, and a double-click puts one back. It binds
+to localhost only and has no authentication, because it holds your tokens.
+
+How the window was left — the pane widths, the folders open in the tree, the view, the sort
+order — is kept in `settings.json`, under `ui`, rather than in the page's own storage. The
+desktop window runs WebView2 in private mode, and private mode forgets `localStorage` every
+time the app is closed; a layout that reset itself on every start would be one nobody
+bothered to arrange.
+
+The page is plain ES modules — `app.js` and the files in `js/` — loaded as they are, with
+no build step, because the whole thing is served by the process that downloads and has to
+keep working from inside a PyInstaller bundle. They are served as `text/javascript` whatever
+the Windows registry thinks a `.js` file is (on more machines than one would like, some
+installer has told it `text/plain`, and a browser will not run a module served as text), and
+revalidated on every load, so an updated app never runs yesterday's page.
+
+### The library
+
+The queue says what is downloading; the library says what you have and where it is. It is
+every model file in the library's folders, downloaded here or not, kept as a table that is a
+cache of the disk — rebuilt by walking the folders, which happens when the app starts and
+again every time the window comes back to the front. That is cheap enough to do without a
+second thought: a real library of three hundred models and a terabyte, in five hundred
+folders, is read in a fifth of a second. Only a listing is read; a file's header is read
+once per version of the file, in the background, and its hash only when someone asks.
+
+The tree on the left is that library as it is on disk: every folder holding a model, with
+how many and how much, plus the folders named for a kind of model — `hypernetworks` with
+nothing in it yet is still where hypernetworks go. A folder is opened in the middle with
+what is in it and in the folders under it; *Subfolders* turns the second part off. A
+download shows up in the folder it is going to land in, with its progress, before a byte of
+it is there.
+
+ComfyUI reads models from several folders and drives, and so does this: *Settings →
+Library folders* lists them, and *Add a folder…* adds one through the system's own dialog.
+Downloads are filed into the main one, using the folders it already has; any other can be
+made the main one, and any can be taken off the list, which touches nothing on disk. A
+folder inside one of them that is not part of the library — a llama.cpp checkout with a
+dozen vocabulary GGUFs, a custom node's test data — can be hidden from the tree by its
+right-click menu, and shown again from Settings.
+
+Records collected into `sidecar_dir` mirror the main folder at the top, as they always did;
+every other folder of the library gets a mirror of its own under `@roots/`, named after its
+whole path, and a file in no folder of the library — moved to another drive — is mirrored by
+the folder it is in, under `@outside/`. `D:\models\loras\a.safetensors` and
+`E:\models\loras\a.safetensors` are two files, and one mirror for both would give them one
+record — and one note. Making another folder the main one moves the records to match.
+
+A record written under an older arrangement — beside the model before `sidecar_dir` was set,
+in the mirror of whichever folder was the main one then, flat — is still found, and a move
+takes it to where it would be written today. Found only when nothing else can claim it,
+though: a record in one of those old places is taken only if it names this model's file and
+is not the proper record of another model that exists, since the old top-level mirror of one
+folder is exactly where another folder's model keeps its record now.
+
+A model split into shards — `model-00001-of-00004.safetensors` — is one entry, moved and
+deleted as one with its index. It is not renamed here: every part and the index would have
+to change together, and a loader that finds three of four is worse off than one that finds
+none.
+
+### Models that went missing
+
+A model deleted or moved outside the app stays in the library, grey, where it was last seen,
+and in *Missing* with a count on it. Most of those were moved, not deleted, and the walk that
+notices one is gone is the walk that notices where it went: a file of the same name and the
+same size turning up somewhere else, while exactly one model of that name and size went
+missing, is the same file dragged in Explorer. It is linked to its new place on its own and
+the page says so. On one real library that recovered twelve models of thirty-six the moment
+it first ran. Two candidates is a question rather than a guess: the missing model offers
+both, and *This is it* makes one of them the model.
+
+Its record goes with it when the record is in `sidecar_dir`, which is this app's own
+directory. What stayed behind in the folder it was dragged out of — the preview, the trigger
+words, a record kept beside the model — is someone's library, and is offered rather than
+moved: *Bring them here* renames each to the model's current name on the way.
+
+*Find the file…* is for the rest: the system's own file dialog, for a model that was renamed
+as well as moved. The rule is the one *Another drive…* follows — the request says which
+model, the operating system asks the person at the keyboard which file, and the page never
+names a path. A file of another size than the model had is a question, held on the server
+under a token while the page asks it, so that the path still never travels through the page.
+
+*Forget…* takes a missing model out of the library for good, and offers to delete what it
+left on disk: its record, and whatever was named after it where it used to be. A model
+downloaded here keeps its line in the history, with its note. One found on disk has no
+history to keep a note in, and the dialog says so. A model found on disk that disappears
+with nothing of anyone's attached to it — no note, no record, nothing identified — goes
+quietly: keeping every file that ever passed through a folder, grey, forever, is how a
+library fills up with rubbish.
+
+### Models from somewhere else
+
+Most of a library usually did not come through this app — on the one above, two thirds. Those
+are described from the files themselves, which say more than one might expect. The header
+gives the kind of model (the same classifier as a download), what precision the weights are
+really stored in, and how many parameters there are; a GGUF adds its architecture, its
+quantisation and its context length. kohya writes its whole training configuration into a
+LoRA — the base model, the rank, and how often each tag appeared in the captions, which for
+most LoRAs is as near to the trigger words as a file gets, and is shown as *Most frequent
+training tags*. `modelspec.*` can add a title, an author, a description and a thumbnail.
+
+What other tools left beside it is read too. A `.civitai.info` from Civitai Helper is the
+whole Civitai record: the model is then as well described as one downloaded here, with its
+samples and their prompts. A1111's `<model>.json` gives its activation text, preferred
+weight and notes; LoRA Manager's `.metadata.json` and Stability Matrix's `.cm-info.json`
+their names and base models; any picture named after the model is its preview. Move, rename
+and delete know those files too, since a rename that left another tool's sidecar under the
+old name would be the half-rename this app exists to prevent.
+
+The folder is a witness as well. For a file the header cannot read — a `.pth`, an `.onnx` —
+the folder it is in is the best evidence there is, and says so. Between a language model, a
+text encoder and a vision tower the folder wins outright, because those are one file used by
+different loaders: Qwen in `text_encoders` is a text encoder by its job. Anywhere else a
+header that is sure is believed over the folder, and the difference is shown — a LoRA sitting
+in `checkpoints` is a LoRA the checkpoint loader will not open, and *Move to…* is right
+there.
+
+*Identify on Civitai* is the rest, and it is a button, never something done behind anyone's
+back: the file is read in full to work out its SHA256 — a few seconds for a LoRA, minutes for
+a large checkpoint on a mechanical drive — and looked up with Civitai's by-hash endpoint. One
+at a time, in the background, with its progress and a *Stop* in the status bar. A model
+found there gets the files a download of it would have left, by the same settings — its
+record, and the `.civitai.info`, preview and trigger `.txt` — but never over one that is
+already there, which may be another tool's or somebody's own. A download's hash was checked
+against the bytes as they landed, so looking one up needs no second read.
+
+### The history
+
+*Clear finished* no longer deletes anything: it takes finished downloads off the Downloads
+list, and they stay in *History* — every download that finished, newest first, by day. A
+renamed model shows what it is called now and the name it arrived under, since the name the
+service gave it is what anyone searching that service for it again will type. One whose
+files were deleted, or that went missing and was forgotten, stays too, marked as such, with
+*Download it again*: which file, from where and where it was is all still known. Taking a
+line out of the history is its own button, and touches no model.
+
+A link to a file that is still in the library is not queued again; the page says where it
+already is. A file that was deleted, or went missing, is — that is what pasting its link
+again is for.
+
+### Duplicates, leftovers and newer versions
+
+*Duplicates* lists the same file kept in more than one place: certain when the hashes match,
+and only possible when all that matches is the size, with *Hash to be sure* beside those.
+
+*Cleanup* lists what belongs to nothing — the `.part` of a download nobody is coming back
+for (the 40 GB fragment from March), the `.part.corrupt` of one that failed its checksum, the
+`.moving` of an interrupted copy, a preview or a `.civitai.info` named after a model that is
+not there, a record in `sidecar_dir` for a model that is gone. A download still in the queue
+keeps its `.part`; a model the library still remembers, missing or not, keeps what it left,
+since forgetting it is where that is offered; a record whose model is somewhere else in the
+library has lost track of it rather than outlived it, and is left alone. Everything else is
+deleted from there, with the list in front of you first.
+
+*Check for a newer version* asks each model's service. Civitai lists a model's versions
+newest first, so anything ahead of this one is newer, and *Download it* queues the new
+version's primary file rather than every quantisation it carries. On the Hub a file keeps its
+name when it changes, so the question there is whether the same path on the same branch now
+hashes differently.
+
+### Changing a model
+
+*Move to…* is the question "where does this go?" asked after the fact: the same ranked list
+of the library's real folders, across every folder of the library, with the layout's own
+guess first. Selecting several and dragging them onto a folder in the tree does the same;
+either way the move takes the model and everything named after it, refuses to overwrite
+anything, and can be undone from the message that says it happened. *Another drive…* opens
+the system's own folder dialog for anywhere else. Across a drive boundary a move is a copy,
+with its progress and a *Stop* in the status bar; the fragment goes if it is stopped, and the
+original has not been touched.
+
+*Rename* happens in place — click the name, or press F2 — with the extension outside the
+box, because every loader dispatches on it. Everything named after the model takes the new
+name, the record's own `filename` is rewritten, and so is every line of the history about
+it.
+
+*Delete from disk…* shows the actual list of files, with sizes, before any of it goes,
+because this is permanent: there is no recycle bin behind it. The model goes first and on its
+own terms — if it will not go, which on Windows means a loader has the weights open, nothing
+else is touched either. The history keeps a line saying it was deleted.
+
+### Your note
+
+*Your note* is for the thing about a model that only you know: the weight past which it
+burns, the LoRA it fights, why you kept this quantisation and not the other. It is written
+straight into the inspector and saved when you click away or press Ctrl+Enter — and saved,
+too, if you select something else while it is half written, since that is not the moment
+anyone meant to throw away what they wrote.
+
+It lives in the model's `.json` record, not in the database, and that is the whole of the
+design: the record follows the file through a move and a rename, it goes when *Delete* goes,
+and the library only carries a copy — the same relationship `downloaded` has with the
+`.part.json` beside a half-finished file. A model with no record — a file from elsewhere, or
+one downloaded with records turned off — is given one to hold the note, and the page says
+so, because a new file appearing beside a model is not something to find out about later.
+Only the record, though: the `.civitai.info` and the trigger `.txt` are a separate choice.
+
+A note can be written while the file is still downloading, which is when what you know about
+a model is in your head. It waits with the download, and the write that lands the file is
+the write that puts it in the record. The search box looks through notes, since *which of
+these was the one that did hands properly* is a question about a note.
+
+### Downloads
+
+Paste a link into the box at the top — or anywhere, with Ctrl+V — or drag one from the
+browser onto the window. Only the first line with anything on it is taken: a copied
+paragraph with a link in it would otherwise arrive as one unparseable line.
 
 The queue lives in SQLite and survives being closed, crashed or rebooted — a task caught
 mid-download comes back as pending with its bytes intact, since the `.part` file carries its
 own resume state. Pausing is a real disconnect rather than a held-open socket; there is
 nothing to lose by pausing for an hour.
 
-Uncertain placements arrive **blocked** rather than filed. Adding one Civitai link that
-expands to five quantisations queues 67 GB that will not move until you accept or correct
-each one, with the reason for the guess on the card.
-
-*Elsewhere…* answers the same question with your library instead of our category names. The
-list is the folders that are really there, best guesses first: the one the layout would have
-used (base-model grouping included, spelled out rather than implied), the runners-up for that
-kind, any folder whose name appears in the filename, then everything else by what is actually
-in it, and finally the canonical homes that have no folder yet. That last group matters
-because the file may be the first LoRA a library has ever had; the folder-name match matters
-because the categories deliberately do not claim `sams`, `insightface`, `reactor` and the
-rest — a bare `.pt` gives nothing to tell them apart — so until now the right answer for a
-SAM checkpoint was not on the list at all.
-
-Search narrows it, and typing a folder that does not exist offers it as a choice. Nothing is
-created at that moment: the folder appears when the file lands, so a download that fails
-leaves no empty folders behind. The one thing that does create a directory on request is
-*Move to…* below, and only ever inside the library root. What you pick is taken exactly as
-given — nothing is appended underneath you, which is how a
-successful download goes missing. Tick **send this kind of model here from now on** and the
-choice becomes the mapping for that kind; a base-model folder like `checkpoints/Krea 2` names
-no kind, so it files the one file and leaves the mapping alone.
-
-*Move to…* on a finished download is the same dialog asked after the fact, for when the
-guess was accepted and turned out wrong anyway. It moves the model **and everything named
-after it** — the `.json` record, `.civitai.info`, the trigger-word `.txt` and
-`.preview.png` — because a model manager that finds a checkpoint without its preview shows
-a blank card, and dragging one file in Explorer is exactly how that happens. Sidecars
-collected elsewhere with **keep sidecars in** follow the mirror of the library tree rather
-than being dumped beside the model they were deliberately kept away from.
-
-Nothing is overwritten: if the destination already holds a file of that name the move is
-refused before anything is touched. The model goes first and the companions follow, so a
-companion that cannot move leaves the model where you asked for it and names the ones that
-stayed behind — reporting the model as stuck when it moved perfectly well would send you
-hunting in the wrong folder.
-
-The list in that dialog is the library and nothing else, so another drive is unreachable
-from it by construction. **Another drive…** opens the system's own folder dialog instead,
-and accepts anywhere on the machine. What makes that safe is that the request never names a
-destination: the path is chosen in a modal window the OS put in front of whoever is at the
-keyboard, and is never sent by the page. Something reaching this unauthenticated API that
-is not a person — a web page that pointed its own hostname at 127.0.0.1, say — can make a
-folder picker appear and nothing else. It cannot answer one, and it cannot say where a file
-should land.
-
-Across a drive boundary a rename cannot exist, so the move becomes what it really is: every
-byte copied, then the original deleted. That takes as long as downloading the file did, so
-it reports its progress and the queue keeps running throughout. The copy lands under a
-`.moving` name and is renamed into place only once it is whole — the destination never holds
-a half-written model that looks finished — and if it fails partway the fragment goes and the
-original is still sitting where it was, untouched.
-
-**Stop the move** appears beside the progress while that copy runs, and the same applies to
-giving up as to failing: the fragment is deleted and the original has not been touched, so
-there is nothing to put back. The stop is a request rather than a kill, because a thread
-copying a file cannot be interrupted — only asked between blocks — so expect it to take
-until the current 4 MB is written. It follows the event stream rather than the tab that
-started the move, so the button is there after a reload and in a second window. Once the
-last byte is across there is nothing left to stop: the sidecars that follow are far too
-small to wait for, and stopping between them would strand the model away from them.
-
-*Rename…* is the same correction applied to the name rather than the folder, and it exists
-because `pytorch_lora_weights.safetensors` — what half of HuggingFace calls its LoRAs — is
-unreadable in a folder of two hundred, and renaming it in Explorer orphans four files at a
-stroke. Everything named after the model takes the new name with it, the collected `.json`
-record included, and the record's own `filename` field is rewritten so the one document
-that explains where a model came from does not go on naming a file that no longer exists.
-A name already taken in that folder is refused before anything is touched, exactly as a
-move is.
-
-The extension is not part of the question: it sits outside the box, because every loader
-dispatches on it and a model renamed to `.ckpt` would be a file lying about its own format.
-Type it or leave it out — either way the model keeps the one it has. A name that is really
-a path is refused as a name rather than quietly becoming a move: this is the one place in
-the server where a string from the browser becomes a filename on disk, so `../` and a drive
-letter are not filenames and are answered as such.
-
-*Delete files* is the other thing Explorer does badly, and it is deliberately only on an
-open card — *Remove* on a collapsed row takes a download off the list and leaves every byte
-where it is. Delete takes the set: the model, the four files named after it, and the
-`.part`, `.part.json` and `.part.corrupt` of a download that never finished. That last group
-is usually the reason anyone is here — a 40 GB fragment from an evening abandoned in March
-is named after a model that does not exist, so nothing else will ever clear it — and it is
-why the button is offered on a paused or failed download too, not only a finished one.
-
-You are shown the actual list, with sizes, before any of it goes, because this is permanent:
-there is no recycle bin behind it. The model is deleted first and on its own terms — if it
-will not go, which on Windows means a loader has the weights open, nothing else is touched
-either, since a model still sitting there without its record, triggers and preview is worse
-than a delete that did nothing. Past that point the set is gone whatever happens, so a
-sidecar that will not go is named rather than raised. The queue row goes with the files:
-everything a finished card shows is about a file on disk, and without one there is nothing
-left for it to say.
-
-*Note…* is for the thing about a model that only you know. Not what the service published —
-that is already in the record — but what you found out: the weight past which it burns, the
-LoRA it fights, why you kept this quantisation and not the other one. A folder of
-`.safetensors` cannot hold that, and neither can a memory of an evening six weeks ago.
-
-It lives in the `.json` record rather than in the queue, and that is the whole of the design.
-The queue row is deleted by *Clear finished*, which is the button anyone presses after an
-evening of collecting; the record is not. It follows the file through *Move to…* and
-*Rename…*, it goes when *Delete files* goes, and the column beside the queue is only a copy
-of it — the same relationship `downloaded` has with the `.part.json` beside a half-finished
-file. Emptying the box removes the note rather than storing a blank one.
-
-A file downloaded with **write metadata sidecars** turned off has nowhere to keep a note, so
-one is written — the record it would have had, and only that: the `.civitai.info` and the
-trigger `.txt` are a separate choice and adding a note is not the moment to overrule it. The
-page says so when it happens, because a new file appearing beside a model is not something
-to find out about later. Everything else in a record can be fetched from the service again;
-this is the one field that cannot, which is why it is worth a file of its own.
-
-The button is on every card, not only a finished one. What you know about a model is in your
-head while you are queueing it — this is the quantised one, this is the version the comments
-said to take — and an hour later, when the bytes stop, it is not. A note written before the
-file lands waits in the queue row, and the write that lands the file is the write that puts
-it in the record; the dialog says which of the two it is about to do. Until then the row is
-the only copy there is, so *Remove* takes the note with it — but there is nothing else yet
-for it to be taken from. This is also the one case where a download with sidecars turned off
-writes a record on its own: dropping the note on the floor at the moment the file arrives
-would be a strange reading of a checkbox about clutter.
-
-On an open card the note is shown in full. On a collapsed row it is a short amber chip
-between the origin and the state — abbreviated, the whole of it on hover, and a click opens
-it for editing. It is also searched by the filter box, which is the point: *which of these
-was the one that did hands properly* is a question about a note, not about a filename.
+Uncertain placements arrive as *needs a decision* rather than filed. Adding one Civitai link
+that expands to five quantisations queues 67 GB that will not move until you accept or
+correct each one, with the reason for the guess beside it. *Elsewhere…* answers the same
+question with your library instead of our category names. The list is the folders that are
+really there, best guesses first: the one the layout would have used (base-model grouping
+included, spelled out rather than implied), the runners-up for that kind, any folder whose
+name appears in the filename, then everything else by what is actually in it, and finally
+the canonical homes that have no folder yet. That last group matters because the file may be
+the first LoRA a library has ever had; the folder-name match matters because the categories
+deliberately do not claim `sams`, `insightface`, `reactor` and the rest — a bare `.pt` gives
+nothing to tell them apart — so the right answer for a SAM checkpoint has to be on the list
+as a folder. Typing a folder that does not exist offers it; nothing is created until the
+file lands. Tick **send this kind of model here from now on** and the choice becomes the
+mapping for that kind; a base-model folder like `checkpoints/Krea 2` names no kind, so it
+files the one file and leaves the mapping alone.
 
 Turn off **start downloads on add** and links pile up paused instead, so an afternoon of
 collecting them costs no bandwidth until you press *Start all*. That releases what is merely
-waiting; blocked tasks stay blocked, because they are waiting on a decision rather than on
-permission, and answering it is the point.
-
-**Add new downloads to** decides which end of the queue a pasted link joins: the bottom, so
-it waits its turn, or the top, so it is what runs next — the setting to flip when the queue
-is a long backlog and the thing you just found is the thing you actually want. A link that
-expands into several files keeps its own order either way. Anything already downloading
-keeps going; the queue only decides what is picked up next, and a card can still be dragged
-by its grip afterwards.
+waiting; downloads that need a decision stay where they are, because they are waiting on an
+answer rather than on permission. **Add new downloads to** decides which end of the queue a
+pasted link joins; a download can still be dragged by its grip afterwards.
 
 A failure that a wait might fix is picked back up on its own — after 30 seconds, then two
-minutes, then ten. A router rebooting at 3am costs minutes rather than the rest of the
-night. Failures no wait can fix are never retried: a missing token, a refused licence, a
-hash that did not match and a disk with no room left are all answered by a person, and
-asking the service again every thirty seconds is how a temporary refusal becomes a ban.
-The switch is **retry failures on their own**; pressing *Retry* by hand also forgives the
-attempts already spent.
+minutes, then ten. Failures no wait can fix are never retried: a missing token, a refused
+licence, a hash that did not match and a disk with no room left are all answered by a
+person, and asking the service again every thirty seconds is how a temporary refusal becomes
+a ban. **Speed limit** caps the whole queue rather than each connection, and takes effect
+while downloads are running (the `huggingface_hub` engine downloads in a subprocess of its
+own and is not capped).
 
-**Speed limit** caps the whole queue rather than each connection, and takes effect while
-downloads are running — which is when you actually reach for it. It applies to the native
-transfer; the `huggingface_hub` engine downloads in a subprocess of its own and is not
-capped. (Neither is the stall watchdog fooled by it: the floor it uses drops with the
-ceiling, so a connection being held back on purpose is not mistaken for a dead one.)
+The status bar says what the queue as a whole is doing — fetched of total, current speed,
+ETA — and warns when what is left does not fit on the disk, which is worth more before the
+queue runs than after: preallocation is sparse, so nothing is reserved up front.
 
-The header says what the queue as a whole is doing — fetched of total, current speed, ETA —
-and warns when what is left does not fit on the disk. That warning is worth more before
-the queue runs than after: preallocation is sparse, so nothing is reserved up front and a
-full disk otherwise turns up forty gigabytes into a download. A file that plainly cannot
-fit is refused before it starts, with the numbers in the message.
+Every download says which site its file came off: `civitai.com`, `huggingface.co`, or the host
+of a plain link — the domain rather than our provider name, so a mirror like `civitai.red`
+reads as itself.
 
-The filter box and the state dropdown narrow a long list; finished downloads collapse to
-one line each until opened. Dragging is disabled while a filter is on, because the reorder
-would only see the rows on screen and would shuffle them around the ones it cannot.
-
-Every card says which site its file came off, next to the name: `civitai.com`,
-`huggingface.co`, or the host of a plain link. It is the domain rather than our provider
-name, so a mirror reads as itself — `civitai.red` is a different host that the download
-keeps talking to, and calling it "civitai" would hide the only thing that explains the
-difference. The filter box matches it too, so one word narrows the queue to a single
-service. Where the file *went* is the path under it; this is where it came *from*.
-
-Ctrl+V anywhere on the page puts the cursor in the link box first, so a link copied off a
-model page a second ago goes in without aiming for the box; the mouse gets there by the
-right-click menu, which is the usual editing one. Only the first line with anything on it
-is taken: a copied paragraph with a link in it would otherwise arrive as one unparseable
-line, because a single-line box throws the newlines away and glues the rest together.
-
-A LoRA's trigger words sit on its card as chips with a **Copy** button after them, and a
-finished one collapsed to a single line keeps a **Triggers** button in the row — which is
-where they are actually wanted, weeks later, with the prompt box already open. What lands on
-the clipboard is comma-joined, exactly what the `.txt` beside the model holds, so the two
-cannot drift apart; the words are split and de-duplicated on the way to the page for the
-same reason, since Civitai often returns them already joined inside one string and that
-would otherwise show as a single chip with commas in it.
-
-**Info** on a finished task opens its stored record in the card — page link, hash, why it
-was filed where it was, and the trigger words with a copy button. Worth having once records
-are collected into their own directory, where they are tidy and hard to find.
+A LoRA's trigger words sit in the inspector with a **Copy** button, comma-joined exactly as
+the `.txt` beside the model holds them. The pictures a model is published with are there
+too, and under each one the prompt, sampler, steps, cfg and seed that produced it. Samples the
+service marks as adult are covered until clicked.
 
 Progress streams over Server-Sent Events; the page patches rows in place rather than
 re-rendering, so a list updating four times a second does not fight with your scrolling.
+
+### Keyboard and mouse
+
+Every list selects with a click, Ctrl+click and Shift+click, and with the arrow keys; Ctrl+A
+takes the lot. Right-click anything for what can be done to it. F2 renames, Delete deletes
+(or forgets, for a model that is missing), Enter opens a model's samples, Ctrl+F goes to the
+search box and Escape backs out of whatever is open. The search box searches the whole
+library from a folder, and narrows the list in every other view.
 
 The server answers only to `127.0.0.1` and `localhost` by name, not merely by address. It
 has no authentication — it holds your tokens and is not meant to be reachable — and a page
 on any website can point a hostname it owns at the loopback address and talk to a local
 server as same-origin. Checking the name it was asked for is what closes that.
+
+It does not close the other way in. A page on any site can send a request straight to
+`127.0.0.1` without renaming anything: a POST with no body, or with a body of no declared
+type, needs nobody's permission to be sent, and a server that did not look would carry it
+out — a move, a delete, a folder taken off the list. The browser says where every such
+request comes from, in `Origin` and in fetch metadata, and anything that changes something
+is refused unless it comes from the app's own page.
+
+For the same reason no request that moves, renames, writes or deletes a file names a path:
+a model is named by its id, a folder by which folder of the library and a place inside it,
+and anywhere else is chosen in a dialog the operating system put in front of whoever is at
+the keyboard.
 
 ## The command line
 

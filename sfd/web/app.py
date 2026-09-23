@@ -13,24 +13,36 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import mimetypes
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from ..core.diskinfo import free_bytes
 from ..jobs import db
 from ..jobs.db import Database
+from ..jobs.library import Busy
 from ..jobs.manager import Manager
-from ..library import erase, folders, previews, relocate, sidecar
+from ..library import details, erase, folders, previews, relocate, sidecar
 from ..library.categories import ALIASES, Category
 from ..library.layout import adopt
 from ..settings import Settings
+
+# Windows keeps its own idea of what a `.js` file is in the registry, and on a fair number of
+# machines some installer has set it to `text/plain`. Python's `mimetypes` reads that, the
+# browser refuses to run a module served as plain text, and the page comes up blank. Said
+# here, once, it no longer depends on the machine.
+mimetypes.add_type("text/javascript", ".js")
+mimetypes.add_type("text/css", ".css")
+mimetypes.add_type("image/svg+xml", ".svg")
 
 
 def _get_static_dir() -> Path:
@@ -63,6 +75,27 @@ def _host_name(header: str) -> str:
     if host.startswith("["):
         return host[1 : host.index("]")] if "]" in host else ""
     return host.split(":", 1)[0]
+
+
+SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _from_this_page(request: Request) -> bool:
+    """Whether a request that changes something came from a page this server served.
+
+    A browser names the origin of every such request, and fetch metadata says outright when
+    it is another site. A request carrying neither is not from a browser page at all — a
+    script, a test — and those were never the danger: they could send any header they like.
+    """
+    site = (request.headers.get("sec-fetch-site") or "").lower()
+    if site and site not in ("same-origin", "none"):
+        return False
+    origin = request.headers.get("origin")
+    if origin is None:
+        return True
+    if origin == "null":
+        return False
+    return _host_name(urlsplit(origin).netloc) in LOCAL_NAMES
 
 
 class AddRequest(BaseModel):
@@ -110,6 +143,70 @@ class PickFolderRequest(BaseModel):
     initial: str = ""
 
 
+class ModelMoveRequest(BaseModel):
+    # Which folder of the library, by its place in the list, and a folder inside it. The
+    # pair is confined exactly as the queue's single folder is: `resolve_inside` the root.
+    root: int = 0
+    folder: str = ""
+    remember: bool = False
+
+
+class BatchMoveRequest(ModelMoveRequest):
+    ids: list[int] = Field(default_factory=list, max_length=500)
+
+
+class IdsRequest(BaseModel):
+    ids: list[int] = Field(default_factory=list, max_length=5000)
+
+
+class BatchAnywhereRequest(IdsRequest):
+    remember: bool = False
+
+
+class CleanupDeleteRequest(IdsRequest):
+    # Which scan the numbers are from: a second window looking again renumbers them.
+    token: str = ""
+
+
+class ForgetRequest(BaseModel):
+    cleanup: bool = False
+
+
+class BatchForgetRequest(IdsRequest):
+    cleanup: bool = False
+
+
+class RelinkRequest(BaseModel):
+    # Another model of the library, never a path: the file it points at was found by the
+    # walk, not named by the page.
+    candidate: int
+
+
+class ConfirmLocateRequest(BaseModel):
+    token: str
+
+
+class NewFolderRequest(BaseModel):
+    root: int = 0
+    parent: str = ""
+    name: str = Field(..., max_length=200)
+
+
+class FolderRequest(BaseModel):
+    root: int = 0
+    relative: str = ""
+
+
+class UnhideRequest(BaseModel):
+    index: int
+
+
+class UiPatch(BaseModel):
+    # Whatever the page wants to remember about how it was left. Bounded, because it is
+    # written into the settings file on every change.
+    prefs: dict[str, Any] = Field(default_factory=dict)
+
+
 class SettingsPatch(BaseModel):
     """What the settings form is allowed to say.
 
@@ -123,6 +220,8 @@ class SettingsPatch(BaseModel):
     """
 
     library_root: str | None = None
+    extra_roots: list[str] | None = Field(None, max_length=64)
+    exclude_dirs: list[str] | None = Field(None, max_length=256)
     profile: Literal["comfyui", "a1111"] | None = None
     group_by_base_model: bool | None = None
     download_dir: str | None = None
@@ -156,6 +255,28 @@ class SettingsPatch(BaseModel):
     write_trigger_txt: bool | None = None
 
     layout_overrides: dict[str, str] | None = None
+    ui: dict[str, Any] | None = None
+
+
+# How much the page may keep in `ui`. Pane widths and a list of open folders fit in a
+# fraction of this; the limit is there so that nothing can turn the settings file into a
+# dumping ground.
+UI_LIMIT = 64 * 1024
+
+
+class NoCacheStatic(StaticFiles):
+    """The page's own files, revalidated on every load.
+
+    The page is served by the process that is also the app, and it changes when the app
+    is updated. A WebView that kept yesterday's script against today's server would show a
+    page that calls endpoints which no longer answer the way it expects. An ETag check is
+    one small request per file and never a stale page.
+    """
+
+    async def get_response(self, path: str, scope):  # type: ignore[override]
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 def create_app(settings: Settings, database: Database) -> FastAPI:
@@ -194,15 +315,22 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
         """
         if _host_name(request.headers.get("host", "")) not in LOCAL_NAMES:
             return JSONResponse({"detail": "not served under that name"}, status_code=403)
+        # The Host check stops a page that renamed itself into this server. It does not stop
+        # a page on any other site from sending a request straight to 127.0.0.1: a POST with
+        # no body, or with one of no declared type, needs no permission from us to be sent,
+        # and would be carried out — a move, a delete, a folder taken off the list. A browser
+        # says where a request comes from, and only the app's own page is let through.
+        if request.method not in SAFE_METHODS and not _from_this_page(request):
+            return JSONResponse({"detail": "not from this app's own page"}, status_code=403)
         return await call_next(request)
 
     # --- page -------------------------------------------------------------
 
     @app.get("/")
     async def index() -> FileResponse:
-        return FileResponse(STATIC / "index.html")
+        return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-cache"})
 
-    app.mount("/static", StaticFiles(directory=STATIC), name="static")
+    app.mount("/static", NoCacheStatic(directory=STATIC), name="static")
 
     # --- tasks ------------------------------------------------------------
 
@@ -216,12 +344,20 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
         if not source:
             raise HTTPException(400, "nothing to add")
         try:
-            created = await manager.add(source)
+            added = await manager.add_links(source)
         except Exception as exc:  # noqa: BLE001 - the message is the useful part here
             raise HTTPException(400, f"{type(exc).__name__}: {exc}") from exc
+        created, skipped = added["created"], added["skipped"]
         if not created:
+            if skipped:
+                where = skipped[0].path
+                more = f" (and {len(skipped) - 1} more)" if len(skipped) > 1 else ""
+                raise HTTPException(409, f"already in your library: {where}{more}")
             raise HTTPException(409, "already in the queue")
-        return {"tasks": [t.to_json() for t in created]}
+        return {
+            "tasks": [t.to_json() for t in created],
+            "skipped": [{"id": m.id, "path": m.path} for m in skipped],
+        }
 
     @app.post("/api/tasks/{task_id}/pause")
     async def pause(task_id: int) -> dict[str, bool]:
@@ -482,18 +618,9 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
             return {"files": [], "total": 0}
 
         found = await asyncio.to_thread(
-            erase.belongings,
-            Path(task.dest),
-            Path(settings.sidecar_dir) if settings.sidecar_dir else None,
-            Path(settings.library_root) if settings.library_root else None,
+            erase.belongings, Path(task.dest), **manager.library.places()
         )
-        listed = []
-        for path in found:
-            try:
-                size = path.stat().st_size
-            except OSError:
-                size = None
-            listed.append({"path": str(path), "name": path.name, "size": size})
+        listed = _listing(found)
         return {
             "files": listed,
             "total": sum(f["size"] or 0 for f in listed),
@@ -543,15 +670,11 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
             raise HTTPException(404, "no such task")
 
         destination = Path(task.dest)
-        directory = Path(settings.sidecar_dir) if settings.sidecar_dir else None
-        root = Path(settings.library_root) if settings.library_root else None
-        data = sidecar.read(destination, directory, root)
+        found = sidecar.find_record(destination, **manager.library.places())
+        data = sidecar.read_record(found) if found is not None else None
         if data is None:
             raise HTTPException(404, "no record was written for this file")
-        return {
-            "record": data,
-            "path": str(sidecar.record_path(destination, directory, root)),
-        }
+        return {"record": data, "path": str(found)}
 
     @app.get("/api/tasks/{task_id}/previews")
     async def list_previews(task_id: int) -> dict[str, Any]:
@@ -595,7 +718,11 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
         task = database.get(task_id)
         if task is None:
             raise HTTPException(404, "no such task")
-        entries = previews.entries(task.meta)
+        return await _remote_preview(previews.entries(task.meta), index, width)
+
+    async def _remote_preview(
+        entries: list[dict[str, Any]], index: int, width: int | None
+    ) -> FileResponse:
         if not 0 <= index < len(entries):
             raise HTTPException(404, "no such preview")
 
@@ -650,6 +777,10 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
     async def start_all() -> dict[str, int]:
         return {"released": manager.start_all()}
 
+    @app.post("/api/tasks/pause-all")
+    async def pause_all() -> dict[str, int]:
+        return {"paused": manager.pause_all()}
+
     @app.post("/api/tasks/clear")
     async def clear() -> dict[str, int]:
         return {"removed": manager.clear_finished()}
@@ -685,6 +816,502 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
             "path": str(root),
         }
 
+    # --- the library ------------------------------------------------------
+    #
+    # Every model the app knows about, by id. Like the task endpoints above, nothing here
+    # takes a path from the page: a model is named by its id and the path comes from the
+    # library; a folder is named by which folder of the library and a place inside it, and
+    # is confined to it; anywhere else is chosen in the system's own dialog.
+
+    library = manager.library
+
+    def _library_folder(root: int, folder: str) -> Path:
+        try:
+            target = library.resolve_folder(root, folder)
+        except LookupError:
+            raise HTTPException(400, "no such library folder") from None
+        if target is None:
+            raise HTTPException(400, f"{folder} is not inside that library folder")
+        return target
+
+    def _remember(chosen: Path, asked: bool) -> str | None:
+        """Make a folder the home of its kind, when asked and when its name is a kind."""
+        if not asked:
+            return None
+        kind = ALIASES.get(chosen.name.lower())
+        if kind is None:
+            return None
+        settings.layout_overrides[kind.value] = str(chosen)
+        settings.save()
+        return kind.value
+
+    def _model(model_id: int):
+        model = database.get_model(model_id)
+        if model is None:
+            raise HTTPException(404, "no such model")
+        return model
+
+    @app.get("/api/library")
+    async def get_library() -> dict[str, Any]:
+        return await asyncio.to_thread(library.snapshot)
+
+    @app.post("/api/library/rescan")
+    async def rescan() -> dict[str, Any]:
+        """Walk the library's folders again. Asked for whenever the window comes back to
+        the front, which is when files are likeliest to have been moved behind its back."""
+        report = await library.refresh()
+        return {"ok": True, "report": report}
+
+    @app.get("/api/models/{model_id}")
+    async def model_details(model_id: int) -> dict[str, Any]:
+        with _answering():
+            return await asyncio.to_thread(library.details, model_id)
+
+    @app.post("/api/models/{model_id}/rename")
+    async def rename_model(model_id: int, request: RenameRequest) -> dict[str, Any]:
+        try:
+            result = await asyncio.to_thread(library.rename, model_id, request.name)
+        except Busy as exc:
+            raise HTTPException(409, str(exc)) from None
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from None
+        except FileExistsError as exc:
+            raise HTTPException(409, str(exc)) from None
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from None
+        except OSError as exc:
+            raise HTTPException(500, f"could not rename the file: {exc}") from None
+        return {
+            "ok": True,
+            "unchanged": result.unchanged,
+            "dest": str(result.path),
+            "filename": result.path.name,
+            "renamed": len(result.companions),
+            "failed": _failures(result.failed),
+        }
+
+    @app.post("/api/models/{model_id}/move")
+    async def move_model(model_id: int, request: ModelMoveRequest) -> dict[str, Any]:
+        chosen = _library_folder(request.root, request.folder)
+        with _answering():
+            try:
+                result = await manager.move_model(model_id, chosen)
+            except relocate.Cancelled:
+                return {"ok": False, "stopped": True}
+        return _moved(result, _remember(chosen, request.remember))
+
+    @app.post("/api/models/move")
+    async def move_models(request: BatchMoveRequest) -> dict[str, Any]:
+        """Move several models into one folder: a drag of a selection onto the tree."""
+        chosen = _library_folder(request.root, request.folder)
+        return await _move_all(request.ids, chosen, request.remember)
+
+    async def _move_all(ids: list[int], chosen: Path, remember: bool) -> dict[str, Any]:
+        results: list[dict[str, Any]] = []
+        for model_id in ids:
+            try:
+                result = await manager.move_model(model_id, chosen)
+            except relocate.Cancelled:
+                results.append({"id": model_id, "ok": False, "stopped": True})
+                break
+            except (LookupError, ValueError, OSError) as exc:
+                results.append({"id": model_id, "ok": False, "error": str(exc)})
+                continue
+            results.append({"id": model_id, **_moved(result)})
+        moved_any = any(r.get("ok") and not r.get("unchanged") for r in results)
+        return {
+            "results": results,
+            "remembered": _remember(chosen, remember) if moved_any else None,
+            "folder": str(chosen),
+        }
+
+    @app.post("/api/models/{model_id}/move-anywhere")
+    async def move_model_anywhere(model_id: int, request: BrowseMoveRequest) -> dict[str, Any]:
+        """The system's own folder dialog, for a place outside the library's folders."""
+        model = _model(model_id)
+        from ..desktop import pick_system_folder
+
+        chosen = await asyncio.to_thread(pick_system_folder, str(Path(model.path).parent))
+        if not chosen:
+            return {"ok": False, "cancelled": True}
+        with _answering():
+            try:
+                result = await manager.move_model(model_id, Path(chosen))
+            except relocate.Cancelled:
+                return {"ok": False, "stopped": True}
+        return {**_moved(result, _remember(Path(chosen), request.remember)), "folder": chosen}
+
+    @app.post("/api/models/move-anywhere")
+    async def move_models_anywhere(request: BatchAnywhereRequest) -> dict[str, Any]:
+        if not request.ids:
+            raise HTTPException(400, "nothing to move")
+        first = _model(request.ids[0])
+        from ..desktop import pick_system_folder
+
+        chosen = await asyncio.to_thread(pick_system_folder, str(Path(first.path).parent))
+        if not chosen:
+            return {"ok": False, "cancelled": True}
+        return await _move_all(request.ids, Path(chosen), request.remember)
+
+    @app.post("/api/models/{model_id}/move/stop")
+    async def stop_model_move(model_id: int) -> dict[str, bool]:
+        return {"ok": manager.stop_model_move(model_id)}
+
+    @app.get("/api/models/{model_id}/folders")
+    async def model_folders(model_id: int) -> dict[str, Any]:
+        with _answering():
+            return await asyncio.to_thread(library.move_targets, model_id, manager.layout())
+
+    @app.post("/api/models/{model_id}/note")
+    async def model_note(model_id: int, request: NoteRequest) -> dict[str, Any]:
+        with _answering():
+            written, created = await asyncio.to_thread(library.set_note, model_id, request.note)
+        return {"ok": True, "note": written, "record_written": created}
+
+    @app.get("/api/models/{model_id}/files")
+    async def model_files(model_id: int) -> dict[str, Any]:
+        with _answering():
+            found = await asyncio.to_thread(library.files, model_id)
+        listed = _listing(found)
+        return {"files": listed, "total": sum(f["size"] or 0 for f in listed)}
+
+    @app.post("/api/models/files")
+    async def models_files(request: IdsRequest) -> dict[str, Any]:
+        """What deleting a whole selection would take, model by model."""
+        groups = []
+        for model_id in request.ids:
+            with contextlib.suppress(LookupError, OSError):
+                listed = _listing(await asyncio.to_thread(library.files, model_id))
+                groups.append({"id": model_id, "files": listed,
+                               "total": sum(f["size"] or 0 for f in listed)})
+        return {"groups": groups, "total": sum(g["total"] for g in groups)}
+
+    @app.delete("/api/models/{model_id}/files")
+    async def delete_model_files(model_id: int) -> dict[str, Any]:
+        """Permanent, like the queue's: asked first, with the list in front of whoever is
+        answering. Which files is decided here, from the model."""
+        if model_id in manager._model_moves:
+            raise HTTPException(409, "this model is being moved right now")
+        with _answering():
+            result = await asyncio.to_thread(library.delete_files, model_id)
+        return _erased(result)
+
+    @app.post("/api/models/delete")
+    async def delete_models(request: IdsRequest) -> dict[str, Any]:
+        results = []
+        for model_id in request.ids:
+            if model_id in manager._model_moves:
+                results.append({"id": model_id, "ok": False, "error": "being moved"})
+                continue
+            try:
+                result = await asyncio.to_thread(library.delete_files, model_id)
+            except (LookupError, ValueError, OSError) as exc:
+                results.append({"id": model_id, "ok": False, "error": str(exc)})
+                continue
+            results.append({"id": model_id, **_erased(result)})
+        return {"results": results}
+
+    @app.get("/api/models/{model_id}/leftovers")
+    async def model_leftovers(model_id: int) -> dict[str, Any]:
+        with _answering():
+            found = await asyncio.to_thread(library.leftovers, model_id)
+        listed = _listing(found)
+        return {"files": listed, "total": sum(f["size"] or 0 for f in listed)}
+
+    @app.post("/api/models/{model_id}/forget")
+    async def forget_model(model_id: int, request: ForgetRequest) -> dict[str, Any]:
+        with _answering():
+            result = await asyncio.to_thread(library.forget, model_id, request.cleanup)
+        return _erased(result)
+
+    @app.post("/api/models/forget")
+    async def forget_models(request: BatchForgetRequest) -> dict[str, Any]:
+        results = []
+        for model_id in request.ids:
+            try:
+                result = await asyncio.to_thread(library.forget, model_id, request.cleanup)
+            except (LookupError, ValueError, OSError) as exc:
+                results.append({"id": model_id, "ok": False, "error": str(exc)})
+                continue
+            results.append({"id": model_id, **_erased(result)})
+        return {"results": results}
+
+    @app.post("/api/models/{model_id}/relink")
+    async def relink_model(model_id: int, request: RelinkRequest) -> dict[str, Any]:
+        with _answering():
+            model = await asyncio.to_thread(library.relink, model_id, request.candidate)
+        return {"ok": True, "path": model.path}
+
+    @app.post("/api/models/{model_id}/locate")
+    async def locate_model(model_id: int) -> dict[str, Any]:
+        """Point a missing model at its file, chosen in the system's own dialog.
+
+        The same rule as moving anywhere: the request says which model, the operating system
+        asks the person at the keyboard which file, and the page never names one. When the
+        file is not the size the model was, the answer is held here under a token and the
+        page is asked to confirm it — still without ever sending the path back.
+        """
+        model = _model(model_id)
+        if model.state != db.MISSING:
+            raise HTTPException(409, "this model is not missing")
+        from ..desktop import pick_system_file
+
+        chosen = await asyncio.to_thread(pick_system_file, str(Path(model.path).parent))
+        if not chosen:
+            return {"ok": False, "cancelled": True}
+        with _answering():
+            return await asyncio.to_thread(library.link_to, model_id, Path(chosen))
+
+    @app.post("/api/models/{model_id}/locate/confirm")
+    async def confirm_locate(model_id: int, request: ConfirmLocateRequest) -> dict[str, Any]:
+        with _answering():
+            return await asyncio.to_thread(library.confirm_link, model_id, request.token)
+
+    @app.post("/api/models/{model_id}/bring-back")
+    async def bring_back(model_id: int) -> dict[str, Any]:
+        with _answering():
+            result = await asyncio.to_thread(library.bring_back, model_id)
+        return _moved(result)
+
+    @app.post("/api/models/identify")
+    async def identify(request: IdsRequest) -> dict[str, Any]:
+        """Hash each model and ask Civitai what it is. Only ever on request: hashing reads
+        the whole file, and a terabyte of models is hours of a disk's time."""
+        return {"queued": library.enqueue("identify", request.ids), "jobs": library.job_state()}
+
+    @app.post("/api/models/verify")
+    async def verify(request: IdsRequest) -> dict[str, Any]:
+        return {"queued": library.enqueue("verify", request.ids), "jobs": library.job_state()}
+
+    @app.post("/api/models/hash")
+    async def hash_models(request: IdsRequest) -> dict[str, Any]:
+        return {"queued": library.enqueue("hash", request.ids), "jobs": library.job_state()}
+
+    @app.get("/api/jobs")
+    async def jobs() -> dict[str, Any]:
+        return library.job_state()
+
+    @app.post("/api/jobs/stop")
+    async def stop_jobs() -> dict[str, int]:
+        return {"dropped": library.stop_jobs()}
+
+    @app.post("/api/models/check-updates")
+    async def check_updates(request: IdsRequest) -> dict[str, Any]:
+        return await library.check_updates(request.ids)
+
+    @app.get("/api/models/{model_id}/previews")
+    async def model_previews(model_id: int) -> dict[str, Any]:
+        model = _model(model_id)
+        return {"blur_nsfw": settings.blur_nsfw, "previews": library.previews(model)}
+
+    @app.get("/api/models/{model_id}/preview/{index}")
+    async def model_preview(
+        model_id: int, index: int, w: int | None = Query(None, ge=32, le=2048)
+    ) -> Response:
+        model = _model(model_id)
+        entries = previews.entries(model.meta)
+        if entries:
+            if not settings.fetch_previews:
+                raise HTTPException(404, "previews are turned off")
+            return await _remote_preview(entries, index, w)
+        if index != 0:
+            raise HTTPException(404, "no such preview")
+        # A picture beside the model, or the one inside its header. The path is the model's
+        # own, looked up here; the request only says which model.
+        path = Path(model.path)
+        image = await asyncio.to_thread(details.local_image, path)
+        if image is not None:
+            return FileResponse(image, media_type=previews.media_type(image),
+                                headers={"Cache-Control": "no-cache"})
+        inside = await asyncio.to_thread(details.thumbnail, path)
+        if inside is not None:
+            return Response(content=inside[0], media_type=inside[1],
+                            headers={"Cache-Control": "no-cache"})
+        raise HTTPException(404, "no picture for this model")
+
+    @app.post("/api/models/{model_id}/reveal")
+    async def reveal_model(model_id: int) -> dict[str, bool]:
+        model = _model(model_id)
+        from ..desktop import open_system_path
+
+        return {"ok": open_system_path(model.path)}
+
+    @app.get("/api/duplicates")
+    async def duplicates() -> dict[str, Any]:
+        return await asyncio.to_thread(library.duplicates)
+
+    @app.get("/api/cleanup")
+    async def cleanup() -> dict[str, Any]:
+        return await asyncio.to_thread(library.cleanup_scan)
+
+    @app.post("/api/cleanup/delete")
+    async def cleanup_delete(request: CleanupDeleteRequest) -> dict[str, Any]:
+        """Delete items of the last cleanup scan, by their number in it. The files are the
+        ones that scan found; the page cannot add one, and a scan it did not see cannot be
+        the one its numbers are read against."""
+        with _answering():
+            result = await asyncio.to_thread(library.cleanup_delete, request.ids, request.token)
+        manager.spawn(library.refresh(), "library-after-cleanup")
+        return _erased(result)
+
+    # --- the history ------------------------------------------------------
+
+    @app.delete("/api/history/{task_id}")
+    async def remove_from_history(task_id: int) -> dict[str, bool]:
+        with _answering():
+            manager.remove_from_history(task_id)
+        return {"ok": True}
+
+    @app.post("/api/history/{task_id}/redownload")
+    async def redownload(task_id: int) -> dict[str, Any]:
+        with _answering():
+            task = manager.redownload(task_id)
+        return {"ok": True, "task": task.to_json()}
+
+    # --- the library's folders --------------------------------------------
+
+    def _folders_now() -> tuple[Path | None, tuple[Path, ...]]:
+        return settings.library_path, tuple(settings.roots)
+
+    async def _folders_changed(before: tuple[Path | None, tuple[Path, ...]]) -> None:
+        """After the library's folders changed: records first, then a walk.
+
+        Which folder is the main one decides where each collected record belongs, so the
+        records are moved before anything reads them under the new arrangement.
+        """
+        old_root, old_roots = before
+        new_root, new_roots = _folders_now()
+        same_root = (old_root is None) == (new_root is None) and (
+            old_root is None or db.path_key(old_root) == db.path_key(new_root)
+        )
+        same_roots = [db.path_key(r) for r in old_roots] == [db.path_key(r) for r in new_roots]
+        if not (same_root and same_roots):
+            await asyncio.to_thread(library.remap_records, old_root, old_roots)
+        await library.refresh()
+
+    @app.post("/api/roots/add")
+    async def add_root() -> dict[str, Any]:
+        """Add a folder to the library, chosen in the system's own dialog."""
+        from ..desktop import pick_system_folder
+
+        chosen = await asyncio.to_thread(pick_system_folder, settings.library_root or "")
+        if not chosen:
+            return {"ok": False, "cancelled": True}
+        path = Path(chosen)
+        if not path.is_dir():
+            raise HTTPException(400, f"{chosen} is not a folder")
+        known = {db.path_key(r) for r in settings.roots}
+        if db.path_key(path) in known:
+            return {"ok": True, "unchanged": True, "roots": library.roots_json()}
+        before = _folders_now()
+        if not settings.library_root:
+            # With no library at all, the first folder added becomes it: downloads have
+            # been landing in a flat folder only because there was nowhere better.
+            settings.library_root = str(path)
+        else:
+            settings.extra_roots.append(str(path))
+        settings.save()
+        await _folders_changed(before)
+        return {"ok": True, "roots": library.roots_json()}
+
+    @app.post("/api/roots/{index}/remove")
+    async def remove_root(index: int) -> dict[str, Any]:
+        """Stop reading a folder into the library. Nothing on disk is touched."""
+        roots = settings.roots
+        if not 0 <= index < len(roots):
+            raise HTTPException(404, "no such library folder")
+        target = db.path_key(roots[index])
+        before = _folders_now()
+        if index == 0:
+            if not settings.library_root:
+                raise HTTPException(
+                    409, "this is the downloads folder — it is where files go until a "
+                         "library folder is set, so it cannot be taken off the list"
+                )
+            settings.library_root = settings.extra_roots.pop(0) if settings.extra_roots else ""
+        else:
+            settings.extra_roots = [
+                r for r in settings.extra_roots if db.path_key(r) != target
+            ]
+        settings.save()
+        await _folders_changed(before)
+        return {"ok": True, "roots": library.roots_json()}
+
+    @app.post("/api/roots/{index}/primary")
+    async def make_primary(index: int) -> dict[str, Any]:
+        """Make a folder the one downloads are filed into."""
+        roots = settings.roots
+        if not 0 <= index < len(roots):
+            raise HTTPException(404, "no such library folder")
+        if index == 0:
+            return {"ok": True, "unchanged": True, "roots": library.roots_json()}
+        chosen = roots[index]
+        before = _folders_now()
+        previous = settings.library_root
+        settings.extra_roots = [
+            r for r in settings.extra_roots if db.path_key(r) != db.path_key(chosen)
+        ]
+        if previous:
+            settings.extra_roots.insert(0, previous)
+        settings.library_root = str(chosen)
+        settings.save()
+        await _folders_changed(before)
+        return {"ok": True, "roots": library.roots_json()}
+
+    @app.post("/api/folders")
+    async def new_folder(request: NewFolderRequest) -> dict[str, Any]:
+        with _answering():
+            made = await asyncio.to_thread(
+                library.new_folder, request.root, request.parent, request.name
+            )
+        await library.refresh()
+        return {"ok": True, "path": str(made)}
+
+    @app.post("/api/folders/reveal")
+    async def reveal_folder(request: FolderRequest) -> dict[str, bool]:
+        target = _library_folder(request.root, request.relative)
+        from ..desktop import open_system_path
+
+        return {"ok": open_system_path(str(target))}
+
+    @app.post("/api/folders/hide")
+    async def hide_folder(request: FolderRequest) -> dict[str, Any]:
+        """Leave a folder out of the library — a code checkout, a node's test data."""
+        if not request.relative.strip("/"):
+            raise HTTPException(400, "a whole library folder is taken off the list, not hidden")
+        target = _library_folder(request.root, request.relative)
+        if db.path_key(target) not in {db.path_key(p) for p in settings.exclude_dirs}:
+            settings.exclude_dirs.append(str(target))
+            settings.save()
+        await library.refresh()
+        return {"ok": True, "hidden": settings.exclude_dirs}
+
+    @app.post("/api/folders/unhide")
+    async def unhide_folder(request: UnhideRequest) -> dict[str, Any]:
+        if not 0 <= request.index < len(settings.exclude_dirs):
+            raise HTTPException(404, "no such hidden folder")
+        settings.exclude_dirs.pop(request.index)
+        settings.save()
+        await library.refresh()
+        return {"ok": True, "hidden": settings.exclude_dirs}
+
+    @app.put("/api/ui")
+    async def put_ui(patch: UiPatch) -> dict[str, bool]:
+        """Remember how the window was left. A null value forgets a key."""
+        merged = dict(settings.ui or {})
+        for key, value in patch.prefs.items():
+            if value is None:
+                merged.pop(key, None)
+            else:
+                merged[str(key)[:64]] = value
+        if len(json.dumps(merged, ensure_ascii=False)) > UI_LIMIT:
+            raise HTTPException(413, "too much to remember")
+        settings.ui = merged
+        settings.save()
+        return {"ok": True}
+
     # --- settings ---------------------------------------------------------
 
     @app.get("/api/settings")
@@ -699,8 +1326,13 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
     async def put_settings(patch: SettingsPatch) -> dict[str, Any]:
         # Only what was actually sent: the form posts a subset, and filling the rest in from
         # the model's defaults would quietly reset every field it does not show.
+        before = _folders_now()
         settings.apply(patch.model_dump(exclude_unset=True))
         settings.save()
+        old_root, old_roots = before
+        if [db.path_key(r) for r in old_roots] != [db.path_key(r) for r in settings.roots] \
+                or (old_root is None) != (settings.library_path is None):
+            await asyncio.to_thread(library.remap_records, old_root, old_roots)
         # "Files at once" and the speed ceiling are live controls, not ones that wait for a
         # restart — you reach for them precisely while something is downloading.
         manager.apply_settings()
@@ -767,6 +1399,66 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
 
 def _sse(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+@contextlib.contextmanager
+def _answering():
+    """Turn the ways a library operation can refuse into the status codes that say so."""
+    try:
+        yield
+    except HTTPException:
+        raise
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(409, f"the library already has a model at that path ({exc})") from None
+    except LookupError as exc:
+        raise HTTPException(404, str(exc).strip("'\"")) from None
+    except Busy as exc:
+        raise HTTPException(409, str(exc)) from None
+    except FileExistsError as exc:
+        raise HTTPException(409, str(exc)) from None
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from None
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from None
+    except OSError as exc:
+        raise HTTPException(500, str(exc)) from None
+
+
+def _listing(paths) -> list[dict[str, Any]]:
+    listed = []
+    for path in paths:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = None
+        listed.append({"path": str(path), "name": path.name, "size": size})
+    return listed
+
+
+def _failures(failed) -> list[dict[str, str]]:
+    # Named rather than counted: "two sidecars stayed behind" is not something a person can
+    # act on without knowing which ones.
+    return [{"path": str(p), "reason": reason} for p, reason in failed]
+
+
+def _moved(result, remembered: str | None = None) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "unchanged": result.unchanged,
+        "dest": str(result.path),
+        "moved": len(result.companions),
+        "failed": _failures(result.failed),
+        "remembered": remembered,
+    }
+
+
+def _erased(result) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "deleted": [str(p) for p in result.deleted],
+        "missing": result.missing,
+        "failed": _failures(result.failed),
+    }
 
 
 __all__ = ["create_app", "db", "contextlib"]

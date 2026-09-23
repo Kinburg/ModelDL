@@ -49,7 +49,106 @@ _DIALOG = threading.Lock()
 def pick_system_folder(initial_dir: str = "", window: Any = None) -> str | None:
     """Open a native folder picker dialog using pywebview or fallback."""
     with _DIALOG:
-        return _pick_folder(initial_dir, window)
+        return _pick_folder(initial_dir, window or _open_window())
+
+
+def pick_system_file(initial_dir: str = "", window: Any = None) -> str | None:
+    """Open a native dialog for choosing one model file.
+
+    Behind *Locate…*, for a model that is no longer where the library last saw it. The same
+    rule as the folder dialog: the answer comes from the person at the keyboard, through a
+    window the operating system put in front of them, and never from the page.
+    """
+    with _DIALOG:
+        return _pick_file(initial_dir, window or _open_window())
+
+
+def _open_window() -> Any:
+    """The app's own window, when the server is running inside one.
+
+    A dialog raised by the server otherwise has no parent: a PowerShell one pops up behind
+    the app, and Tk refuses to run off the main thread at all. pywebview marshals the call
+    onto its own UI thread, so asking it is safe from a request handler.
+    """
+    if webview is None:
+        return None
+    try:
+        windows = list(getattr(webview, "windows", []) or [])
+    except Exception:  # noqa: BLE001 - no window is the normal answer outside the desktop app
+        return None
+    return windows[0] if windows else None
+
+
+MODEL_PATTERNS = ("*.safetensors", "*.sft", "*.ckpt", "*.pt", "*.pth", "*.gguf", "*.bin", "*.onnx")
+
+
+def _pick_file(initial_dir: str, window: Any) -> str | None:
+    folder = Path(initial_dir) if initial_dir else None
+    while folder is not None and not folder.exists() and folder.parent != folder:
+        folder = folder.parent
+    init_path = str(folder.resolve()) if folder is not None and folder.exists() else ""
+
+    if window is not None:
+        try:
+            result = window.create_file_dialog(
+                webview.OPEN_DIALOG,
+                directory=init_path or "",
+                allow_multiple=False,
+                file_types=(f"Model files ({';'.join(MODEL_PATTERNS)})", "All files (*.*)"),
+            )
+            if result:
+                return str(result[0] if isinstance(result, (list, tuple)) else result)
+            return None
+        except Exception:
+            pass
+
+    if threading.current_thread() is threading.main_thread():
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            chosen = filedialog.askopenfilename(
+                initialdir=init_path or None,
+                filetypes=[("Model files", " ".join(MODEL_PATTERNS)), ("All files", "*.*")],
+            )
+            root.destroy()
+            return str(chosen) if chosen else None
+        except Exception:
+            pass
+
+    if platform.system() == "Windows":
+        try:
+            patterns = ";".join(MODEL_PATTERNS)
+            safe_init = init_path.replace("'", "''")
+            cmd = [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                (
+                    "Add-Type -AssemblyName System.Windows.Forms; "
+                    "$f = New-Object System.Windows.Forms.OpenFileDialog; "
+                    f"$f.InitialDirectory = '{safe_init}'; "
+                    f"$f.Filter = 'Model files|{patterns}|All files|*.*'; "
+                    "if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { "
+                    "Write-Output $f.FileName }"
+                ),
+            ]
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                timeout=600,
+            )
+            out = proc.stdout.strip()
+            return out if out and Path(out).is_file() else None
+        except Exception:
+            pass
+
+    return None
 
 
 def _pick_folder(initial_dir: str, window: Any) -> str | None:
@@ -90,6 +189,9 @@ def _pick_folder(initial_dir: str, window: Any) -> str | None:
     # 3. Windows PowerShell FolderBrowserDialog fallback
     if platform.system() == "Windows":
         try:
+            # Doubled, because a folder called `Bob's models` would otherwise end the
+            # string early and hand the rest of its name to PowerShell as code.
+            safe_init = init_path.replace("'", "''")
             cmd = [
                 "powershell",
                 "-NoProfile",
@@ -97,18 +199,20 @@ def _pick_folder(initial_dir: str, window: Any) -> str | None:
                 (
                     "Add-Type -AssemblyName System.Windows.Forms; "
                     "$f = New-Object System.Windows.Forms.FolderBrowserDialog; "
-                    f"$f.SelectedPath = '{init_path}'; "
+                    f"$f.SelectedPath = '{safe_init}'; "
                     "$f.Description = 'Select Folder'; "
                     "if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { "
                     "Write-Output $f.SelectedPath }"
                 ),
             ]
+            # Long enough for a person to find a folder on another drive. Thirty seconds
+            # was not, and the answer given after it went nowhere.
             proc = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                timeout=30,
+                timeout=600,
             )
             out = proc.stdout.strip()
             return out if out and Path(out).is_dir() else None
@@ -318,12 +422,30 @@ def window_icon() -> str | None:
     return str(icon) if icon.is_file() else None
 
 
+def fit_to_screen(width: int, height: int) -> tuple[int, int]:
+    """The window's size, shrunk to fit the screen it opens on.
+
+    A laptop's 1366x768 is smaller than the size three panes would like, and a window
+    taller than the screen opens with its status bar under the taskbar.
+    """
+    try:
+        screen = webview.screens[0]
+        return (
+            max(760, min(width, int(screen.width * 0.92))),
+            max(540, min(height, int(screen.height * 0.88))),
+        )
+    except Exception:  # noqa: BLE001 - no screen to ask about is no reason not to open
+        return width, height
+
+
 def launch_desktop(
     app: FastAPI,
     host: str = "127.0.0.1",
     port: int = 7788,
-    width: int = 1120,
-    height: int = 780,
+    # Three panes side by side: the tree, the list and the details each want a width of
+    # their own, and the list is the one that suffers when the window is narrow.
+    width: int = 1360,
+    height: int = 860,
     debug: bool = False,
     sock: socket.socket | None = None,
 ) -> int:
@@ -342,6 +464,7 @@ def launch_desktop(
 
     url = f"http://{host}:{port}"
     api = JsApi()
+    width, height = fit_to_screen(width, height)
 
     # Create native standalone window
     window = webview.create_window(

@@ -213,12 +213,16 @@ def test_a_note_can_be_taken_off_again(client):
 
 
 def test_the_note_outlives_the_queue_row(client):
-    """The whole reason it is not kept in the database: this is the button people press
-    after an evening of downloading."""
+    """The whole reason it is not kept in the database: clearing the list is the button
+    people press after an evening of downloading, and taking a row out of the history the
+    one they press when tidying that."""
     task = finished(client)
     client.post(f"/api/tasks/{task.id}/note", json={"note": NOTE})
 
     client.post("/api/tasks/clear")
+    assert client.database.get(task.id).archived, "off the list, into the history"
+
+    client.delete(f"/api/history/{task.id}")
 
     assert client.database.get(task.id) is None
     assert written(client.library / "loras" / f"{MODEL}.json")["note"] == NOTE

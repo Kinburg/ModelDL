@@ -29,6 +29,7 @@ from sfd.library.classify import Verdict, classify  # noqa: E402
 from sfd.library.inspect import sniff_remote  # noqa: E402
 from sfd.library.layout import Layout, adopt, flat  # noqa: E402
 from sfd.providers.registry import Item, Resolution, expand, source_url  # noqa: E402
+from sfd.settings import hf_login  # noqa: E402
 
 
 def human(n: float | None) -> str:
@@ -161,9 +162,9 @@ async def main() -> int:
     parser.add_argument("--include", action="append", default=[], metavar="GLOB")
     parser.add_argument("--exclude", action="append", default=[], metavar="GLOB")
     parser.add_argument(
-        "--hf-token", default=os.environ.get("HF_TOKEN"),
-        help="defaults to $HF_TOKEN; prefer the environment variable, a command line is "
-             "visible to every process on the machine",
+        "--hf-token", default=os.environ.get("HF_TOKEN") or hf_login()[0],
+        help="defaults to $HF_TOKEN, then to the token hf auth login saved; prefer either "
+             "of those, a command line is visible to every process on the machine",
     )
     parser.add_argument("--civitai-token", default=os.environ.get("CIVITAI_TOKEN"))
     parser.add_argument("--min-speed", type=float, default=64.0, help="stall floor, KB/s")

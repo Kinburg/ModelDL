@@ -8,7 +8,6 @@ ROOT = Path.cwd()
 
 datas = [
     (str(ROOT / "sfd" / "web" / "static"), "sfd/web/static"),
-    (str(ROOT / "sfd" / "engines" / "hf_worker.py"), "sfd/engines"),
 ]
 
 hiddenimports = [

@@ -268,12 +268,6 @@ class SettingsPatch(BaseModel):
     verify_existing: bool | None = None
     disk_kind: Literal["", "ssd", "hdd"] | None = None
 
-    hf_engine: Literal["native", "hf_hub"] | None = None
-    hf_fallback: bool | None = None
-    hf_disable_xet: bool | None = None
-    hf_xet_high_performance: bool | None = None
-    hf_xet_sequential_writes: bool | None = None
-
     write_sidecars: bool | None = None
     fetch_previews: bool | None = None
     blur_nsfw: bool | None = None

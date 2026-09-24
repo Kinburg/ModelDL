@@ -92,37 +92,6 @@ digest, comparing it against something unrelated, and quarantining a flawless do
 An ETag we cannot identify leaves the hash unset, so verification is skipped rather than
 failed — a missing hash must never produce a verdict.
 
-## Two engines for HuggingFace
-
-**native** is the transfer described above: resume we control, a hash we verify, per-chunk
-progress, placement exactly where the layout says. It is the default.
-
-**hf_hub** runs HuggingFace's own client — in a **subprocess**, never as a library call in
-the server. That is not fussiness; it follows from one line in their documentation:
-
-> All environment variables are read at import time of `huggingface_hub`. Any modification
-> made afterwards will not be taken into account.
-
-Half of what tunes that client is environment variables — `HF_HUB_DISABLE_XET`,
-`HF_XET_HIGH_PERFORMANCE`, `HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY`. A long-running server
-cannot change any of them without a fresh interpreter. A subprocess also gets a clean
-connection pool each time, which is the documented shape of "the second repository
-downloaded at zero bytes per second", and it can actually be killed — a wedged thread inside
-someone else's library cannot.
-
-Progress comes back as JSON lines from a `tqdm` subclass, so it is real byte counts rather
-than scraped console output, and the token travels in the environment rather than on a
-command line every process on the machine can read.
-
-Worth switching to it for Xet chunk deduplication when re-fetching a repo that changed.
-Either engine can fall back to the other once when it fails outright; they speak different
-protocols, so one sometimes succeeds where the other is refused. **Verification is ours
-either way** — a file fetched by `hf_hub` is still hashed against what the Hub advertised
-before it counts as done, because a guarantee that lapses when a setting changes is not one.
-
-`huggingface_hub` writes its bookkeeping into a hidden `.cache/huggingface/` inside the
-destination. That is what makes its resume work; it stays contained.
-
 ## On connection count
 
 `scripts/bench_connections.py` measures throughput at several concurrency levels and
@@ -176,7 +145,7 @@ By hand, or on Linux and macOS:
 
 ```bash
 py -3 -m venv .venv
-.venv\Scripts\python.exe -m pip install -e ".[hf,desktop]"
+.venv\Scripts\python.exe -m pip install -e ".[desktop]"
 .venv\Scripts\python.exe scripts\serve.py --open
 ```
 
@@ -191,6 +160,12 @@ detect that mistake and print the command you meant, rather than a bare
 Nothing needs configuring to start: with no settings at all, files land in `downloads/`
 unsorted. Tokens and a library path go in the Settings panel — or in `$HF_TOKEN` and
 `$CIVITAI_TOKEN`, which take priority and keep them out of the settings file.
+
+A HuggingFace token saved by `hf auth login` is used when neither is set, found where
+HuggingFace's own tools look (`$HF_TOKEN_PATH`, else `token` in `$HF_HOME`, by default
+`~/.cache/huggingface`), and read afresh each time, so logging in needs no restart. A browser
+login's token expires and only the `hf` tool renews it; once it has run out, it is not sent,
+and the token field in Settings says so.
 
 ## The web interface
 
@@ -522,8 +497,7 @@ minutes, then ten. Failures no wait can fix are never retried: a missing token, 
 licence, a hash that did not match and a disk with no room left are all answered by a
 person, and asking the service again every thirty seconds is how a temporary refusal becomes
 a ban. **Speed limit** caps the whole queue rather than each connection, and takes effect
-while downloads are running (the `huggingface_hub` engine downloads in a subprocess of its
-own and is not capped).
+while downloads are running.
 
 The status bar says what the queue as a whole is doing — fetched of total, current speed,
 ETA — and warns when what is left does not fit on the disk, which is worth more before the
@@ -593,8 +567,9 @@ the same checkpoint, which is 67 GB when you wanted 12.
 `scripts/probe.py <url>` inspects a link without downloading it — size, hash, range
 support, whether a token is needed. `scripts/bench_connections.py` measures throughput.
 
-Tokens come from `$HF_TOKEN` / `$CIVITAI_TOKEN`; prefer those over `--hf-token`, since a
-command line is visible to every process on the machine.
+Tokens come from `$HF_TOKEN` / `$CIVITAI_TOKEN`, and for HuggingFace from `hf auth login`
+when the variable is not set; prefer those over `--hf-token`, since a command line is visible
+to every process on the machine.
 
 ## Tests
 

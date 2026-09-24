@@ -9,9 +9,9 @@ import { toast, toastError } from "./toasts.js";
 import * as act from "./actions.js";
 
 const FIELDS = ["profile", "connections", "concurrent_downloads", "disk_kind", "sidecar_dir",
-  "hf_engine", "queue_position", "max_speed_kb", "download_dir"];
+  "queue_position", "max_speed_kb", "download_dir"];
 const CHECKS = ["group_by_base_model", "smart_placement", "verify_hash", "write_sidecars", "write_compat_files",
-  "write_trigger_txt", "hf_fallback", "auto_start", "auto_retry", "fetch_previews", "blur_nsfw"];
+  "write_trigger_txt", "auto_start", "auto_retry", "fetch_previews", "blur_nsfw"];
 
 let dirty = false;
 
@@ -85,17 +85,10 @@ export function renderSettings() {
           ${field("concurrent_downloads", "Files at once", number("concurrent_downloads", 1, 8))}
           ${field("auto_start", "Start downloads on add", check("auto_start"), "Off: added links wait paused until you press Start all")}
           ${field("queue_position", "Add new downloads to", select("queue_position", [["bottom", "the bottom of the list"], ["top", "the top of the list"]]))}
-          ${field("max_speed_kb", "Speed limit, KB/s", number("max_speed_kb", 0, null, 64, "0 = unlimited"), "Shared by every connection of every file. Takes effect immediately. The huggingface_hub engine is not capped")}
+          ${field("max_speed_kb", "Speed limit, KB/s", number("max_speed_kb", 0, null, 64, "0 = unlimited"), "Shared by every connection of every file. Takes effect immediately")}
           ${field("auto_retry", "Retry failures on their own", check("auto_retry"), "After 30 s, 2 min and 10 min. A missing token or a full disk is never retried")}
           ${field("disk_kind", "Target disk", select("disk_kind", [["", "detect automatically"], ["ssd", "SSD / NVMe"], ["hdd", "mechanical"]]))}
           ${field("verify_hash", "Verify checksums", check("verify_hash"))}
-        </div>
-      </section>
-      <section>
-        <h3>HuggingFace</h3>
-        <div class="grid">
-          ${field("hf_engine", "Engine", select("hf_engine", [["native", "native transfer"], ["hf_hub", "huggingface_hub (subprocess)"]]), "native: resume and hashing we control. hf_hub: HuggingFace's own client, for Xet deduplication")}
-          ${field("hf_fallback", "Fall back to the other engine", check("hf_fallback"))}
         </div>
       </section>
       <section>
@@ -112,7 +105,7 @@ export function renderSettings() {
       <section>
         <h3>Accounts</h3>
         <div class="grid">
-          ${field("hf_token", "HuggingFace token", `<input id="set-hf_token" data-token="hf_token" type="password" autocomplete="off">`)}
+          ${field("hf_token", "HuggingFace token", `<input id="set-hf_token" data-token="hf_token" type="password" autocomplete="off">`, "For gated and private models. $HF_TOKEN overrides it; with neither, the token saved by hf auth login is used")}
           ${field("civitai_token", "Civitai API key", `<input id="set-civitai_token" data-token="civitai_token" type="password" autocomplete="off">`)}
         </div>
       </section>
@@ -131,7 +124,14 @@ function fill(holder) {
     const input = holder.querySelector(`[data-check="${key}"]`);
     if (input) input.checked = !!s[key];
   }
-  const hint = (key, env) => (s[`${key}_from_env`] ? `set from $${env}` : s[`${key}_set`] ? "saved — leave blank to keep" : "not set");
+  // In the order the server picks a token in, so the hint names the one actually in use.
+  const hint = (key, env) => {
+    if (s[`${key}_from_env`]) return `set from $${env}`;
+    if (s[`${key}_set`]) return "saved — leave blank to keep";
+    if (s[`${key}_from_login`]) return "not set — using the one from hf auth login";
+    if (s[`${key}_login_expired`]) return "not set — the hf auth login one has expired, log in again";
+    return "not set";
+  };
   holder.querySelector('[data-token="hf_token"]').placeholder = hint("hf_token", "HF_TOKEN");
   holder.querySelector('[data-token="civitai_token"]').placeholder = hint("civitai_token", "CIVITAI_TOKEN");
 }

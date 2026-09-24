@@ -804,7 +804,7 @@ def test_a_setting_outside_its_bounds_is_refused(client):
     something that reads like a bug in the downloader rather than a typed-in zero."""
     for patch in ({"connections": 0}, {"connections": 999}, {"connections": "several"},
                   {"concurrent_downloads": 0}, {"queue_position": "sideways"},
-                  {"hf_engine": "torrent"}, {"min_speed_kb": -1}):
+                  {"disk_kind": "floppy"}, {"min_speed_kb": -1}):
         assert client.put("/api/settings", json=patch).status_code == 422, patch
     assert client.get("/api/settings").json()["settings"]["connections"] == Settings().connections
 

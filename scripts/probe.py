@@ -23,6 +23,7 @@ import httpx  # noqa: E402
 
 from sfd.core.errors import SfdError  # noqa: E402
 from sfd.providers.registry import expand, source_url  # noqa: E402
+from sfd.settings import hf_login  # noqa: E402
 
 
 def human(n: float) -> str:
@@ -38,7 +39,7 @@ async def main() -> int:
     parser.add_argument("url")
     # Separate flags on purpose: one shared token would be sent to whichever service the
     # link happens to name, and a HuggingFace token offered to Civitai is simply rejected.
-    parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"))
+    parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN") or hf_login()[0])
     parser.add_argument("--civitai-token", default=os.environ.get("CIVITAI_TOKEN"))
     args = parser.parse_args()
 

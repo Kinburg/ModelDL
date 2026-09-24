@@ -35,8 +35,7 @@ from ..core.errors import (
 )
 from ..core.speed import RateLimiter
 from ..core.state import PartState
-from ..core.transfer import Transfer, TransferOptions, hash_file
-from ..engines.hf_hub import HfHubEngine, HfHubOptions
+from ..core.transfer import Transfer, TransferOptions
 from ..core.types import FileIdentity, ProgressSnapshot
 from ..library import erase, previews, relocate, sidecar
 from ..library.categories import ALIASES, Category
@@ -1127,36 +1126,9 @@ class Manager:
             self._fail(task, exc)
             return
 
-        use_hub = kind == "huggingface" and self.settings.hf_engine == "hf_hub"
-        if use_hub:
-            try:
-                await self._run_hf_hub(task, identity, destination)
-                return
-            except SfdError as exc:
-                if not self.settings.hf_fallback:
-                    self._fail(task, exc)
-                    return
-                self.emit({
-                    "type": "note", "id": task.id,
-                    "message": f"hf_hub engine failed ({exc}); trying the native transfer",
-                })
-
         try:
             await self._run_native(task, identity, destination)
         except SfdError as exc:
-            # The official client speaks protocols we do not, so it occasionally succeeds
-            # where the native path is refused. One extra attempt, only when it might help.
-            if kind == "huggingface" and self.settings.hf_fallback and not use_hub:
-                self.emit({
-                    "type": "note", "id": task.id,
-                    "message": f"native transfer failed ({exc}); trying huggingface_hub",
-                })
-                try:
-                    await self._run_hf_hub(task, identity, destination)
-                    return
-                except SfdError as fallback_error:
-                    self._fail(task, fallback_error)
-                    return
             self._fail(task, exc)
 
     def _require_space(self, task: Task, destination: Path) -> None:
@@ -1209,49 +1181,6 @@ class Manager:
                 self._wake.set()
             await asyncio.sleep(RETRY_POLL)
 
-    async def _run_hf_hub(
-        self, task: Task, identity: FileIdentity, destination: Path
-    ) -> None:
-        ref = task.identity.get("ref", {})
-        engine = HfHubEngine(
-            self.settings.effective_hf_token,
-            HfHubOptions(**self.settings.hf_hub_options),
-        )
-        result = await engine.download_file(
-            str(ref["repo_id"]),
-            str(ref["path"]),
-            destination,
-            repo_type=str(ref.get("repo_type") or "model"),
-            revision=str(ref.get("revision") or "main"),
-            total=task.size,
-            on_progress=self._progress_reporter(task, {"downloaded": task.downloaded,
-                                                       "persisted": 0.0}),
-        )
-
-        path = result.paths[0]
-        # The other engine does not do our verification, and dropping the guarantee when the
-        # engine changes would make it worthless. Hash what landed.
-        if task.sha256 and self.settings.verify_hash:
-            digest = await asyncio.to_thread(hash_file, path)
-            if digest != task.sha256:
-                corrupt = path.with_name(path.name + ".corrupt")
-                path.replace(corrupt)
-                raise ChecksumMismatch(
-                    f"expected {task.sha256}, got {digest}; kept the data at {corrupt}"
-                )
-
-        self.db.update(
-            task.id, state=db.DONE, downloaded=path.stat().st_size, dest=str(path),
-            error=None, finished_at=time.time(), transferred=result.transferred,
-        )
-        await self._write_sidecar(path, task, identity)
-        # Deliberately not tied to the records setting the write above answers to. The
-        # preview beside the model is read by the model managers, and someone who turned our
-        # JSON records off did not thereby ask their model manager to stop showing pictures.
-        if self.settings.fetch_previews and self.settings.write_compat_files:
-            await self._write_preview(path, task)
-        self._landed(task, path)
-
     def _progress_reporter(self, task: Task, progress: dict) -> ProgressCallback:
         def on_progress(snapshot: ProgressSnapshot) -> None:
             progress["downloaded"] = snapshot.downloaded
@@ -1284,8 +1213,8 @@ class Manager:
         try:
             path = await transfer.run()
         except SfdError:
-            # Recorded, but re-raised: the caller decides whether the other engine is worth
-            # a try before this counts as a failure.
+            # Recorded, then re-raised: failing the task, and booking another attempt, is
+            # the caller's.
             self.db.update(task.id, downloaded=progress["downloaded"])
             raise
         except asyncio.CancelledError:
@@ -1307,6 +1236,9 @@ class Manager:
             transferred=transfer.bytes_transferred,
         )
         await self._write_sidecar(path, task, identity)
+        # Deliberately not tied to the records setting the write above answers to. The
+        # preview beside the model is read by the model managers, and someone who turned our
+        # JSON records off did not thereby ask their model manager to stop showing pictures.
         if self.settings.fetch_previews and self.settings.write_compat_files:
             await self._write_preview(path, task)
         self._landed(task, path)

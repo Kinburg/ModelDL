@@ -35,7 +35,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - a setup problem, not a 
     else:
         print("Set the project up first:\n\n  run.cmd\n\nor by hand:\n\n"
               "  py -3 -m venv .venv\n"
-              f"  {venv} -m pip install -e \".[hf]\"\n", file=sys.stderr)
+              f"  {venv} -m pip install -e \".[desktop]\"\n", file=sys.stderr)
     raise SystemExit(1) from None
 
 from sfd.desktop import bind_local_port, is_gui_available, launch_desktop  # noqa: E402
@@ -95,8 +95,6 @@ def main() -> int:
         say(f"library: {settings.library_root} ({settings.profile})")
     else:
         say(f"library: not configured — files go to {settings.download_dir}/")
-    say(f"engine : {settings.hf_engine}"
-        f"{' (falls back to the other)' if settings.hf_fallback else ''}")
     if not settings.auto_start:
         say("note   : auto-start is off — added links wait until you press Start all")
 

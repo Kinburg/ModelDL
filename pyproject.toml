@@ -13,7 +13,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-hf = ["huggingface_hub>=0.34"]
 # The standalone window. Without it the same server still runs and opens in a browser, so
 # this is not something a command-line or headless install should have to carry.
 desktop = ["pywebview>=5.0"]

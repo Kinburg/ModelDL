@@ -29,6 +29,41 @@ from .categories import ALIASES, Category
 from .classify import Verdict
 from .layout import Layout
 
+# What each kind is called in the reasons a row gives, one and several.
+KIND_NAMES: dict[Category, tuple[str, str]] = {
+    Category.CHECKPOINT: ("checkpoint", "checkpoints"),
+    Category.DIFFUSION_MODEL: ("diffusion model", "diffusion models"),
+    Category.LORA: ("LoRA", "LoRAs"),
+    Category.VAE: ("VAE", "VAEs"),
+    Category.TEXT_ENCODER: ("text encoder", "text encoders"),
+    Category.CLIP_VISION: ("CLIP vision model", "CLIP vision models"),
+    Category.CONTROLNET: ("ControlNet", "ControlNets"),
+    Category.EMBEDDING: ("embedding", "embeddings"),
+    Category.UPSCALER: ("upscaler", "upscalers"),
+    Category.IPADAPTER: ("IP-Adapter", "IP-Adapters"),
+    Category.STYLE_MODEL: ("style model", "style models"),
+    Category.HYPERNETWORK: ("hypernetwork", "hypernetworks"),
+    Category.MOTION_MODULE: ("motion module", "motion modules"),
+    Category.LLM: ("LLM", "LLMs"),
+    Category.DETECTION: ("detector", "detectors"),
+    Category.OTHER: ("file", "files"),
+}
+
+
+def kind_name(category: Category | None, count: int = 1) -> str:
+    one, many = KIND_NAMES.get(category, ("model", "models")) if category else ("model", "models")
+    return one if count == 1 else many
+
+
+def same_base(a: str | None, b: str | None) -> bool:
+    """Whether two spellings name one base model: `Krea 2`, `Krea2` and `krea-2` do."""
+    return bool(a and b) and _base_key(a) == _base_key(b)
+
+
+def _base_key(name: str) -> str:
+    return re.sub(r"[\s._\-]+", "", str(name).casefold())
+
+
 # Two levels: the top of the library, and the base-model folders inside it. Deeper trees
 # exist, but by the third level the names stop being about what the file is.
 DEPTH = 2
@@ -205,12 +240,21 @@ def _walk(root: Path) -> dict[str, int]:
     return counts
 
 
+def named_in(folder: str, filename: str | None) -> bool:
+    """Whether a folder's whole name is one of the words of a filename."""
+    return _named_in(folder, _words(filename))
+
+
+# Words in nearly every filename, which would otherwise name every `models` folder there is.
+_GENERIC = frozenset({"model", "models", "weights", "file", "files"})
+
+
 def _words(filename: str | None) -> set[str]:
     """The words of a filename, long enough to mean something."""
     if not filename:
         return set()
     stem = Path(filename).stem.lower()
-    return {word for word in re.split(r"[\W_]+", stem) if len(word) > 2}
+    return {word for word in re.split(r"[\W_]+", stem) if len(word) > 2 and word not in _GENERIC}
 
 
 def _named_in(folder: str, words: set[str]) -> bool:

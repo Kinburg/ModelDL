@@ -8,266 +8,33 @@
 <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
-<header>
-  <img class="logo" src="/static/logo.png" alt="" width="22" height="22">
-  <h1>ModelDL</h1>
-  <input id="source" aria-label="Link to download"
-         placeholder="Paste a HuggingFace or Civitai link, or org/repo" autofocus>
-  <button class="primary" id="add">Add</button>
-  <button id="toggle-settings">Settings</button>
+<header id="top">
+  <div class="brand">
+    <img class="logo" src="/static/logo.png" alt="" width="22" height="22">
+    <h1>ModelDL</h1>
+  </div>
+  <div class="link-box">
+    <input id="source" aria-label="Link to download" spellcheck="false" autocomplete="off"
+           placeholder="Paste a HuggingFace or Civitai link, or org/repo" autofocus>
+    <button class="primary" id="add">Add</button>
+  </div>
+  <label class="search-box" data-icon="search">
+    <input id="search" type="search" aria-label="Search" spellcheck="false" autocomplete="off"
+           placeholder="Search the library">
+  </label>
+  <button id="open-settings" class="icon-button big" data-icon="settings" title="Settings" aria-label="Settings"></button>
 </header>
 
-<main>
-  <div class="row" style="margin-bottom:12px">
-    <span id="message" class="small"></span>
-    <!-- Only ever shown while a move is copying across drives, which is the only kind that
-         lasts long enough for anyone to change their mind about it. -->
-    <button id="move-stop" class="danger" hidden>Stop the move</button>
-  </div>
-
-  <div class="row" style="margin-bottom:12px">
-    <span class="small muted" id="summary"></span>
-    <span class="small muted" id="totals" hidden></span>
-    <span class="small warn" id="space" hidden></span>
-    <span style="flex:1"></span>
-    <input id="filter-text" class="filter" aria-label="Filter the queue by name"
-           placeholder="Filter by name" spellcheck="false">
-    <select id="filter-state" class="filter" aria-label="Filter the queue by state">
-      <option value="all">everything</option>
-      <option value="active">active</option>
-      <option value="blocked">needs a decision</option>
-      <option value="failed">failed</option>
-      <option value="done">finished</option>
-    </select>
-    <!-- Windows Task Manager reports bits, downloaders report bytes, and the factor of 8
-         between them makes every cross-check look like a bug. -->
-    <button id="start-all" hidden class="primary">Start all</button>
-    <button id="toggle-units" title="Switch speed between bytes and bits">MB/s</button>
-    <button id="clear-done">Clear finished</button>
-  </div>
-
-  <div id="tasks"></div>
-  <div class="empty" id="empty">Nothing queued yet.</div>
+<main id="panes">
+  <nav id="sidebar" aria-label="Views and folders"></nav>
+  <div class="splitter" data-side="left" role="separator" aria-orientation="vertical" title="Drag to resize, double-click to reset"></div>
+  <section id="center" aria-label="List"></section>
+  <div class="splitter" data-side="right" role="separator" aria-orientation="vertical" title="Drag to resize, double-click to reset"></div>
+  <aside id="inspector" aria-label="Details"></aside>
 </main>
 
-<!-- Settings modal -->
-<div class="modal-backdrop" id="settings-backdrop">
-  <div class="modal" id="settings" role="dialog" aria-modal="true" aria-labelledby="settings-title">
-    <div class="modal-header">
-      <strong id="settings-title">Settings</strong>
-      <button class="modal-close" id="close-settings" title="Close">&times;</button>
-    </div>
-    <div class="modal-body">
-      <div class="grid">
-        <label for="library_root">Library root</label>
-        <div class="input-with-btn">
-          <input id="library_root" placeholder="F:\ComfyUI\Shared — leave empty to keep one flat folder">
-          <button type="button" class="btn-browse" data-target="library_root" title="Choose folder in File Explorer">Browse…</button>
-        </div>
+<footer id="status"></footer>
 
-        <label for="profile">Folder profile</label>
-        <select id="profile"><option value="comfyui">ComfyUI</option><option value="a1111">A1111</option></select>
-
-        <label for="group_by_base_model">Group by base model</label>
-        <input type="checkbox" id="group_by_base_model">
-
-        <label for="hf_token">HuggingFace token</label>
-        <input id="hf_token" type="password" placeholder="unchanged">
-
-        <label for="civitai_token">Civitai API key</label>
-        <input id="civitai_token" type="password" placeholder="unchanged">
-
-        <label for="connections">Connections per file</label>
-        <input id="connections" type="number" min="1" max="64">
-
-        <label for="concurrent_downloads">Files at once</label>
-        <input id="concurrent_downloads" type="number" min="1" max="8">
-
-        <label for="auto_start" title="Off: added links wait paused until you press Start all">Start downloads on add</label>
-        <input type="checkbox" id="auto_start">
-
-        <label for="max_speed_kb" title="Shared by every connection of every file. 0 leaves the link alone. Takes effect immediately, mid-download. The huggingface_hub engine downloads in its own subprocess and is not capped">Speed limit, KB/s</label>
-        <input id="max_speed_kb" type="number" min="0" step="64" placeholder="0 = unlimited">
-
-        <label for="auto_retry" title="A failed download is picked back up after 30s, 2min and 10min. Failures a wait cannot fix — a missing token, a full disk — are never retried">Retry failures on their own</label>
-        <input type="checkbox" id="auto_retry">
-
-        <label for="queue_position" title="Where newly added downloads appear in the list">Add new downloads to</label>
-        <select id="queue_position">
-          <option value="bottom">bottom of the list</option>
-          <option value="top">top of the list</option>
-        </select>
-
-        <label for="hf_engine" title="native: our transfer, with resume and hashing we control. hf_hub: HuggingFace's own client in a subprocess, for Xet chunk deduplication">HuggingFace engine</label>
-        <select id="hf_engine">
-          <option value="native">native transfer</option>
-          <option value="hf_hub">huggingface_hub (subprocess)</option>
-        </select>
-
-        <label for="hf_fallback" title="Try the other engine once when one fails outright">Fall back to the other engine</label>
-        <input type="checkbox" id="hf_fallback">
-
-        <label for="disk_kind">Target disk</label>
-        <select id="disk_kind">
-          <option value="">detect automatically</option>
-          <option value="ssd">SSD / NVMe</option>
-          <option value="hdd">mechanical</option>
-        </select>
-
-        <label for="verify_hash">Verify checksums</label>
-        <input type="checkbox" id="verify_hash">
-
-        <label for="write_sidecars">Write metadata sidecars</label>
-        <input type="checkbox" id="write_sidecars">
-
-        <label for="sidecar_dir">Keep .json records in</label>
-        <div class="input-with-btn">
-          <input id="sidecar_dir" placeholder="empty = next to each model; a path collects them">
-          <button type="button" class="btn-browse" data-target="sidecar_dir" title="Choose folder in File Explorer">Browse…</button>
-        </div>
-
-        <label for="write_compat_files" title="Read by A1111 and ComfyUI model managers, which look for them beside the model">Also .civitai.info + preview</label>
-        <input type="checkbox" id="write_compat_files">
-
-        <label for="fetch_previews" title="The sample images a model is published with. Shown in the queue, and — with the compatibility files on — stored beside the model as .preview.png">Sample images</label>
-        <input type="checkbox" id="fetch_previews">
-
-        <label for="blur_nsfw" title="Civitai marks its own samples. A covered picture uncovers when you click it">Cover adult samples</label>
-        <input type="checkbox" id="blur_nsfw">
-
-        <label for="write_trigger_txt" title="Loaders paste this file straight into the prompt, so it holds the trigger words and nothing else">Trigger words as .txt</label>
-        <input type="checkbox" id="write_trigger_txt">
-      </div>
-      <pre id="layout" class="small muted" style="white-space:pre-wrap"></pre>
-    </div>
-    <div class="modal-footer">
-      <button class="primary" id="save-settings">Save</button>
-      <button id="show-layout">Check folder mapping</button>
-      <span style="flex:1"></span>
-      <span class="small muted" id="settings-saved"></span>
-    </div>
-  </div>
-</div>
-
-<!-- Folder picker, for a file the classifier could not place on its own -->
-<div class="modal-backdrop" id="folders-backdrop">
-  <div class="modal" id="folders" role="dialog" aria-modal="true" aria-labelledby="folders-title">
-    <div class="modal-header">
-      <strong id="folders-title">Where does this go?</strong>
-      <button class="modal-close" id="close-folders" title="Close">&times;</button>
-    </div>
-    <div class="modal-body">
-      <div id="folders-preview"></div>
-      <div class="small muted" id="folders-file"></div>
-      <input id="folders-search" aria-label="Search the library, or type a folder to create"
-             placeholder="Search, or type a folder to create"
-             spellcheck="false" autocomplete="off">
-      <div id="folders-list"></div>
-    </div>
-    <div class="modal-footer">
-      <label class="small muted" id="folders-remember-row"
-             title="Only applies to a folder that names a kind of model. A base-model folder like checkpoints/Krea 2 files this one file and leaves the mapping alone.">
-        <input type="checkbox" id="folders-remember">
-        <span>Send this kind of model here from now on</span>
-      </label>
-      <span style="flex:1"></span>
-      <!-- The list above is the library and nothing else, so another drive is unreachable
-           from it by construction. This opens the system's own dialog instead. -->
-      <button id="folders-browse" hidden
-              title="Choose any folder on this machine, including one on another drive">Another drive…</button>
-    </div>
-  </div>
-</div>
-
-<!-- Renaming, for a file the service named something nobody can scan -->
-<div class="modal-backdrop" id="rename-backdrop">
-  <div class="modal" id="rename" role="dialog" aria-modal="true" aria-labelledby="rename-title">
-    <div class="modal-header">
-      <strong id="rename-title">Rename</strong>
-      <button class="modal-close" id="close-rename" title="Close">&times;</button>
-    </div>
-    <div class="modal-body">
-      <div class="small muted" id="rename-where"></div>
-      <div class="input-with-btn" style="margin:12px 0 8px">
-        <input id="rename-input" aria-label="New name" spellcheck="false" autocomplete="off">
-        <span class="suffix" id="rename-suffix"></span>
-      </div>
-      <div class="small muted" id="rename-also"></div>
-    </div>
-    <div class="modal-footer">
-      <button class="primary" id="rename-go">Rename</button>
-      <span style="flex:1"></span>
-      <!-- Not a restriction anyone has to work around: every loader dispatches on the
-           extension, so changing it would make the file lie about its own format. -->
-      <span class="small muted">The extension stays as it is.</span>
-    </div>
-  </div>
-</div>
-
-<!-- Your own note. The one thing in a record that no service can supply -->
-<div class="modal-backdrop" id="note-backdrop">
-  <div class="modal" id="note" role="dialog" aria-modal="true" aria-labelledby="note-title">
-    <div class="modal-header">
-      <strong id="note-title">Note</strong>
-      <button class="modal-close" id="close-note" title="Close">&times;</button>
-    </div>
-    <div class="modal-body">
-      <div class="small muted" id="note-file"></div>
-      <textarea id="note-text" rows="6" maxlength="4000" spellcheck="false"
-                aria-label="Your note about this file"
-                placeholder="What you will want to know the next time you find this file — the weight that works, what it clashes with, why you kept it."></textarea>
-      <!-- Said here because it is the question a note raises: the queue row is cleared by
-           Clear finished and the record is not. Written by askNote, which knows whether the
-           file this is about exists yet. -->
-      <div class="small muted" id="note-where"></div>
-    </div>
-    <div class="modal-footer">
-      <button class="primary" id="note-save">Save</button>
-      <button id="note-clear" hidden>Remove the note</button>
-      <span style="flex:1"></span>
-      <span class="small muted" id="note-count"></span>
-    </div>
-  </div>
-</div>
-
-<!-- What a delete would take, before it takes it -->
-<div class="modal-backdrop" id="delete-backdrop">
-  <div class="modal" id="delete" role="dialog" aria-modal="true" aria-labelledby="delete-title">
-    <div class="modal-header">
-      <strong id="delete-title">Delete from disk</strong>
-      <button class="modal-close" id="close-delete" title="Close">&times;</button>
-    </div>
-    <div class="modal-body">
-      <div class="small muted" id="delete-intro"></div>
-      <div class="dest muted small" id="delete-where"></div>
-      <ul class="filelist" id="delete-list"></ul>
-      <div class="small warn">Deleted for good — nothing here goes to a recycle bin.</div>
-    </div>
-    <div class="modal-footer">
-      <button class="danger" id="delete-go">Delete</button>
-      <span style="flex:1"></span>
-      <span class="small muted" id="delete-total"></span>
-    </div>
-  </div>
-</div>
-
-<!-- Sample images, full size, with the prompt that produced each one -->
-<div class="modal-backdrop" id="preview-backdrop">
-  <div class="modal wide" id="preview-modal" role="dialog" aria-modal="true" aria-labelledby="preview-title">
-    <div class="modal-header">
-      <strong id="preview-title">Sample</strong>
-      <span class="small muted" id="preview-count"></span>
-      <span style="flex:1"></span>
-      <button class="modal-close" id="close-preview" title="Close">&times;</button>
-    </div>
-    <div class="modal-body">
-      <div class="stage" id="preview-stage"></div>
-      <div class="strip" id="preview-strip"></div>
-      <dl class="record" id="preview-meta"></dl>
-    </div>
-  </div>
-</div>
-
-<script src="/static/app.js"></script>
+<script type="module" src="/static/app.js"></script>
 </body>
 </html>

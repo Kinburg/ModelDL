@@ -26,6 +26,7 @@ without asking first, and why `belongings` exists to be shown before that questi
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -55,7 +56,10 @@ def leftovers(path: Path) -> list[Path]:
 
 
 def belongings(
-    path: Path, sidecar_dir: Path | None = None, library_root: Path | None = None
+    path: Path,
+    sidecar_dir: Path | None = None,
+    library_root: Path | None = None,
+    roots: Iterable[Path] = (),
 ) -> list[Path]:
     """Every file on disk that a delete would take, model first.
 
@@ -64,18 +68,21 @@ def belongings(
     nobody should have to answer from memory.
     """
     found = [path] if path.is_file() else []
-    return found + companions(path, sidecar_dir, library_root) + leftovers(path)
+    return found + companions(path, sidecar_dir, library_root, roots) + leftovers(path)
 
 
 def erase(
-    path: Path, sidecar_dir: Path | None = None, library_root: Path | None = None
+    path: Path,
+    sidecar_dir: Path | None = None,
+    library_root: Path | None = None,
+    roots: Iterable[Path] = (),
 ) -> Erased:
     """Delete `path` and everything named after it. Permanently.
 
     Raises `OSError` if the model itself will not go, having touched nothing else.
     """
     result = Erased()
-    rest = companions(path, sidecar_dir, library_root) + leftovers(path)
+    rest = companions(path, sidecar_dir, library_root, roots) + leftovers(path)
 
     if path.is_file():
         # Deliberately not guarded: if this raises, the sidecars are still on disk beside
@@ -92,4 +99,24 @@ def erase(
             result.failed.append((other, str(exc)))
         else:
             result.deleted.append(other)
+    return result
+
+
+def remove(paths: Iterable[Path]) -> Erased:
+    """Delete a list of files that has already been shown to someone and agreed to.
+
+    For what is left of a model that is gone — its record, a preview in a folder it was
+    dragged out of — and for the fragments of downloads nobody is coming back for. A file
+    that has already gone is not a failure: the point was for it not to be there.
+    """
+    result = Erased()
+    for path in paths:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            result.failed.append((path, str(exc)))
+        else:
+            result.deleted.append(path)
     return result

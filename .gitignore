@@ -7,9 +7,10 @@ downloads/
 settings.json
 settings.local.json
 
-# The download queue
+# The download queue, and the copy kept of it before the library changed its schema
 queue.db
 queue.db-journal
+*.before-library.bak
 
 # Cached preview images — refetched on demand
 previews/

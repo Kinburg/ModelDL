@@ -14,7 +14,9 @@ hundred rows does not justify the complexity of an async driver.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -60,9 +62,81 @@ CREATE TABLE IF NOT EXISTS tasks (
     attempts      INTEGER NOT NULL DEFAULT 0,
     retry_at      REAL,
     -- What you wrote about the file yourself. A cache of the `note` in the `.json` record,
-    -- which is where it actually lives: this row is cleared by `Clear finished` and the
+    -- which is where it actually lives: the row can be taken out of the history and the
     -- record is not, and a note that survives only until the list is tidied is no note.
-    note          TEXT
+    note          TEXT,
+    -- The model in the library this download produced. A finished task is the history of
+    -- a model, not the model: the model can be renamed, moved or deleted, and the history
+    -- has to keep saying what arrived and when.
+    model_id      INTEGER,
+    -- Taken off the Downloads list by `Clear finished`, still in the history.
+    archived      INTEGER NOT NULL DEFAULT 0,
+    -- The name the file arrived under, before any rename. The name a service gave a file
+    -- is what anyone searching that service for it again will type.
+    original_filename TEXT,
+    -- What became of a finished download whose model is no longer in the library:
+    -- 'deleted' when its files were deleted here, 'forgotten' when it went missing and was
+    -- taken out of the library.
+    fate          TEXT
+);
+
+-- The library: every model file the app knows about, downloaded here or found on disk.
+-- A cache of the disk, rebuilt by scanning; what cannot be rebuilt (the note) lives in the
+-- model's `.json` record, and this table only carries a copy of it.
+CREATE TABLE IF NOT EXISTS models (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- The path as the file system compares it, so `Loras/A.safetensors` and
+    -- `loras/a.safetensors` are one model on Windows rather than two.
+    key           TEXT NOT NULL,
+    path          TEXT NOT NULL,
+    filename      TEXT NOT NULL,
+    size          INTEGER,
+    mtime         REAL,
+    state         TEXT NOT NULL,
+    origin        TEXT NOT NULL,
+    provider      TEXT,
+    identity      TEXT NOT NULL DEFAULT '{}',
+    meta          TEXT NOT NULL DEFAULT '{}',
+    sha256        TEXT,
+    -- Where the hash came from: 'download' (what the service advertised and the transfer
+    -- verified) or 'computed' (read off the file here, valid for `hashed_mtime`).
+    hash_source   TEXT,
+    hashed_mtime  REAL,
+    category      TEXT,
+    confidence    TEXT,
+    reason        TEXT,
+    base_model    TEXT,
+    -- What the file's own header says, read once per version of the file.
+    header        TEXT NOT NULL DEFAULT '{}',
+    sniffed_mtime REAL,
+    -- A few small pieces of the file, hashed: tells two files of one size apart without
+    -- reading either. And A1111's AutoV1 hash, read in the same pass, which Civitai still
+    -- answers to. Both for the version of the file at `sampled_mtime`.
+    fingerprint   TEXT,
+    autov1        TEXT,
+    sampled_mtime REAL,
+    -- Which file on its volume this name is, and how many names that file has: more than
+    -- one is a hard link, the same data under several names. Read on every walk, since
+    -- making a link changes no date on the file for anything else to notice.
+    file_id       TEXT,
+    links         INTEGER,
+    -- What other tools left beside it: a `.civitai.info`, an A1111 description, a picture.
+    extras        TEXT NOT NULL DEFAULT '{}',
+    note          TEXT,
+    -- Where its `.json` record was last found, which after a move made in Explorer is not
+    -- necessarily where it would be written today.
+    record        TEXT,
+    -- Every file of a model split into shards, `path` being the first of them.
+    parts         TEXT NOT NULL DEFAULT '[]',
+    -- Files named after the model that stayed behind when it was moved outside the app.
+    left_behind   TEXT NOT NULL DEFAULT '[]',
+    -- The last attempt to identify it on Civitai, and the last check for a newer version.
+    lookup        TEXT NOT NULL DEFAULT '{}',
+    updates       TEXT NOT NULL DEFAULT '{}',
+    first_seen    REAL NOT NULL,
+    last_seen     REAL,
+    missing_since REAL,
+    updated_at    REAL NOT NULL
 );
 """
 
@@ -72,9 +146,14 @@ CREATE TABLE IF NOT EXISTS tasks (
 INDEXES = """
 CREATE INDEX IF NOT EXISTS tasks_state ON tasks(state);
 CREATE INDEX IF NOT EXISTS tasks_position ON tasks(position);
--- One row per remote file: adding the same thing twice should adopt the existing task
--- rather than race another download onto the same path.
-CREATE UNIQUE INDEX IF NOT EXISTS tasks_identity ON tasks(identity);
+CREATE INDEX IF NOT EXISTS tasks_model ON tasks(model_id);
+-- One unfinished row per remote file: adding the same thing twice should adopt the task
+-- already under way rather than race another download onto the same path. Finished rows
+-- are history, and a file can have been downloaded more than once — deleted in March,
+-- fetched again in May — so they are left out of the rule.
+CREATE UNIQUE INDEX IF NOT EXISTS tasks_identity_open ON tasks(identity) WHERE state != 'done';
+CREATE UNIQUE INDEX IF NOT EXISTS models_key ON models(key);
+CREATE INDEX IF NOT EXISTS models_sha256 ON models(sha256);
 """
 
 # The states a task moves through. `blocked` means classification was not confident enough
@@ -91,6 +170,18 @@ ACTIVE_STATES = (PENDING, RUNNING)
 # Which end of the queue a newly added task joins — `queue_position` in the settings.
 TOP = "top"
 BOTTOM = "bottom"
+
+# Whether a model in the library is where the app last saw it.
+PRESENT = "present"
+MISSING = "missing"
+
+# How a model came to be in the library.
+DOWNLOADED = "downloaded"
+FOUND = "found"
+
+# What became of a finished download whose model left the library.
+DELETED = "deleted"
+FORGOTTEN = "forgotten"
 
 
 @dataclass(slots=True)
@@ -122,6 +213,10 @@ class Task:
     attempts: int = 0
     retry_at: float | None = None
     note: str | None = None
+    model_id: int | None = None
+    archived: bool = False
+    original_filename: str | None = None
+    fate: str | None = None
 
     @property
     def duration(self) -> float | None:
@@ -186,18 +281,166 @@ class Task:
             # details of the one it is showing.
             "previews": len(previews.entries(self.meta)),
             "nsfw": bool(self.meta.get("nsfw")),
+            "model_id": self.model_id,
+            "archived": self.archived,
+            "original_filename": self.original_filename or self.filename,
+            "fate": self.fate,
+            "model_name": self.meta.get("model_name"),
+            "version_name": self.meta.get("version_name"),
         }
         if self.size:
             data["fraction"] = min(1.0, self.downloaded / self.size)
         return data
 
 
+@dataclass(slots=True)
+class Model:
+    """One model file in the library, wherever it came from."""
+
+    id: int
+    key: str
+    path: str
+    filename: str
+    size: int | None
+    mtime: float | None
+    state: str
+    origin: str
+    provider: str | None = None
+    identity: dict[str, Any] = field(default_factory=dict)
+    meta: dict[str, Any] = field(default_factory=dict)
+    sha256: str | None = None
+    hash_source: str | None = None
+    hashed_mtime: float | None = None
+    category: str | None = None
+    confidence: str | None = None
+    reason: str | None = None
+    base_model: str | None = None
+    header: dict[str, Any] = field(default_factory=dict)
+    sniffed_mtime: float | None = None
+    fingerprint: str | None = None
+    autov1: str | None = None
+    sampled_mtime: float | None = None
+    file_id: str | None = None
+    links: int | None = None
+    extras: dict[str, Any] = field(default_factory=dict)
+    note: str | None = None
+    record: str | None = None
+    parts: list[str] = field(default_factory=list)
+    left_behind: list[str] = field(default_factory=list)
+    lookup: dict[str, Any] = field(default_factory=dict)
+    updates: dict[str, Any] = field(default_factory=dict)
+    first_seen: float = 0.0
+    last_seen: float | None = None
+    missing_since: float | None = None
+    updated_at: float = 0.0
+
+    @property
+    def identified(self) -> bool:
+        """Whether a service has said what this is: downloaded from one, or looked up."""
+        return bool(
+            self.meta.get("version_id") or self.meta.get("repo_id") or self.meta.get("model_name")
+        )
+
+    @property
+    def title(self) -> str | None:
+        """The model's own name, as opposed to its file's."""
+        return (
+            self.meta.get("model_name")
+            or self.extras.get("model_name")
+            or self.header.get("title")
+            or None
+        )
+
+    @property
+    def trigger_words(self) -> list[str]:
+        """What wakes it up, from the most trustworthy source that says.
+
+        The service first — that is what the uploader published. Then what other tools
+        wrote beside it (A1111's activation text), then what the trainer put in the header.
+        """
+        for source in (
+            self.meta.get("trained_words"),
+            self.extras.get("trained_words"),
+            self.extras.get("activation_text"),
+            self.header.get("trigger_phrase"),
+        ):
+            words = sidecar.normalise_triggers(source)
+            if words:
+                return words
+        return []
+
+    @property
+    def preview_count(self) -> int:
+        remote = len(previews.entries(self.meta))
+        if remote:
+            return remote
+        return 1 if (self.extras.get("image") or self.header.get("thumbnail")) else 0
+
+    def to_json(self) -> dict[str, Any]:
+        """What the page lists. Deliberately light: this goes out for every model in the
+        library, and the prompts, the header and the record are fetched for the one that
+        is being looked at."""
+        precision = self.header.get("precision") or self.meta.get("precision")
+        return {
+            "id": self.id,
+            "path": self.path,
+            "folder": str(Path(self.path).parent),
+            "filename": self.filename,
+            "size": self.size,
+            "mtime": self.mtime,
+            "state": self.state,
+            "origin": self.origin,
+            "provider": self.provider,
+            "host": _origin(self.provider or "", self.identity, self.meta)
+            if self.provider else "",
+            "identified": self.identified,
+            "category": self.category,
+            "confidence": self.confidence,
+            "base_model": self.base_model,
+            "title": self.title,
+            "version_name": self.meta.get("version_name") or self.extras.get("version_name"),
+            "note": self.note,
+            "trigger_words": self.trigger_words,
+            "previews": self.preview_count,
+            "nsfw": bool(self.meta.get("nsfw") or self.extras.get("nsfw")),
+            "sha256": self.sha256,
+            "hash_source": self.hash_source,
+            "format": self.header.get("format"),
+            "precision": precision,
+            "parts": len(self.parts),
+            # How many names its file has: more than one is a hard link, and deleting this
+            # name alone frees nothing.
+            "links": self.links or 1,
+            "left_behind": len(self.left_behind),
+            "has_record": bool(self.record),
+            "first_seen": self.first_seen,
+            "last_seen": self.last_seen,
+            "missing_since": self.missing_since,
+            "lookup": self.lookup.get("result"),
+            "update": self.updates if self.updates.get("available") else None,
+        }
+
+
+# Columns of `models` stored as JSON, and what an empty one reads back as.
+_MODEL_JSON = {
+    "identity": dict, "meta": dict, "header": dict, "extras": dict,
+    "parts": list, "left_behind": list, "lookup": dict, "updates": dict,
+}
+
+
+def path_key(path: Path | str) -> str:
+    """How the file system compares two spellings of a path."""
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
 class Database:
     def __init__(self, path: Path | str = "queue.db") -> None:
         self._lock = threading.Lock()
+        self._path = str(path)
         self._conn = sqlite3.connect(str(path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
+            self._keep_a_copy_before_the_library()
             self._conn.executescript(SCHEMA)
             self._migrate()
             self._conn.executescript(INDEXES)
@@ -206,6 +449,29 @@ class Database:
                 "UPDATE tasks SET state = ? WHERE state = ?", (PENDING, RUNNING)
             )
             self._conn.commit()
+
+    def _keep_a_copy_before_the_library(self) -> None:
+        """Copy a queue from before the library aside, once, before changing it.
+
+        The change cannot be undone by an older build: it drops the rule that a file is
+        queued once ever, and once a file has been downloaded twice that rule can no longer
+        be put back — an older build opening this database would fail to start. The copy
+        is what that build can be pointed at instead.
+        """
+        old = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'tasks_identity'"
+        ).fetchone()
+        if old is None or self._path in ("", ":memory:"):
+            return
+        target = Path(self._path + ".before-library.bak")
+        if target.exists():
+            return
+        with contextlib.suppress(sqlite3.Error, OSError):
+            copy = sqlite3.connect(str(target))
+            try:
+                self._conn.backup(copy)
+            finally:
+                copy.close()
 
     def _migrate(self) -> None:
         """Add columns a database from an older build is missing.
@@ -222,15 +488,41 @@ class Database:
             "attempts": "INTEGER NOT NULL DEFAULT 0",
             "retry_at": "REAL",
             "note": "TEXT",
+            "model_id": "INTEGER",
+            "archived": "INTEGER NOT NULL DEFAULT 0",
+            "original_filename": "TEXT",
+            "fate": "TEXT",
         }
         for column, definition in additions.items():
             if column not in existing:
                 self._conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} {definition}")
 
+        # The library's table grows the same way: a database from the first build that had
+        # one keeps every model, and gains what the walk has learned to keep since.
+        existing = {row["name"] for row in self._conn.execute("PRAGMA table_info(models)")}
+        for column, definition in {
+            "fingerprint": "TEXT",
+            "autov1": "TEXT",
+            "sampled_mtime": "REAL",
+            "file_id": "TEXT",
+            "links": "INTEGER",
+        }.items():
+            if column not in existing:
+                self._conn.execute(f"ALTER TABLE models ADD COLUMN {column} {definition}")
+
         # Backfill, or the queue misbehaves in a way that looks arbitrary: with every
         # existing row at NULL, MAX(position) is NULL, the next task is handed position 1.0,
         # and it sorts ahead of everything already waiting.
         self._conn.execute("UPDATE tasks SET position = id WHERE position IS NULL")
+        # The name a file had when this build first sees it is the best record there is of
+        # the name it arrived under; a rename made before now left no other trace.
+        self._conn.execute(
+            "UPDATE tasks SET original_filename = filename WHERE original_filename IS NULL"
+        )
+        # The old rule — one row per remote file, ever — made a finished download block the
+        # same file from being fetched again once it was deleted. It is replaced by one that
+        # only covers the rows still under way.
+        self._conn.execute("DROP INDEX IF EXISTS tasks_identity")
         self._conn.commit()
 
     def close(self) -> None:
@@ -270,7 +562,10 @@ class Database:
             # Fractional positions let a row be dropped between two others without
             # renumbering the whole queue.
             "position": position,
+            "note": values.pop("note", None),
+            "model_id": values.pop("model_id", None),
         }
+        payload["original_filename"] = values.pop("original_filename", None) or payload["filename"]
         columns = ", ".join(payload)
         marks = ", ".join("?" for _ in payload)
         with self._lock:
@@ -345,6 +640,125 @@ class Database:
             )
             self._conn.commit()
             return cursor.rowcount
+
+    def archive_finished(self) -> int:
+        """Take every finished download off the Downloads list. The history keeps them."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE tasks SET archived = 1, updated_at = ? "
+                "WHERE state = ? AND archived = 0",
+                (time.time(), DONE),
+            )
+            self._conn.commit()
+            return cursor.rowcount
+
+    def tasks_for_model(self, model_id: int) -> list[Task]:
+        """Every download that produced this model, newest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM tasks WHERE model_id = ? "
+                "ORDER BY COALESCE(finished_at, created_at) DESC, id DESC",
+                (model_id,),
+            ).fetchall()
+        return [_to_task(row) for row in rows]
+
+    def finished_with_identity(self, identity: dict[str, Any]) -> list[Task]:
+        """Finished downloads of this remote file — the history of one link."""
+        encoded = json.dumps(identity, sort_keys=True)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM tasks WHERE identity = ? AND state = ? ORDER BY id DESC",
+                (encoded, DONE),
+            ).fetchall()
+        return [_to_task(row) for row in rows]
+
+    # --- the library ------------------------------------------------------
+
+    def add_model(self, **values: Any) -> Model | None:
+        """Insert a model. None when a model at that path is already known."""
+        now = time.time()
+        path = str(values.pop("path"))
+        payload: dict[str, Any] = {
+            "key": path_key(path),
+            "path": path,
+            "filename": values.pop("filename", None) or Path(path).name,
+            "state": values.pop("state", PRESENT),
+            "origin": values.pop("origin", FOUND),
+            "first_seen": values.pop("first_seen", now),
+            "updated_at": now,
+        }
+        payload.update(values)
+        payload = _encode_model(payload)
+        columns = ", ".join(payload)
+        marks = ", ".join("?" for _ in payload)
+        with self._lock:
+            try:
+                cursor = self._conn.execute(
+                    f"INSERT INTO models ({columns}) VALUES ({marks})", tuple(payload.values())
+                )
+                self._conn.commit()
+            except sqlite3.IntegrityError:
+                return None
+            model_id = cursor.lastrowid
+        return self.get_model(model_id)
+
+    def update_model(self, model_id: int, **values: Any) -> None:
+        if not values:
+            return
+        if "path" in values:
+            values["path"] = str(values["path"])
+            values["key"] = path_key(values["path"])
+        values["updated_at"] = time.time()
+        values = _encode_model(values)
+        assignments = ", ".join(f"{k} = ?" for k in values)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE models SET {assignments} WHERE id = ?", (*values.values(), model_id)
+            )
+            self._conn.commit()
+
+    def delete_model(self, model_id: int) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM models WHERE id = ?", (model_id,))
+            self._conn.commit()
+
+    def get_model(self, model_id: int) -> Model | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM models WHERE id = ?", (model_id,)).fetchone()
+        return _to_model(row) if row else None
+
+    def model_at(self, path: Path | str) -> Model | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM models WHERE key = ?", (path_key(path),)
+            ).fetchone()
+        return _to_model(row) if row else None
+
+    def list_models(self) -> list[Model]:
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM models ORDER BY id").fetchall()
+        return [_to_model(row) for row in rows]
+
+    def models_with_hash(self, sha256: str) -> list[Model]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM models WHERE sha256 = ? ORDER BY id", (sha256.lower(),)
+            ).fetchall()
+        return [_to_model(row) for row in rows]
+
+    def retarget_tasks(self, model_id: int, **values: Any) -> None:
+        """Carry a change to a model over to every download that produced it."""
+        if not values:
+            return
+        if "dest" in values:
+            values["dest"] = str(values["dest"])
+        values["updated_at"] = time.time()
+        assignments = ", ".join(f"{k} = ?" for k in values)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE tasks SET {assignments} WHERE model_id = ?", (*values.values(), model_id)
+            )
+            self._conn.commit()
 
     # --- reads ------------------------------------------------------------
 
@@ -454,4 +868,59 @@ def _to_task(row: sqlite3.Row) -> Task:
         attempts=row["attempts"] or 0,
         retry_at=row["retry_at"],
         note=row["note"],
+        model_id=row["model_id"],
+        archived=bool(row["archived"]),
+        original_filename=row["original_filename"],
+        fate=row["fate"],
+    )
+
+
+def _encode_model(values: dict[str, Any]) -> dict[str, Any]:
+    encoded = dict(values)
+    for key in _MODEL_JSON:
+        if key in encoded and not isinstance(encoded[key], str):
+            encoded[key] = json.dumps(encoded[key] or _MODEL_JSON[key](), ensure_ascii=False)
+    if encoded.get("sha256"):
+        encoded["sha256"] = str(encoded["sha256"]).lower()
+    return encoded
+
+
+def _to_model(row: sqlite3.Row) -> Model:
+    decoded: dict[str, Any] = {}
+    for key, kind in _MODEL_JSON.items():
+        try:
+            value = json.loads(row[key] or "null")
+        except (TypeError, ValueError):
+            value = None
+        decoded[key] = value if isinstance(value, kind) else kind()
+    return Model(
+        id=row["id"],
+        key=row["key"],
+        path=row["path"],
+        filename=row["filename"],
+        size=row["size"],
+        mtime=row["mtime"],
+        state=row["state"],
+        origin=row["origin"],
+        provider=row["provider"],
+        sha256=row["sha256"],
+        hash_source=row["hash_source"],
+        hashed_mtime=row["hashed_mtime"],
+        category=row["category"],
+        confidence=row["confidence"],
+        reason=row["reason"],
+        base_model=row["base_model"],
+        sniffed_mtime=row["sniffed_mtime"],
+        fingerprint=row["fingerprint"],
+        autov1=row["autov1"],
+        sampled_mtime=row["sampled_mtime"],
+        file_id=row["file_id"],
+        links=row["links"],
+        note=row["note"],
+        record=row["record"],
+        first_seen=row["first_seen"],
+        last_seen=row["last_seen"],
+        missing_since=row["missing_since"],
+        updated_at=row["updated_at"],
+        **decoded,
     )

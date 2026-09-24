@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import secrets
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -36,9 +38,10 @@ from ..core.state import PartState
 from ..core.transfer import Transfer, TransferOptions, hash_file
 from ..engines.hf_hub import HfHubEngine, HfHubOptions
 from ..core.types import FileIdentity, ProgressSnapshot
-from ..library import erase, relocate, sidecar
-from ..library.categories import ALIASES
+from ..library import erase, previews, relocate, sidecar
+from ..library.categories import ALIASES, Category
 from ..library.classify import Verdict, classify
+from ..library.files import is_model_file, shard_of, without_variant
 from ..library.inspect import sniff_remote
 from ..library.layout import Layout, adopt, flat
 from ..providers.base import Provider
@@ -46,10 +49,11 @@ from ..providers.civitai import DEFAULT_HOST as CIVITAI_DEFAULT_HOST
 from ..providers.civitai import CivitaiProvider
 from ..providers.direct import DirectProvider
 from ..providers.huggingface import HuggingFaceProvider
-from ..providers.registry import Item, expand, source_url
+from ..providers.registry import Item, Resolution, expand, source_url
 from ..settings import Settings
 from . import db
 from .db import Database, Task
+from .library import Library
 
 PROGRESS_INTERVAL = 0.4
 # How often progress is written to the queue. Far slower than the event stream, because its
@@ -68,6 +72,16 @@ SPACE_HEADROOM = 64 * 1024**2
 RETRY_DELAYS = (30.0, 120.0, 600.0)
 RETRY_POLL = 5.0
 
+# How long a resolved link waits for the answer to "where does it go?". Long enough to think
+# about it; not so long that a dialog left open overnight queues yesterday's idea.
+RESOLVED_FOR = 1800.0
+# Files of one link read at once to classify them: a repository of twenty quantisations is
+# twenty header reads, and in a row they would keep the dialog waiting half a minute.
+CLASSIFY_AT_ONCE = 4
+# Never ticked for anyone: nobody downloads a repository for its `.gitattributes` or for
+# the pictures in its model card.
+UNWANTED_SUFFIXES = (".gitattributes", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".webm")
+
 # Failures no amount of waiting fixes. Everything else — a reset connection, an expired
 # signature, a chunk that ran out of its own retries — is worth another go later.
 NO_RETRY = (
@@ -78,6 +92,18 @@ NO_RETRY = (
 
 def _gb(size: float) -> str:
     return f"{size / 1024**3:.1f} GB"
+
+
+@dataclass(slots=True)
+class Resolved:
+    """A link expanded and classified, waiting for the page to say which files go where."""
+
+    source: str
+    resolution: Resolution
+    verdicts: list[Verdict]
+    at: float
+    # The model a "download again" puts back, so the new file lands in its history.
+    restores: int | None = None
 
 
 class Manager:
@@ -100,19 +126,45 @@ class Manager:
         self._wake = asyncio.Event()
         self._stopping = False
         self._last_emit: dict[int, float] = {}
+        # Moves of library models, by model — the same stop mechanism as `_moves`, for the
+        # moves that start from the library rather than from a download's card.
+        self._model_moves: dict[int, threading.Event] = {}
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self.library = Library(settings, database, self.emit_threadsafe)
+        self._background: set[asyncio.Task[Any]] = set()
+        # Links resolved for the page to place, by token — see `resolve_links`.
+        self._resolved: dict[str, Resolved] = {}
+        # What a search for a missing model found: (model, answers, when), by token.
+        self._found: dict[str, tuple[int, list[dict[str, Any]], float]] = {}
 
     # --- lifecycle --------------------------------------------------------
 
     async def start(self) -> None:
         self._stopping = False
+        self._loop = asyncio.get_running_loop()
         self.reconcile()
         self.resize()
         self._retries = asyncio.create_task(self._retry_loop(), name="queue-retries")
+        self.library.start()
+        # The first walk of the library happens behind the page rather than in front of
+        # it: the queue is usable at once, and the tree fills in a moment later.
+        self.spawn(self.library.refresh(), "library-first-walk")
+
+    def spawn(self, coroutine, name: str) -> asyncio.Task[Any]:
+        """Run something in the background, and keep hold of it until it is done — a task
+        nothing refers to can be collected halfway through."""
+        task = asyncio.get_running_loop().create_task(coroutine, name=name)
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+        return task
 
     def apply_settings(self) -> None:
         """Take up the settings that are allowed to change while the queue is running."""
         self.limiter.rate = max(0.0, self.settings.max_speed_kb * 1024)
         self.resize()
+        # The library's folders may be different ones now.
+        with contextlib.suppress(RuntimeError):
+            self.spawn(self.library.refresh(), "library-after-settings")
 
     def resize(self) -> int:
         """Match the worker pool to the setting.
@@ -159,6 +211,16 @@ class Manager:
         self._workers.clear()
         self._running.clear()
         self._retries = None
+        for event in self._model_moves.values():
+            event.set()
+        for event in self._moves.values():
+            event.set()
+        await self.library.stop()
+        for task in list(self._background):
+            task.cancel()
+        for task in list(self._background):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
 
     def reconcile(self) -> None:
         """Re-read progress from the files themselves.
@@ -203,6 +265,26 @@ class Manager:
                 # A browser tab that stopped reading must not stall the downloads.
                 self._subscribers.discard(queue)
 
+    def emit_threadsafe(self, event: dict[str, Any]) -> None:
+        """`emit` for code running on a worker thread — the library's walk, a hash.
+
+        The subscriber queues belong to the event loop, and putting into one from another
+        thread is a race; the loop is asked to do it instead.
+        """
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            self.emit(event)
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            self.emit(event)
+        else:
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(self.emit, event)
+
     def _emit_task(self, task_id: int) -> None:
         task = self.db.get(task_id)
         if task is not None:
@@ -212,9 +294,19 @@ class Manager:
 
     async def add(self, source: str) -> list[Task]:
         """Expand a pasted link and queue everything it names."""
+        return (await self.add_links(source))["created"]
+
+    async def add_links(self, source: str) -> dict[str, Any]:
+        """Expand a pasted link and queue everything it names that is not already here.
+
+        "Already here" means in the library, on disk: a file downloaded before and still
+        where it landed is not fetched again. One that was deleted, or went missing, is —
+        that is what pasting its link again is for.
+        """
         layout = self.layout()
         timeout = httpx.Timeout(connect=15.0, read=60.0, write=30.0, pool=15.0)
         created: list[Task] = []
+        skipped: list[Any] = []
 
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
             resolution = await expand(
@@ -229,6 +321,10 @@ class Manager:
                 len(resolution.items), self.settings.queue_position
             )
             for item, position in zip(resolution.items, positions):
+                have = self._already_have(item)
+                if have is not None:
+                    skipped.append(have)
+                    continue
                 verdict = None
                 if self.settings.library_root:
                     verdict = await self._classify(resolution.provider, item, client)
@@ -243,35 +339,359 @@ class Manager:
                 else:
                     state = db.PENDING if self.settings.auto_start else db.PAUSED
 
-                task = self.db.add(
-                    state=state,
-                    source=source,
-                    label=resolution.label,
-                    provider=resolution.provider.name,
-                    identity={
-                        "provider": item.identity.provider,
-                        "ref": item.identity.ref,
-                    },
-                    filename=item.filename,
-                    size=item.size,
-                    sha256=item.sha256,
-                    dest=destination,
-                    category=verdict.category.value if verdict else None,
-                    confidence=verdict.confidence if verdict else None,
-                    reason=verdict.reason if verdict else None,
-                    disagreement=(
-                        verdict.disagreement.value if verdict and verdict.disagreement else None
-                    ),
-                    base_model=verdict.base_model if verdict else None,
-                    meta=item.meta,
-                    position=position,
-                )
+                task = self._add_task(source, resolution, item, verdict, destination, state, position)
                 if task is not None:
                     created.append(task)
-                    self.emit({"type": "task", "task": task.to_json()})
 
         self._wake.set()
-        return created
+        return {"created": created, "skipped": skipped}
+
+    def _add_task(
+        self,
+        source: str,
+        resolution: Resolution,
+        item: Item,
+        verdict: Verdict | None,
+        destination: Path,
+        state: str,
+        position: float,
+        **extra: Any,
+    ) -> Task | None:
+        task = self.db.add(
+            state=state,
+            source=source,
+            label=resolution.label,
+            provider=resolution.provider.name,
+            identity={
+                "provider": item.identity.provider,
+                "ref": item.identity.ref,
+            },
+            filename=item.filename,
+            size=item.size,
+            sha256=item.sha256,
+            dest=destination,
+            category=verdict.category.value if verdict else None,
+            confidence=verdict.confidence if verdict else None,
+            reason=verdict.reason if verdict else None,
+            disagreement=(
+                verdict.disagreement.value if verdict and verdict.disagreement else None
+            ),
+            base_model=verdict.base_model if verdict else None,
+            meta=item.meta,
+            position=position,
+            **extra,
+        )
+        if task is not None:
+            self.emit({"type": "task", "task": task.to_json()})
+        return task
+
+    # --- asking where a download goes -------------------------------------
+
+    async def resolve_links(self, source: str) -> dict[str, Any]:
+        """Expand a pasted link and say what it names and where it could go — queueing
+        nothing. The answer is kept under a token until the page says which files go where.
+
+        Everything that takes the network happens here, before the question is put: the
+        files a link expands into, and what each of them is, read from its header. What is
+        left to answer is the person's alone.
+        """
+        timeout = httpx.Timeout(connect=15.0, read=60.0, write=30.0, pool=15.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+            resolution = await expand(
+                source,
+                client,
+                hf_token=self.settings.effective_hf_token,
+                civitai_token=self.settings.effective_civitai_token,
+            )
+            if not resolution.items:
+                raise ValueError("the link names no files")
+            verdicts = await self._classify_all(resolution, client)
+        return self._hold(Resolved(source, resolution, verdicts, time.time()))
+
+    def _hold(self, resolved: Resolved, hint: tuple[Path, str] | None = None) -> dict[str, Any]:
+        now = time.time()
+        self._resolved = {k: v for k, v in self._resolved.items() if now - v.at < RESOLVED_FOR}
+        token = secrets.token_urlsafe(16)
+        self._resolved[token] = resolved
+        return self._describe(token, resolved, hint)
+
+    async def _classify_all(self, resolution: Resolution, client: httpx.AsyncClient) -> list[Verdict]:
+        """What each file of a link is.
+
+        Only model files are read — a `config.json` is what its name says — and of those,
+        one of each family: twenty quantisations of one model are one kind of file, and
+        reading twenty headers to learn that once kept the question waiting for seconds.
+        The smallest of a family is the one read, its header being the quickest to reach.
+        """
+        gate = asyncio.Semaphore(CLASSIFY_AT_ONCE)
+        items = resolution.items
+        families: dict[tuple[str, str], list[int]] = {}
+        verdicts: list[Verdict | None] = [None] * len(items)
+        for index, item in enumerate(items):
+            if item.filename and not is_model_file(item.filename, item.size):
+                verdicts[index] = classify(item.filename, item.meta, None)
+            else:
+                families.setdefault(_family(item.filename), []).append(index)
+
+        async def one(members: list[int]) -> None:
+            first = min(members, key=lambda i: items[i].size or 0)
+            async with gate:
+                verdict = await self._classify(resolution.provider, items[first], client)
+            for index in members:
+                verdicts[index] = verdict if index == first else Verdict(
+                    verdict.category, verdict.confidence, verdict.reason,
+                    base_model=verdict.base_model, disagreement=verdict.disagreement,
+                )
+
+        await asyncio.gather(*(one(members) for members in families.values()))
+        return [v for v in verdicts if v is not None]
+
+    def _describe(
+        self, token: str, resolved: Resolved, hint: tuple[Path, str] | None = None
+    ) -> dict[str, Any]:
+        """What the page shows while it asks: the files, which of them are worth having,
+        and where they could go — one ranking for each kind of file among them."""
+        resolution = resolved.resolution
+        items = resolution.items
+        have = [self._already_have(item) for item in items]
+        checked, structure = _preselect(resolution, have)
+        layout = self.layout()
+        rankings: dict[str, list[dict[str, Any]]] = {}
+        described = []
+        main = next((i for i, it in enumerate(items) if checked[i] and _model(it)), None)
+        if main is None:
+            main = next((i for i, it in enumerate(items) if _model(it)), 0)
+        for index, (item, verdict) in enumerate(zip(items, resolved.verdicts)):
+            # A config goes wherever the model it belongs to goes.
+            source = verdict if _model(item) else resolved.verdicts[main]
+            key = f"{source.category.value}|{source.base_model or ''}"
+            if key not in rankings:
+                rankings[key] = self.library.rank_folders(
+                    layout, source.category, source.base_model,
+                    item.filename if _model(item) else items[main].filename,
+                    meta=item.meta if _model(item) else items[main].meta,
+                    confidence=source.confidence, hint=hint,
+                )
+            model = have[index]
+            described.append({
+                "index": index,
+                "filename": item.filename,
+                "relative": item.relative,
+                "size": item.size,
+                "model_file": _model(item),
+                "primary": item.primary,
+                "category": verdict.category.value,
+                "confidence": verdict.confidence,
+                "reason": verdict.reason,
+                "base_model": verdict.base_model,
+                "model_name": item.meta.get("model_name"),
+                "version_name": item.meta.get("version_name"),
+                "checked": checked[index],
+                "have": None if model is None else {
+                    **dict(zip(("root", "relative"), self.library.placement(model.path))),
+                    "id": model.id, "path": model.path,
+                },
+                "ranking": key,
+            })
+        first = items[main]
+        return {
+            "token": token,
+            "source": resolved.source,
+            "label": resolution.label,
+            "provider": resolution.provider.name,
+            "host": first.meta.get("host") or (
+                "huggingface.co" if resolution.provider.name == "huggingface" else ""
+            ),
+            "items": described,
+            "main": main,
+            "rankings": rankings,
+            "folder_name": resolution.folder_name if len(items) > 1 else None,
+            "structure": structure,
+            "previews": len(previews.entries(first.meta)),
+            "nsfw": bool(first.meta.get("nsfw")),
+            "roots": self.library.roots_json(),
+        }
+
+    def resolve_again(self, model_id: int | None = None, task_id: int | None = None) -> dict[str, Any]:
+        """A file the library once had, as a resolved link: what its download kept, or what
+        identifying it found — for the page to ask where it goes back to, the folder it was
+        in first. Nothing is fetched to know it; it was all kept."""
+        model = self.db.get_model(model_id) if model_id is not None else None
+        task = None
+        if model_id is not None:
+            if model is None:
+                raise LookupError("no such model")
+            task = next((t for t in self.db.tasks_for_model(model.id) if t.identity.get("ref")), None)
+        elif task_id is not None:
+            task = self.db.get(task_id)
+            if task is None or task.state != db.DONE:
+                raise LookupError("no such download")
+            model = self.db.get_model(task.model_id) if task.model_id else None
+        if model is not None and model.state == db.PRESENT and Path(model.path).is_file():
+            raise ValueError(f"it is still in your library at {model.path}")
+
+        if task is not None:
+            identity = FileIdentity(
+                provider=str(task.identity.get("provider") or task.provider),
+                ref=dict(task.identity.get("ref") or {}),
+            )
+            item = Item(identity=identity, filename=model.filename if model else task.filename,
+                        size=task.size, sha256=task.sha256, meta=task.meta)
+            verdict = Verdict(_category(task.category) if task.category in Category._value2member_map_
+                              else Category.OTHER, task.confidence or "low", task.reason or "",
+                              base_model=task.base_model)
+            source, label = task.source, task.label
+            was = Path(model.path).parent if model else Path(task.dest).parent
+        elif model is not None and model.identity.get("provider"):
+            identity = FileIdentity(provider=str(model.identity["provider"]),
+                                    ref=dict(model.identity.get("ref") or {}))
+            item = Item(identity=identity, filename=model.filename, size=model.size,
+                        sha256=model.sha256, meta=model.meta)
+            verdict = Verdict(_category(model.category) if model.category in Category._value2member_map_
+                              else Category.OTHER, model.confidence or "low", model.reason or "",
+                              base_model=model.base_model)
+            source = source_url(identity, model.meta.get("host")) or ""
+            label = model.title or model.filename
+            was = Path(model.path).parent
+        else:
+            raise ValueError(
+                "nothing says where this file came from — look for it online, or find the file"
+            )
+        resolution = Resolution(
+            provider=self._provider_for(identity.provider, item.meta), items=[item], label=label
+        )
+        resolved = Resolved(source, resolution, [verdict], time.time(),
+                            restores=model.id if model is not None else None)
+        return self._hold(resolved, hint=(was, "where it was"))
+
+    async def find_online(self, model_id: int) -> dict[str, Any]:
+        """Where a model could be downloaded from, looked for on the services. What each
+        answer would download is kept here, under a token; the page is shown what it is and
+        says which one, by its place in the list."""
+        answer = await self.library.find_online(model_id)
+        now = time.time()
+        self._found = {k: v for k, v in self._found.items() if now - v[2] < RESOLVED_FOR}
+        token = secrets.token_urlsafe(16)
+        self._found[token] = (model_id, answer["found"], now)
+        shown = [{k: v for k, v in hit.items() if not k.startswith("_")} for hit in answer["found"]]
+        return {**answer, "found": shown, "token": token}
+
+    def resolve_found(self, token: str, index: int) -> dict[str, Any]:
+        """One of the answers `find_online` gave, as a link resolved — for the page to ask
+        where it goes, the folder the model was in first."""
+        held = self._found.get(token)
+        if held is None or not 0 <= index < len(held[1]):
+            raise LookupError("that search has expired — look again")
+        model_id, found, _at = held
+        model = self.db.get_model(model_id)
+        if model is None:
+            raise LookupError("no such model")
+        hit = found[index]
+        identity = FileIdentity(provider=hit["_identity"]["provider"], ref=dict(hit["_identity"]["ref"]))
+        item = Item(identity=identity, filename=model.filename, size=hit.get("size") or model.size,
+                    sha256=model.sha256 if hit.get("proven") else None, meta=dict(hit["_meta"]))
+        verdict = Verdict(_category(model.category) if model.category in Category._value2member_map_
+                          else Category.OTHER, model.confidence or "low", model.reason or "",
+                          base_model=model.base_model)
+        resolution = Resolution(provider=self._provider_for(identity.provider, item.meta),
+                                items=[item], label=hit.get("title") or model.filename)
+        resolved = Resolved(hit.get("page") or "", resolution, [verdict], time.time(), restores=model.id)
+        return self._hold(resolved, hint=(Path(model.path).parent, "where it was"))
+
+    def redownload_models(self, model_ids: list[int]) -> dict[str, Any]:
+        """Queue several missing models again, each back into the folder it was in — the
+        answer to "where?" given once for all of them, by asking to put them back."""
+        created: list[Task] = []
+        failed: list[dict[str, Any]] = []
+        for model_id in model_ids:
+            try:
+                answer = self.resolve_again(model_id=model_id)
+                model = self.db.get_model(model_id)
+                assert model is not None
+                result = self.queue_resolved(answer["token"], [0], Path(model.path).parent)
+            except (LookupError, ValueError) as exc:
+                failed.append({"id": model_id, "error": str(exc)})
+                continue
+            if result["created"]:
+                created.extend(result["created"])
+            else:
+                failed.append({"id": model_id, "error": "already downloading"})
+        return {"created": created, "failed": failed}
+
+    def resolved_meta(self, token: str) -> dict[str, Any]:
+        """The service's description of the main file of a resolved link — its pictures."""
+        resolved = self._resolved.get(token)
+        if resolved is None:
+            raise LookupError("that link has expired — paste it again")
+        items = resolved.resolution.items
+        main = next((it for it in items if _model(it)), items[0])
+        return main.meta
+
+    def drop_resolved(self, token: str) -> None:
+        self._resolved.pop(token, None)
+
+    def queue_resolved(
+        self, token: str, picks: list[int], folder: Path, keep_structure: bool = False
+    ) -> dict[str, Any]:
+        """Queue the files the page picked, into the folder it chose.
+
+        The folder is taken exactly as given, like a placement confirmed by hand: nothing is
+        added under it, not even a base-model subfolder — except the repository's own
+        folders, when asked to keep them. A folder that names a kind says what the files are
+        as well as where they go.
+        """
+        resolved = self._resolved.get(token)
+        if resolved is None:
+            raise LookupError("that link has expired — paste it again")
+        items = resolved.resolution.items
+        chosen = sorted({i for i in picks if 0 <= i < len(items)})
+        if not chosen:
+            raise ValueError("no file was picked")
+        container = resolved.resolution.folder_name if keep_structure else None
+        kind = ALIASES.get(folder.name.lower())
+        state = db.PENDING if self.settings.auto_start else db.PAUSED
+        # A model put back keeps what was written about it, whichever folder it lands in.
+        back = self.db.get_model(resolved.restores) if resolved.restores else None
+        note = back.note if back is not None else None
+        positions = self.db.reserve_positions(len(chosen), self.settings.queue_position)
+        created: list[Task] = []
+        queued: list[str] = []
+        for index, position in zip(chosen, positions):
+            item = items[index]
+            verdict = resolved.verdicts[index]
+            if container and item.relative:
+                destination = folder / container / Path(*item.relative.split("/"))
+            else:
+                destination = folder / item.filename
+            filed = Verdict(
+                kind or verdict.category,
+                "high" if kind is not None else verdict.confidence,
+                verdict.reason if kind in (None, verdict.category)
+                else f"filed by hand into {folder.name}",
+                base_model=verdict.base_model,
+            )
+            task = self._add_task(
+                resolved.source, resolved.resolution, item, filed, destination, state, position,
+                model_id=resolved.restores, note=note,
+            )
+            if task is None:
+                queued.append(item.filename)
+            else:
+                created.append(task)
+        self._resolved.pop(token, None)
+        self._wake.set()
+        return {"created": created, "queued": queued}
+
+    def _already_have(self, item: Item):
+        """The model a finished download of this very file left, if it is still on disk."""
+        identity = {"provider": item.identity.provider, "ref": item.identity.ref}
+        for task in self.db.finished_with_identity(identity):
+            if task.model_id is None:
+                continue
+            model = self.db.get_model(task.model_id)
+            if model is not None and model.state == db.PRESENT and Path(model.path).is_file():
+                return model
+        return None
 
     async def _classify(
         self, provider: Provider, item: Item, client: httpx.AsyncClient
@@ -366,18 +786,18 @@ class Manager:
 
         if task_id in self._moves:
             raise ValueError("this file is already being moved")
+        if not Path(task.dest).is_file():
+            raise FileNotFoundError(f"{task.dest} is not there any more")
 
+        # The file is the library's model now, and the model is what moves: the library
+        # carries the change over to every download that produced it — this card included —
+        # so the explanation on it stops naming a guess a person has overruled by hand.
+        model = self.library.model_for_task(task)
         stop = threading.Event()
         self._moves[task_id] = stop
         try:
             result = await asyncio.to_thread(
-                relocate.move,
-                Path(task.dest),
-                folder,
-                sidecar_dir=Path(self.settings.sidecar_dir) if self.settings.sidecar_dir else None,
-                library_root=Path(self.settings.library_root) if self.settings.library_root else None,
-                progress=self._move_progress(task_id),
-                stop=stop,
+                self.library.move, model.id, folder, self._move_progress(task_id), stop
             )
         finally:
             # Whatever happened, nothing is copying any more, and every page watching needs
@@ -385,22 +805,45 @@ class Manager:
             self._moves.pop(task_id, None)
             self.emit({"type": "moved", "id": task_id})
 
-        if result.unchanged:
-            return result
-
-        # The card explains where the file went and why. Leaving the old guess on it after
-        # a person has overruled it by hand is how the explanation stops being true.
-        kind = ALIASES.get(folder.name.lower())
-        self.db.update(
-            task_id,
-            dest=str(result.path),
-            category=kind.value if kind is not None else task.category,
-            confidence="high",
-            reason=f"moved by hand into {folder.name}",
-            disagreement=None,
-        )
         self._emit_task(task_id)
         return result
+
+    async def move_model(self, model_id: int, folder: Path) -> relocate.Move:
+        """Move a model of the library, which may not be anybody's download."""
+        if model_id in self._model_moves:
+            raise ValueError("this model is already being moved")
+        stop = threading.Event()
+        self._model_moves[model_id] = stop
+        try:
+            return await asyncio.to_thread(
+                self.library.move, model_id, folder, self._move_progress(model_id, "model_id"), stop
+            )
+        finally:
+            self._model_moves.pop(model_id, None)
+            self.emit({"type": "moved", "model_id": model_id})
+
+    async def separate_model(self, model_id: int) -> dict[str, Any]:
+        """Give one name of a shared file a copy of its own: a copy of the whole file on the
+        same drive, with its progress and a Stop, as a move across drives has."""
+        if model_id in self._model_moves:
+            raise ValueError("this model is being moved or copied already")
+        stop = threading.Event()
+        self._model_moves[model_id] = stop
+        try:
+            return await asyncio.to_thread(
+                self.library.separate, model_id,
+                self._move_progress(model_id, "model_id", verb="Copying"), stop,
+            )
+        finally:
+            self._model_moves.pop(model_id, None)
+            self.emit({"type": "moved", "model_id": model_id})
+
+    def stop_model_move(self, model_id: int) -> bool:
+        stop = self._model_moves.get(model_id)
+        if stop is None:
+            return False
+        stop.set()
+        return True
 
     def stop_move(self, task_id: int) -> bool:
         """Ask an in-flight move to give up. True if there was one to ask."""
@@ -410,7 +853,9 @@ class Manager:
         stop.set()
         return True
 
-    def _move_progress(self, task_id: int) -> relocate.Progress:
+    def _move_progress(
+        self, task_id: int, field: str = "id", verb: str | None = None
+    ) -> relocate.Progress:
         """Report a cross-drive move, which is a copy and therefore has a duration.
 
         Called from the worker thread doing the copying, so the event cannot be put on the
@@ -427,10 +872,10 @@ class Manager:
             if copied < total and now - last < PROGRESS_INTERVAL:
                 return
             last = now
-            loop.call_soon_threadsafe(
-                self.emit,
-                {"type": "moving", "id": task_id, "copied": copied, "total": total},
-            )
+            event = {"type": "moving", field: task_id, "copied": copied, "total": total}
+            if verb:
+                event["verb"] = verb
+            loop.call_soon_threadsafe(self.emit, event)
 
         return report
 
@@ -453,21 +898,14 @@ class Manager:
             raise ValueError("only a finished download can be renamed")
         if task_id in self._moves:
             raise ValueError("this file is being moved right now")
+        if not Path(task.dest).is_file():
+            raise FileNotFoundError(f"{task.dest} is not there any more")
 
-        result = await asyncio.to_thread(
-            relocate.rename,
-            Path(task.dest),
-            name,
-            sidecar_dir=Path(self.settings.sidecar_dir) if self.settings.sidecar_dir else None,
-            library_root=Path(self.settings.library_root) if self.settings.library_root else None,
-        )
-        if result.unchanged:
-            return result
-
-        # Both, and never just the path: `filename` is what the card shows, what the queue
-        # is searched by, and what a future download checks against to decide it is already
-        # here. A row where the two disagree is a row that lies twice.
-        self.db.update(task_id, dest=str(result.path), filename=result.path.name)
+        # Through the library, which renames the model and then every download of it: the
+        # history has to say what the file is called now, and `original_filename` keeps
+        # what it arrived as.
+        model = self.library.model_for_task(task)
+        result = await asyncio.to_thread(self.library.rename, model.id, name)
         self._emit_task(task_id)
         return result
 
@@ -502,51 +940,24 @@ class Manager:
             self._emit_task(task_id)
             return written, False
 
-        written, created = await asyncio.to_thread(self._annotate, Path(task.dest), task, note)
-        self.db.update(task_id, note=written)
+        if not Path(task.dest).is_file():
+            raise FileNotFoundError(f"{task.dest} is not there any more")
+        # The model is where the note lives; the library writes it into the record — and
+        # writes the record first when sidecars were turned off, since everything else in a
+        # record can be fetched again and this is the one field that cannot — then copies it
+        # to every download of the model, this one included.
+        model = self.library.model_for_task(task)
+        written, created = await asyncio.to_thread(self.library.set_note, model.id, note)
         self._emit_task(task_id)
         return written, created
 
-    def _annotate(self, path: Path, task: Task, note: str) -> tuple[str | None, bool]:
-        """Put the note in the record, writing the record first if there is not one yet."""
-        if not path.is_file():
-            raise FileNotFoundError(f"{path} is not there any more")
-
-        directory = Path(self.settings.sidecar_dir) if self.settings.sidecar_dir else None
-        root = Path(self.settings.library_root) if self.settings.library_root else None
-        record = sidecar.record_path(path, directory, root)
-
-        if not record.is_file():
-            # Clearing a note that was never written: there is nothing to do, and writing a
-            # whole record to hold `null` would be an odd way to do nothing.
-            if not note.strip():
-                return None, False
-            # Sidecars are turned off, so the note has nowhere to live. Written rather than
-            # refused: everything else in a record can be fetched again from the service,
-            # and this is the one field that cannot — losing it to a checkbox is the wrong
-            # outcome. Only the record, though. The compatibility files and the trigger
-            # `.txt` are a separate choice, and adding a note is not the moment to overrule
-            # it.
-            identity = FileIdentity(
-                provider=task.identity.get("provider", task.provider),
-                ref=task.identity.get("ref", {}),
-            )
-            verdict, built = self._record_for(path, task, identity)
-            sidecar.write(
-                path, verdict, built,
-                sidecar_dir=directory, library_root=root, compat=False, triggers=False,
-            )
-            return sidecar.annotate(record, note), True
-
-        return sidecar.annotate(record, note), False
-
     async def delete_files(self, task_id: int) -> erase.Erased:
-        """Delete what this download put on disk, and drop it from the queue.
+        """Delete what this download put on disk.
 
         Permanent, and therefore only ever reached from a question already answered — see
-        the endpoint. The row goes with the files because the alternative is a card offering
-        Folder, Move and Info for a file that is not there: everything a finished task shows
-        is about a file on disk, and without one there is nothing left for it to be.
+        the endpoint. A finished download stays in the history, marked deleted: what arrived
+        and when is still true after the file has gone, and it is what "download it again"
+        needs. One that never finished was never history, and its row goes with the files.
 
         A download still running is paused first and waited for. Pulling a `.part` out from
         under a transfer that is still writing to it is the one way this could damage
@@ -566,22 +977,93 @@ class Manager:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await running
 
+        if task.state == db.DONE:
+            model = self.library.model_for_task(task)
+            result = await asyncio.to_thread(self.library.delete_files, model.id)
+            self._emit_task(task_id)
+            return result
+
         result = await asyncio.to_thread(
-            erase.erase,
-            Path(task.dest),
-            sidecar_dir=Path(self.settings.sidecar_dir) if self.settings.sidecar_dir else None,
-            library_root=Path(self.settings.library_root) if self.settings.library_root else None,
+            erase.erase, Path(task.dest), **self.library.places()
         )
         self.db.delete(task_id)
         self.emit({"type": "removed", "id": task_id})
         return result
 
     def cancel(self, task_id: int) -> None:
+        """Take a download off the list.
+
+        One that finished goes into the history rather than away: the list is for what is
+        happening, the history for what happened. One that did not is cancelled, and its
+        `.part` stays on disk for the cleanup view to find.
+        """
+        task = self.db.get(task_id)
+        if task is not None and task.state == db.DONE:
+            self.db.update(task_id, archived=True)
+            self._emit_task(task_id)
+            return
         running = self._running.get(task_id)
         if running is not None:
             running.cancel()
         self.db.delete(task_id)
         self.emit({"type": "removed", "id": task_id})
+
+    def remove_from_history(self, task_id: int) -> None:
+        """Drop a finished download from the history. The model, if any, is untouched."""
+        task = self.db.get(task_id)
+        if task is None:
+            raise LookupError("no such download")
+        if task.state != db.DONE:
+            raise ValueError("only a finished download is history")
+        self.db.delete(task_id)
+        self.emit({"type": "removed", "id": task_id})
+
+    def redownload(self, task_id: int) -> Task:
+        """Queue a finished download again — the "Get again" of a model that was deleted
+        or went missing. Everything needed was kept: which file, from where, and where it
+        was when it was last seen, which is where it goes back to."""
+        old = self.db.get(task_id)
+        if old is None:
+            raise LookupError("no such download")
+        if old.state != db.DONE:
+            raise ValueError("only a finished download can be fetched again")
+        model = self.db.get_model(old.model_id) if old.model_id else None
+        if model is not None and model.state == db.PRESENT and Path(model.path).is_file():
+            raise ValueError(f"it is still in your library at {model.path}")
+        dest = model.path if model is not None else old.dest
+        task = self.db.add(
+            # The model it puts back, when the library still remembers it.
+            model_id=model.id if model is not None else None,
+            state=db.PENDING if self.settings.auto_start else db.PAUSED,
+            source=old.source,
+            label=old.label,
+            provider=old.provider,
+            identity=old.identity,
+            filename=Path(dest).name,
+            size=old.size,
+            sha256=old.sha256,
+            dest=dest,
+            category=old.category,
+            confidence=old.confidence,
+            reason=old.reason,
+            base_model=old.base_model,
+            meta=old.meta,
+            note=old.note,
+            original_filename=old.original_filename,
+            position_mode=self.settings.queue_position,
+        )
+        if task is None:
+            raise ValueError("this file is already in the queue")
+        self.emit({"type": "task", "task": task.to_json()})
+        self._wake.set()
+        return task
+
+    def pause_all(self) -> int:
+        paused = 0
+        for task in self.db.list([db.PENDING, db.RUNNING]):
+            self.pause(task.id)
+            paused += 1
+        return paused
 
     def start_all(self) -> int:
         """Release everything that is merely waiting for permission to begin.
@@ -600,9 +1082,10 @@ class Manager:
         return released
 
     def clear_finished(self) -> int:
-        removed = self.db.clear([db.DONE])
+        """Take every finished download off the list. Into the history, not away."""
+        archived = self.db.archive_finished()
         self.emit({"type": "reload"})
-        return removed
+        return archived
 
     # --- the worker loop --------------------------------------------------
 
@@ -767,7 +1250,7 @@ class Manager:
         # JSON records off did not thereby ask their model manager to stop showing pictures.
         if self.settings.fetch_previews and self.settings.write_compat_files:
             await self._write_preview(path, task)
-        self._emit_task(task.id)
+        self._landed(task, path)
 
     def _progress_reporter(self, task: Task, progress: dict) -> ProgressCallback:
         def on_progress(snapshot: ProgressSnapshot) -> None:
@@ -826,6 +1309,16 @@ class Manager:
         await self._write_sidecar(path, task, identity)
         if self.settings.fetch_previews and self.settings.write_compat_files:
             await self._write_preview(path, task)
+        self._landed(task, path)
+
+    def _landed(self, task: Task, path: Path) -> None:
+        """A download is done: into the library with it, then tell the page."""
+        try:
+            self.library.adopt_download(task, path)
+            self.library.inspect_soon()
+        except Exception as exc:  # noqa: BLE001 - the file is safely on disk either way
+            self.emit({"type": "toast", "level": "error",
+                       "message": f"{path.name} downloaded, but the library could not take it in: {exc}"})
         self._emit_task(task.id)
 
     def _record_for(
@@ -873,20 +1366,40 @@ class Manager:
         # the bytes were moving is in the queue and nowhere else, and this is the write that
         # gives it a home.
         task = self.db.get(task.id) or task
+        # A missing model downloaded again, into another folder: its record comes along
+        # first, so that what is written now adds to it — the note included — rather than
+        # starting a record of its own beside the old one.
+        back = self.db.get_model(task.model_id) if task.model_id else None
+        if back is not None and back.state == db.MISSING:
+            self.library.carry_record(back, path)
         records = self.settings.write_sidecars
         if not records and not task.note:
             return
 
         verdict, record = self._record_for(path, task, identity)
+        if not record.note:
+            # The same file fetched again — after it was deleted, or went missing — lands on
+            # a model the library already knows, and what was written about it then is still
+            # true. A pasted link knows nothing of that note; the record and the library do.
+            record.note = self._known_note(path)
         sidecar.write(
             path,
             verdict,
             record,
-            sidecar_dir=Path(self.settings.sidecar_dir) if self.settings.sidecar_dir else None,
-            library_root=Path(self.settings.library_root) if self.settings.library_root else None,
             compat=records and self.settings.write_compat_files,
             triggers=records and self.settings.write_trigger_txt,
+            **self.library.places(),
         )
+
+    def _known_note(self, path: Path) -> str | None:
+        places = self.library.places()
+        found = sidecar.find_record(path, **places)
+        if found is not None:
+            data = sidecar.read_record(found) or {}
+            if data.get("note"):
+                return str(data["note"])
+        model = self.db.model_at(path)
+        return model.note if model is not None else None
 
     async def _write_preview(self, path: Path, task: Task) -> None:
         """Put `<model>.preview.png` beside the file, at full size.
@@ -936,9 +1449,69 @@ class Manager:
 
 
 def _category(value: str):
-    from ..library.categories import Category
-
     return Category(value)
+
+
+def _family(filename: str) -> tuple[str, str]:
+    """Files that are one model in different sizes: the name without its variant, and the
+    container, since a GGUF and a safetensors of one name are not read the same way."""
+    stem, _, suffix = (filename or "").lower().rpartition(".")
+    if not stem:
+        stem, suffix = suffix, ""
+    shard = shard_of(filename or "")
+    if shard is not None:
+        stem = shard[0].lower().rpartition(".")[0]
+    return suffix, without_variant(stem)
+
+
+def _model(item: Item) -> bool:
+    """Whether a file of a link is a model, rather than something that comes with one. A
+    direct link names no file until it is fetched, and is taken to be one."""
+    return not item.filename or is_model_file(item.filename, item.size)
+
+
+def _doc(name: str) -> bool:
+    lowered = name.lower()
+    return lowered.endswith(".md") or lowered.split(".")[0] in ("readme", "license", "notice")
+
+
+def _preselect(resolution: Resolution, have: list[Any]) -> tuple[list[bool], bool]:
+    """Which files of a link are ticked when the question is put, and whether they keep the
+    repository's folders.
+
+    One file: that file. A Civitai version: the file its own download button gives. A
+    repository holding one model — its weights, in shards or not — the weights; and when
+    configs come with them, all of it, as the repository lays it out, since a transformers
+    model is a folder that only works whole. A repository of several models — a list of
+    quantisations, a pack of files for different nodes — nothing: which of them is wanted
+    is the question being asked. Nothing already in the library is ticked.
+    """
+    items = resolution.items
+    fresh = [have[i] is None for i in range(len(items))]
+    if len(items) == 1:
+        return [fresh[0]], False
+    if resolution.provider.name == "civitai":
+        if any(item.primary for item in items):
+            return [item.primary and fresh[i] for i, item in enumerate(items)], False
+        first = next((i for i, item in enumerate(items) if _model(item) and fresh[i]), None)
+        return [i == first for i in range(len(items))], False
+    models = [item for item in items if _model(item)]
+    sets = {(shard_of(item.filename) or (item.filename,))[0].lower() for item in models}
+    if len(sets) != 1:
+        return [False] * len(items), False
+    configs = [
+        item for item in items
+        if not _model(item) and not _doc(item.filename)
+        and not item.filename.lower().endswith(UNWANTED_SUFFIXES)
+    ]
+    if configs:
+        checked = [
+            fresh[i] and (_model(item) or item in configs or _doc(item.filename))
+            for i, item in enumerate(items)
+        ]
+        return checked, True
+    nested = any("/" in (item.relative or "") for item in models)
+    return [fresh[i] and _model(item) for i, item in enumerate(items)], nested
 
 
 ProgressCallback = Callable[[ProgressSnapshot], None]

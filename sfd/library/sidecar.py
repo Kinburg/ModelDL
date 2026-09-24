@@ -23,10 +23,11 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import httpx
 
@@ -115,18 +116,37 @@ def write(
     library_root: Path | None = None,
     compat: bool = True,
     triggers: bool = True,
+    roots: Iterable[Path] = (),
+    keep_existing: bool = False,
 ) -> Path:
-    """Write the sidecars for a model already at `path`. Returns where the record went."""
-    target = record_path(path, sidecar_dir, library_root)
+    """Write the sidecars for a model already at `path`. Returns where the record went.
+
+    `keep_existing` is for a model that did not come from here: the `.civitai.info` and the
+    trigger `.txt` beside it may be another tool's, or edited by hand, and identifying the
+    model is no reason to overwrite them.
+    """
+    target = record_path(path, sidecar_dir, library_root, roots)
     target.parent.mkdir(parents=True, exist_ok=True)
-    _write_json(target, record.build(verdict))
+    payload = record.build(verdict)
+    if payload.get("note") is None:
+        # A record being replaced — the same file downloaded again, a model identified —
+        # keeps the note it had. A note is removed by `annotate`, never by a rewrite that
+        # simply did not know there was one.
+        previous = read_record(target) if target.is_file() else None
+        if previous and previous.get("note"):
+            payload["note"] = previous["note"]
+    _write_json(target, payload)
 
     if compat and raw is not None and record.provider == "civitai":
         # Deliberately not moved: the model managers look here and nowhere else.
-        _write_json(path.with_name(path.stem + ".civitai.info"), raw)
+        info = path.with_name(path.stem + ".civitai.info")
+        if not (keep_existing and info.exists()):
+            _write_json(info, raw)
 
     if triggers:
-        write_trigger_text(path, (record.meta or {}).get("trained_words"))
+        text = path.with_name(path.stem + ".txt")
+        if not (keep_existing and text.exists()):
+            write_trigger_text(path, (record.meta or {}).get("trained_words"))
     return target
 
 
@@ -166,13 +186,21 @@ def normalise_triggers(words: Any) -> list[str]:
 
 
 def record_path(
-    path: Path, sidecar_dir: Path | None = None, library_root: Path | None = None
+    path: Path,
+    sidecar_dir: Path | None = None,
+    library_root: Path | None = None,
+    roots: Iterable[Path] = (),
 ) -> Path:
     """Where a model's `.json` record belongs.
 
     Beside the model by default. When collected elsewhere, the library's folder structure is
     mirrored underneath — two `model.safetensors` in different categories are different
     files, and flattening them into one directory would make one overwrite the other.
+
+    The library root is mirrored at the top of the collection, as it always was. Every other
+    folder the library is read from gets a mirror of its own under `@roots`, named after the
+    folder: `D:\\models\\loras\\a.safetensors` and `E:\\models\\loras\\a.safetensors` are two
+    files, and one tree for both would give them one record.
     """
     if sidecar_dir is None:
         return path.with_name(path.name + ".json")
@@ -182,8 +210,134 @@ def record_path(
         with contextlib.suppress(ValueError):
             relative = path.relative_to(library_root)
     if relative is None:
-        relative = Path(path.name)
+        for root in roots:
+            if library_root is not None and _same_folder(root, library_root):
+                continue
+            try:
+                inner = path.relative_to(root)
+            except ValueError:
+                continue
+            return sidecar_dir / ROOTS_FOLDER / root_label(root) / inner.with_name(
+                inner.name + ".json"
+            )
+    if relative is None:
+        # Outside every folder of the library — moved to another drive, say. Mirrored by
+        # the folder it is in, since two such files of one name are two files and one flat
+        # collection would give them one record.
+        return sidecar_dir / OUTSIDE_FOLDER / root_label(path.parent) / (path.name + ".json")
     return sidecar_dir / relative.with_name(relative.name + ".json")
+
+
+# Where the records of the library's other folders are collected, inside `sidecar_dir`,
+# and those of files in no folder of the library at all.
+ROOTS_FOLDER = "@roots"
+OUTSIDE_FOLDER = "@outside"
+
+
+def root_label(root: Path) -> str:
+    """A folder's full path as one readable directory name: `F:\\ComfyUI\\Shared` is
+    `F_ComfyUI_Shared`. The whole path rather than the last part of it, because
+    `D:\\models` and `E:\\models` are different folders with the same name."""
+    label = re.sub(r"[^A-Za-z0-9._-]+", "_", str(root)).strip("_.")
+    return label or "root"
+
+
+def find_record(
+    path: Path,
+    sidecar_dir: Path | None = None,
+    library_root: Path | None = None,
+    roots: Iterable[Path] = (),
+) -> Path | None:
+    """The record for `path` wherever it actually is, or None.
+
+    Usually that is `record_path`. It is not after the settings changed underneath a
+    library: a record written beside the model before `sidecar_dir` was set, or one
+    collected flat for a file that is only now inside a folder of the library. Those are
+    still this model's record, and a note in one of them is still this model's note.
+
+    Only the first two places are this model's by construction. The others are guesses,
+    and a guess can be another model's record: `E:\\models\\loras\\a.safetensors` mirrored
+    as if it were in the library root lands exactly on the record of the library root's
+    own `loras\\a.safetensors`. A guess is therefore taken only when nothing else can claim
+    it — it is not the proper record of a file that exists — and when it says it describes
+    a file of this name.
+    """
+    roots = tuple(roots)
+    canonical = record_path(path, sidecar_dir, library_root, roots)
+    if canonical.is_file():
+        return canonical
+    if sidecar_dir is None:
+        return None
+    beside = path.with_name(path.name + ".json")
+    if beside.is_file():
+        return beside
+
+    guesses: list[Path] = [record_path(path, sidecar_dir, library_root)]
+    # Mirrored at the top from whichever folder was the library root when it was written:
+    # making another folder the root moves where new records go, not where the old ones
+    # already are.
+    guesses.extend(record_path(path, sidecar_dir, root) for root in roots)
+    guesses.append(sidecar_dir / (path.name + ".json"))
+    tried: set[str] = {_key(canonical)}
+    for guess in guesses:
+        if _key(guess) in tried:
+            continue
+        tried.add(_key(guess))
+        if not guess.is_file():
+            continue
+        owner = owner_of(guess, sidecar_dir, library_root, roots)
+        if owner is not None and _key(owner) != _key(path) and owner.is_file():
+            continue
+        if _describes(guess, path):
+            return guess
+    return None
+
+
+def owner_of(
+    record: Path,
+    sidecar_dir: Path,
+    library_root: Path | None = None,
+    roots: Iterable[Path] = (),
+) -> Path | None:
+    """The model a record in `sidecar_dir` is the proper record of, under the layout as it
+    is now — or None for one collected flat, which names no folder."""
+    try:
+        relative = record.relative_to(sidecar_dir)
+    except ValueError:
+        return None
+    parts = relative.parts
+    if not parts or not parts[-1].lower().endswith(".json"):
+        return None
+    last = parts[-1][:-5]
+    if parts[0] == OUTSIDE_FOLDER:
+        # Named by a label of its folder, which cannot be turned back into the folder.
+        return None
+    if parts[0] == ROOTS_FOLDER:
+        if len(parts) < 3:
+            return None
+        labels = {root_label(r): r for r in roots}
+        root = labels.get(parts[1])
+        return root.joinpath(*parts[2:-1], last) if root is not None else None
+    if len(parts) < 2 or library_root is None:
+        return None
+    return library_root.joinpath(*parts[:-1], last)
+
+
+def _describes(record: Path, path: Path) -> bool:
+    """Whether a record says it is about a file of this name."""
+    data = read_record(record)
+    if data is None:
+        return False
+    named = str(data.get("filename") or "")
+    return named.lower() == path.name.lower()
+
+
+def _key(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _same_folder(a: Path, b: Path) -> bool:
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
 
 async def fetch_preview(
@@ -265,12 +419,23 @@ def retitle(record: Path, filename: str) -> bool:
 
 
 def read(
-    path: Path, sidecar_dir: Path | None = None, library_root: Path | None = None
+    path: Path,
+    sidecar_dir: Path | None = None,
+    library_root: Path | None = None,
+    roots: Iterable[Path] = (),
 ) -> dict[str, Any] | None:
-    try:
-        return json.loads(record_path(path, sidecar_dir, library_root).read_text("utf-8"))
-    except (OSError, json.JSONDecodeError):
+    found = find_record(path, sidecar_dir, library_root, roots)
+    if found is None:
         return None
+    return read_record(found)
+
+
+def read_record(record: Path) -> dict[str, Any] | None:
+    try:
+        data = json.loads(record.read_text("utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 # --- helpers ----------------------------------------------------------------

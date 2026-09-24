@@ -30,6 +30,12 @@ class Item:
     sha256: str | None = None
     # Provider metadata for later folder placement (repo tags, model type, base model).
     meta: dict[str, Any] = field(default_factory=dict)
+    # The file a service's own download button gives, among the several a version carries.
+    primary: bool = False
+    # Where the file sits inside the folder the link named — `vae/model.safetensors` — for
+    # keeping a repository's folders as they are rather than dropping every file side by
+    # side. None for a link to one file.
+    relative: str | None = None
 
 
 @dataclass(slots=True)
@@ -37,6 +43,9 @@ class Resolution:
     provider: Provider
     items: list[Item]
     label: str                      # what the user asked for, for display
+    # The name a folder holding the files would have, when they are kept as the repository
+    # arranges them: the repository's own name, or the folder the link pointed into.
+    folder_name: str | None = None
 
     @property
     def total_size(self) -> int | None:
@@ -145,6 +154,7 @@ async def _expand_civitai(
             # The mirror travels with the task, not with the identity: the same file from
             # either domain stays one download, but keeps talking to the domain that works.
             meta={**entry.meta, "host": ref.host},
+            primary=entry.primary,
         )
         for entry in files
     ]
@@ -176,6 +186,9 @@ async def _expand_hf(
         )
 
     files = await provider.list_files(ref, client)
+    # Paths inside the folder the link named, so a repository can be kept as it is laid out:
+    # a transformers model is a folder of files that only work together.
+    base = f"{ref.path.strip('/')}/" if ref.path else ""
     items = [
         Item(
             identity=hf.make_identity(
@@ -185,8 +198,10 @@ async def _expand_hf(
             size=entry.size,
             sha256=entry.sha256,
             meta={"repo_id": ref.repo_id, "path": entry.path},
+            relative=entry.path[len(base):] if entry.path.startswith(base) else entry.path,
         )
         for entry in files
     ]
     scope = f"{ref.repo_id}/{ref.path}" if ref.path else ref.repo_id
-    return Resolution(provider=provider, items=items, label=scope)
+    name = (ref.path.strip("/").rsplit("/", 1)[-1] if ref.path else ref.repo_id.rsplit("/", 1)[-1])
+    return Resolution(provider=provider, items=items, label=scope, folder_name=name or None)

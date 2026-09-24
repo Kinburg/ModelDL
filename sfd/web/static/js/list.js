@@ -146,11 +146,14 @@ function buildView() {
   if (view.kind === "missing") {
     const models = missingModels().filter((m) => matches(m, query))
       .sort((a, b) => (b.missing_since || 0) - (a.missing_since || 0));
+    const again = models.filter((m) => m.source);
     return {
       title: "Missing from disk",
-      meta: `${plural(models.length, "model")} the library remembers but cannot find`,
-      help: "Moved or deleted outside ModelDL. A model that turns up elsewhere under the same name and size is linked again on its own; for the rest, point to the file or forget it.",
-      tools: models.length ? `<button data-tool="forget-all" class="danger">${icon("trash")}Forget all…</button>` : "",
+      meta: `${plural(models.length, "model")} the library remembers but cannot find`
+        + (again.length ? ` · ${again.length} can be downloaded again` : ""),
+      help: "Moved or deleted outside ModelDL. A model that turns up elsewhere under the same name and size is linked again on its own; for the rest, download it again, point to the file, or forget it.",
+      tools: `${again.length ? `<button data-tool="again-all" title="Each back into the folder it was in">${icon("download")}Download all again…</button>` : ""}
+              ${models.length ? `<button data-tool="forget-all" class="danger">${icon("trash")}Forget all…</button>` : ""}`,
       rows: models.map((m) => ({ key: `m${m.id}`, html: modelRow(m, { where: true }) })),
       empty: "Every model the library knows about is where it should be.",
       sortable: false,
@@ -163,8 +166,8 @@ function buildView() {
     return {
       title: "Unidentified",
       meta: `${plural(models.length, "model")} not downloaded by ModelDL, and not described by anything beside them`,
-      help: "What they are is read from the files themselves — their headers, and the folders they are in. Identify asks Civitai by the file's hash and fills in the rest.",
-      tools: models.length ? `<button data-tool="identify-all" title="${fmtBytes(unhashed)} to read">${icon("hash")}Identify all on Civitai</button>` : "",
+      help: "What they are is read from the files themselves — their headers, and the folders they are in. Identify looks each one up on Civitai by its hash and on HuggingFace by its name and size, and fills in the rest; a big file is read in full only to prove a match.",
+      tools: models.length ? `<button data-tool="identify-all" title="At most ${fmtBytes(unhashed)} to read">${icon("hash")}Identify all</button>` : "",
       rows: models.map((m) => ({ key: `m${m.id}`, html: modelRow(m, { where: true }) })),
       empty: "Every model in the library came with a description.",
     };
@@ -172,23 +175,55 @@ function buildView() {
 
   if (view.kind === "duplicates") {
     const data = state.duplicates;
-    if (!data || data.loading) return { title: "Duplicates", meta: "Looking…", rows: [], empty: "Looking…" };
+    if (!data || data.loading) {
+      return { title: "Duplicates", meta: "Looking…", rows: [], empty: "Comparing the files that share a size…" };
+    }
+    const all = data.groups || [];
+    const wanted = (g) => !query || g.models.some((m) => matches(state.models.get(m.id) || m, query));
+    const groups = all.filter(wanted);
+    const linked = (data.linked || []).filter(wanted);
     const rows = [];
-    const group = (models, label) => {
-      rows.push({ key: null, html: `<div class="group-head">${label}</div>` });
-      for (const m of models) rows.push({ key: `m${m.id}`, html: modelRow(state.models.get(m.id) || m, { where: true }) });
-    };
-    for (const g of data.exact) group(g, `${esc(g[0].filename)} — the same file ${g.length} times · ${fmtBytes((g[0].size || 0) * (g.length - 1))} to gain`);
-    for (const g of data.possible) group(g, `${fmtBytes(g[0].size)} — the same size, perhaps the same file`);
-    const possibleIds = data.possible.flat().filter((m) => !m.sha256).map((m) => m.id);
+    for (const group of groups) {
+      rows.push({ key: null, html: duplicateHead(group) });
+      const keep = act.keeperOf(group);
+      for (const m of group.models) {
+        rows.push({
+          key: `m${m.id}`,
+          html: modelRow(state.models.get(m.id) || m, { where: true, keep: { group, chosen: m.id === keep } }),
+        });
+      }
+    }
+    if (linked.length) {
+      rows.push({ key: null, html: `<div class="group-head">Linked — one file under several names</div>` });
+      for (const group of linked) {
+        rows.push({ key: null, html: linkedHead(group) });
+        for (const m of group.models) {
+          rows.push({ key: `m${m.id}`, html: modelRow(state.models.get(m.id) || m, { where: true }) });
+        }
+      }
+    }
+    const same = all.filter((g) => g.status === "same");
+    const likely = all.filter((g) => g.status === "likely");
+    const toHash = likely.flatMap((g) => g.to_hash);
+    const toRead = likely.reduce((sum, g) => sum + g.to_read, 0);
     return {
       title: "Duplicates",
-      meta: `${plural(data.exact.length, "file")} kept more than once${data.wasted ? ` · ${fmtBytes(data.wasted)} to gain` : ""}`,
-      help: "Certain when the hashes match. Files of the same size are only a guess until they are hashed.",
-      tools: `${possibleIds.length ? `<button data-tool="hash-possible" data-ids="${possibleIds.join(",")}">${icon("hash")}Hash to be sure</button>` : ""}
+      meta: [
+        same.length ? `${plural(same.length, "file")} kept more than once · ${fmtBytes(data.wasted)} to gain` : "",
+        likely.length ? `<span class="warn">${likely.length} very likely · ${fmtBytes(data.likely)}</span>` : "",
+        (data.linked || []).length ? `${fmtBytes(data.saved)} saved by links` : "",
+      ].filter(Boolean).join(" · ") || "No copies",
+      help: "Files that share a size are first compared by a few small pieces of each"
+        + (data.told_apart ? ` — ${plural(data.told_apart, "set")} of them turned out to be different models` : "")
+        + ". Certain once the hashes of the whole files match. A workflow names the file it loads, folder"
+        + " included: after deleting a copy, point the workflows that used it at the one you kept.",
+      tools: `${toHash.length ? `<button data-tool="hash-likely" data-ids="${toHash.join(",")}" title="Reads ${fmtBytes(toRead)}">${icon("hash")}Confirm all by hash</button>` : ""}
               <button data-tool="reload-dups">${icon("refresh")}Look again</button>`,
       rows,
-      empty: data.error ? esc(data.error) : "No file is kept twice — as far as the hashes that are known can tell.",
+      empty: data.error ? esc(data.error)
+        : query ? "No copy matches."
+        : (data.linked || []).length ? "No file is kept twice."
+        : `No file is kept twice.${data.shared_sizes ? ` ${plural(data.shared_sizes, "set")} of files share a size, and all of them are different models.` : ""}`,
       sortable: false,
     };
   }
@@ -250,6 +285,9 @@ export function chips(model) {
   if (model.category) list.push(`<span class="chip kind">${esc(kindLabel(model.category))}</span>`);
   if (model.base_model) list.push(`<span class="chip">${esc(model.base_model)}</span>`);
   if (model.precision) list.push(`<span class="chip quiet">${esc(model.precision)}</span>`);
+  if (model.links > 1) {
+    list.push(`<span class="chip link" title="One file under ${model.links} names — deleting this one frees nothing while another is left">linked · ${model.links}</span>`);
+  }
   if (model.origin === "found") {
     list.push(model.identified
       ? `<span class="chip quiet" title="Not downloaded by ModelDL, identified afterwards">found</span>`
@@ -260,7 +298,59 @@ export function chips(model) {
   return list.join("");
 }
 
-function modelRow(model, { where = false, base = "" } = {}) {
+// The head of one set of copies in the Duplicates view: how sure, how much it would free, and
+// the one thing to do next — prove it with the hashes, or delete the copies not kept.
+function duplicateHead(group) {
+  const first = state.models.get(group.models[0].id) || group.models[0];
+  const name = first.title && first.title !== first.filename ? first.title : first.filename;
+  const sure = group.status === "same";
+  const others = group.copies - 1;
+  const linkable = sure ? act.linkable(group) : [];
+  const action = sure
+    ? `${linkable.length ? `<button class="mini" data-dup="link" data-group="${esc(group.key)}" title="The other copies become names of the one kept: every path keeps working, and their room is freed">${icon("link")}Link the copies…</button>` : ""}
+       <button class="mini danger" data-dup="dedupe" data-group="${esc(group.key)}">${icon("trash")}Delete ${others === 1 ? "the other copy" : `${others} other copies`}…</button>`
+    : `<button class="mini" data-dup="confirm" data-group="${esc(group.key)}" title="Reads ${fmtBytes(group.to_read)}">${icon("hash")}Confirm by hash</button>`;
+  return `
+    <div class="dup-head">
+      <div class="dup-line">
+        <span class="dup-title" title="${esc(name)}">${esc(name)}</span>
+        <span class="state ${sure ? "ok" : "warn"}" title="${sure ? "The hashes of the whole files match" : "The pieces compared agree — only the hashes of the whole files are proof"}">${sure ? "identical" : "very likely identical"}</span>
+      </div>
+      <div class="dup-line">
+        <span class="dup-meta">${plural(group.copies, "copy", "copies")} · ${fmtBytes(group.wasted)} to gain</span>
+        <span class="grow"></span>${action}
+      </div>
+      ${group.caution ? `<div class="dup-caution">${icon("alert")}<span>${esc(group.caution)}</span></div>` : ""}
+    </div>`;
+}
+
+// A file that is already under several names: nothing to gain, and the way back to copies.
+function linkedHead(group) {
+  const first = state.models.get(group.models[0].id) || group.models[0];
+  const name = first.title && first.title !== first.filename ? first.title : first.filename;
+  return `
+    <div class="dup-head">
+      <div class="dup-line">
+        <span class="dup-title" title="${esc(name)}">${esc(name)}</span>
+        <span class="state ok" title="Hard links: one file on the disk, under several names">linked</span>
+      </div>
+      <div class="dup-line">
+        <span class="dup-meta">one file, ${group.names} names · ${fmtBytes(group.saved)} saved${group.outside ? ` · ${plural(group.outside, "name")} outside the library` : ""}</span>
+        <span class="grow"></span>
+        <button class="mini" data-dup="separate" data-group="${esc(group.key)}" title="Give every name a copy of its own again">${icon("copy")}Make separate copies…</button>
+      </div>
+    </div>`;
+}
+
+function keepToggle({ group, chosen }, id) {
+  if (chosen) {
+    const why = group.keep === id && group.keep_why ? ` — ${group.keep_why}` : "";
+    return `<span class="keep on" title="${esc(`Kept when the other copies are deleted${why}`)}">${icon("star")}Keep</span>`;
+  }
+  return `<button class="keep" data-keep="${esc(group.key)}" data-id="${id}" title="Keep this copy instead">${icon("copy")}Copy</button>`;
+}
+
+function modelRow(model, { where = false, base = "", keep = null } = {}) {
   const selected = state.selection.has(`m${model.id}`);
   const missing = model.state === "missing";
   const place = model.root === null || model.root === undefined
@@ -286,6 +376,7 @@ function modelRow(model, { where = false, base = "" } = {}) {
         <div class="row-title"><span class="name">${esc(model.filename)}</span>${marks}</div>
         <div class="row-sub">${sub}</div>
       </div>
+      ${keep ? keepToggle(keep, model.id) : ""}
       <div class="row-side">
         <span class="size">${fmtBytes(model.size)}</span>
         <span class="date" title="${esc(fmtDate(model.first_seen))}">${missing ? "" : fmtAgo(model.first_seen)}</span>
@@ -532,9 +623,11 @@ export function modelMenu(models) {
   const present = models.filter((m) => m.state === "present");
   const missing = models.filter((m) => m.state === "missing");
   if (models.length > 1) {
+    const again = missing.filter((m) => m.source);
     return [
       present.length && { label: `Move ${present.length} to…`, icon: "move", run: () => act.moveModelsDialog(present.map((m) => m.id)) },
-      models.some(canIdentify) && { label: "Identify on Civitai", icon: "hash", run: () => act.identify(models.filter(canIdentify).map((m) => m.id)) },
+      again.length && { label: `Download ${again.length} again…`, icon: "download", run: () => act.downloadAllAgain(again.map((m) => m.id)) },
+      models.some(canIdentify) && { label: "Identify", icon: "hash", run: () => act.identify(models.filter(canIdentify).map((m) => m.id)) },
       { label: "Check for newer versions", icon: "update", run: () => act.checkUpdates(idsOf) },
       "-",
       present.length && { label: `Delete ${present.length} from disk…`, icon: "trash", danger: true, hint: "Del", run: () => act.deleteModels(present.map((m) => m.id)) },
@@ -544,6 +637,8 @@ export function modelMenu(models) {
   const [model] = models;
   if (model.state === "missing") {
     return [
+      model.source && { label: "Download again…", icon: "download", run: () => act.downloadAgain(model.id) },
+      { label: "Find online…", icon: "globe", run: () => act.findOnline(model.id) },
       { label: "Find the file…", icon: "search", run: () => act.locateModel(model.id) },
       { label: "Open the folder it was in", icon: "external", run: () => act.revealModel(model.id) },
       "-",
@@ -556,11 +651,12 @@ export function modelMenu(models) {
     "-",
     { label: "Rename", icon: "edit", hint: "F2", run: () => document.dispatchEvent(new CustomEvent("rename-model", { detail: model.id })) },
     { label: "Move to…", icon: "move", run: () => act.moveModelsDialog([model.id]) },
+    model.links > 1 && { label: "Make a separate copy…", icon: "copy", run: () => act.separateModels([model.id]) },
     "-",
     model.trigger_words?.length && { label: "Copy trigger words", icon: "copy", run: () => copyText(model.trigger_words.join(", ")).then(() => toast("Trigger words copied")) },
     { label: "Copy path", icon: "copy", run: () => copyText(model.path).then(() => toast("Path copied")) },
     "-",
-    canIdentify(model) && { label: "Identify on Civitai", icon: "hash", run: () => act.identify([model.id]) },
+    canIdentify(model) && { label: "Identify", icon: "hash", run: () => act.identify([model.id]) },
     model.hash_source === "download" && { label: "Verify the file", icon: "check", run: () => act.verify([model.id]) },
     (model.provider === "civitai" || model.provider === "huggingface") && { label: "Check for a newer version", icon: "update", run: () => act.checkUpdates([model.id]) },
     "-",
@@ -612,6 +708,10 @@ export function wireList() {
     if (tool && tool.tagName !== "SELECT") { runTool(tool); return; }
     const crumb = event.target.closest("[data-crumb]");
     if (crumb) { act.go({ kind: "folder", root: state.view.root, relative: crumb.dataset.crumb }); return; }
+    const dup = event.target.closest("[data-dup]");
+    if (dup) { event.stopPropagation(); act.duplicateCommand(dup.dataset.dup, dup.dataset.group); return; }
+    const keep = event.target.closest("[data-keep]");
+    if (keep) { event.stopPropagation(); act.chooseKeeper(keep.dataset.keep, Number(keep.dataset.id)); return; }
     const command = event.target.closest("[data-cmd]");
     const row = event.target.closest(".row[data-key]");
     if (command && row) {
@@ -694,9 +794,10 @@ async function runTool(tool) {
   if (name === "clear-done") return act.clearFinished();
   if (name === "reload-cleanup") return act.loadCleanup();
   if (name === "reload-dups") return act.loadDuplicates();
-  if (name === "hash-possible") return act.hashModels(tool.dataset.ids.split(",").map(Number));
+  if (name === "hash-likely") return act.hashModels(tool.dataset.ids.split(",").map(Number));
   if (name === "cleanup-all") return act.deleteCleanup((state.cleanup?.items || []).map((i) => i.id));
   if (name === "forget-all") return act.forgetModels(missingModels().map((m) => m.id));
+  if (name === "again-all") return act.downloadAllAgain(missingModels().filter((m) => m.source).map((m) => m.id));
   if (name === "identify-all") return act.identify(unidentifiedModels().map((m) => m.id));
   if (name === "folder-menu") {
     const models = modelsIn(view.root, view.relative);

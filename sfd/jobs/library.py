@@ -35,11 +35,14 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from urllib.parse import quote_plus
 
 import httpx
 
+from ..core.diskinfo import free_bytes
 from ..core.types import FileIdentity
-from ..library import details, erase, folders, relocate, sidecar
+from ..library import details, erase, fingerprint, folders, links, relocate, sidecar
+from ..library import lookup as online
 from ..library import scan as scanning
 from ..library.categories import ALIASES, Category
 from ..library.classify import Verdict
@@ -57,6 +60,14 @@ BULK = 150
 PENDING_FOR = 600.0
 CIVITAI_API = "https://{host}/api/v1"
 UPDATE_CONCURRENCY = 4
+# Below this, a "copy" is a tokenizer or a config that happens to share a size with another,
+# and nobody is short of disk over it.
+DUPLICATE_MIN = 1024 * 1024
+# Above this, identifying a model asks the services for anything like it before reading the
+# whole file: below it, reading the file is quicker than asking.
+QUICK_ABOVE = 1024 ** 3
+# Slack kept between a copy and a completely full volume, as the queue keeps it.
+SPACE_HEADROOM = 64 * 1024**2
 
 Emit = Callable[[dict[str, Any]], None]
 
@@ -89,6 +100,9 @@ class Library:
         self._pending: dict[str, tuple[int, str, float]] = {}
         self._cleanup: dict[int, dict[str, Any]] = {}
         self._client: httpx.AsyncClient | None = None
+        # What the Hub said about its repositories, for a while: identifying a library asks
+        # after the same ones again and again.
+        self._hub_cache: dict[str, tuple[float, Any]] = {}
         self._closing = False
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -164,11 +178,11 @@ class Library:
         data = model.to_json()
         data["root"], data["relative"] = self.placement(model.path)
         data["busy"] = model.id in self._busy
+        # Whether there is somewhere to download it from again, should it go.
+        data["source"] = bool((model.identity or {}).get("provider"))
         return data
 
     def roots_json(self) -> list[dict[str, Any]]:
-        from ..core.diskinfo import free_bytes
-
         found = []
         missing = set(self.last_scan.missing_roots) if self.last_scan else set()
         for index, root in enumerate(self.roots):
@@ -414,7 +428,9 @@ class Library:
                 removed.add(current.id)
                 changed.discard(current.id)
 
-        # 5. Notes, from where they actually live.
+        # 5. Notes, from where they actually live — and which names are one file, read fresh
+        # every time: making a hard link changes no date on the file, so nothing above would
+        # have noticed one.
         for model in self.db.list_models():
             if model.state != db.PRESENT or self.is_busy(model.id) or under_away(model.key):
                 continue
@@ -425,8 +441,9 @@ class Library:
                 if data is not None and "note" in data:
                     note = data.get("note") or None
             where = str(record) if record is not None else None
-            if where != model.record or note != model.note:
-                self.db.update_model(model.id, record=where, note=note)
+            file_id, count = links.identity(model.path) or (None, None)
+            if (where, note, file_id, count) != (model.record, model.note, model.file_id, model.links):
+                self.db.update_model(model.id, record=where, note=note, file_id=file_id, links=count)
                 changed.add(model.id)
 
         self.synced_at = now
@@ -527,6 +544,10 @@ class Library:
                           last_seen=task.finished_at)
         return self.db.add_model(path=str(dest), filename=dest.name, **values)
 
+    def carry_record(self, model: Model, new: Path) -> None:
+        """Take a model's collected record to where a file of it has just arrived."""
+        self._relocate_record(model, new, self.places())
+
     def _relocate_record(self, model: Model, new: Path, places: dict[str, Any]) -> None:
         """Take a model's record along to its new place, when the record is one of ours.
 
@@ -563,10 +584,11 @@ class Library:
     ) -> None:
         """Point a model at where it is now, and note what it left where it was."""
         old = Path(model.path)
+        moved = path_key(old) != path_key(path)
         left = [
             {"from": str(a), "to": str(b)}
             for a, b in relocate.strays(old, path, **places)
-        ] if path_key(old) != path_key(path) else []
+        ] if moved else []
         record = sidecar.find_record(path, **places)
         self.db.update_model(
             model.id,
@@ -580,6 +602,10 @@ class Library:
             left_behind=left,
             record=str(record) if record is not None else model.record,
             sniffed_mtime=None if model.sniffed_mtime != mtime else model.sniffed_mtime,
+            # Another file, as far as anyone can tell until it is read. The fingerprint is
+            # what decides what may be deleted as a copy, so it is taken again rather than
+            # trusted across a move.
+            sampled_mtime=None if moved else model.sampled_mtime,
         )
         self.db.retarget_tasks(model.id, dest=str(path), filename=path.name)
 
@@ -610,7 +636,8 @@ class Library:
 
     def inspect_pending(self) -> int:
         """Read the header and the neighbours of every model whose file changed since the
-        last reading. Once per version of a file: the answer does not change until it does."""
+        last reading, and take its fingerprint. Once per version of a file: the answer does
+        not change until the file does."""
         batch: list[int] = []
         last = time.monotonic()
         done = 0
@@ -619,30 +646,46 @@ class Library:
                 break
             if model.state != db.PRESENT:
                 continue
-            if model.sniffed_mtime is not None and model.mtime is not None \
-                    and abs(model.sniffed_mtime - model.mtime) < 1e-3:
+            header_due = not _same_time(model.sniffed_mtime, model.mtime)
+            # A split model is a set of files, and nobody keeps a set twice by accident.
+            sample_due = not model.parts and not _same_time(model.sampled_mtime, model.mtime)
+            if not (header_due or sample_due) or self.is_busy(model.id):
                 continue
-            if self.is_busy(model.id):
-                continue
-            try:
-                updates = self._inspect(model)
-            except Exception as exc:  # noqa: BLE001 - one odd file must not stop the rest
-                # Someone else's sidecar, in whatever shape it is in, or a file that went away
-                # halfway through reading it. Said on the model, and not read again until the
-                # file changes.
-                updates = {"header": {"format": None, "error": f"could not be read: {exc}"},
-                           "sniffed_mtime": model.mtime}
-            if updates is None:
-                continue
+            updates: dict[str, Any] | None = {}
+            if header_due:
+                try:
+                    updates = self._inspect(model)
+                except Exception as exc:  # noqa: BLE001 - one odd file must not stop the rest
+                    # Someone else's sidecar, in whatever shape it is in, or a file that went
+                    # away halfway through reading it. Said on the model, and not read again
+                    # until the file changes.
+                    updates = {"header": {"format": None, "error": f"could not be read: {exc}"},
+                               "sniffed_mtime": model.mtime}
+                if updates is None:
+                    continue
+            if sample_due:
+                updates.update(self._sample(model))
             self.db.update_model(model.id, **updates)
-            batch.append(model.id)
             done += 1
-            if len(batch) >= 25 or time.monotonic() - last > 0.7:
+            # A fingerprint changes nothing the page shows; a header does.
+            if header_due:
+                batch.append(model.id)
+            if batch and (len(batch) >= 25 or time.monotonic() - last > 0.7):
                 self._announce(batch, ())
                 batch, last = [], time.monotonic()
         if batch:
             self._announce(batch, ())
         return done
+
+    def _sample(self, model: Model) -> dict[str, Any]:
+        """The fingerprint and the AutoV1 hash of the file as it is now. A file that cannot
+        be read gets neither, and is not read again until it changes."""
+        try:
+            taken = fingerprint.sample(Path(model.path))
+        except OSError:
+            return {"fingerprint": None, "autov1": None, "sampled_mtime": model.mtime}
+        return {"fingerprint": taken.fingerprint, "autov1": taken.autov1,
+                "sampled_mtime": model.mtime}
 
     def _inspect(self, model: Model) -> dict[str, Any] | None:
         path = Path(model.path)
@@ -703,10 +746,26 @@ class Library:
             state=db.PRESENT,
             missing_since=None,
             sniffed_mtime=None,
+            sampled_mtime=None,
             record=str(record) if record is not None else None,
             last_seen=time.time(),
         )
         existing = self.db.model_at(path)
+        # A model that went missing, downloaded again — wherever it was put this time, it is
+        # that model back, with its history and its note, not a second model beside it.
+        back = self.db.get_model(task.model_id) if task.model_id else None
+        if back is not None and back.state == db.MISSING and (existing is None or existing.id != back.id):
+            with contextlib.suppress(Busy):
+                with self.working_on(back.id):
+                    places = self.places()
+                    if existing is not None:
+                        # A walk met the new file before the download could say whose it is.
+                        self._absorb(back, existing)
+                        self.emit({"type": "model_removed", "id": existing.id})
+                    else:
+                        self._relocate_record(back, path, places)
+                        self.db.retarget_tasks(back.id, dest=str(path), filename=path.name)
+                    existing = self.db.get_model(back.id)
         if existing is not None:
             if not task.sha256:
                 values.pop("sha256", None)
@@ -1048,6 +1107,9 @@ class Library:
             header=other.header,
             extras=other.extras,
             sniffed_mtime=other.sniffed_mtime,
+            fingerprint=other.fingerprint,
+            autov1=other.autov1,
+            sampled_mtime=other.sampled_mtime,
             note=note,
             **carried,
         )
@@ -1226,8 +1288,23 @@ class Library:
             ],
             "candidates": [self.summary(c) for c in self.candidates(model)],
             "exists": path.is_file(),
+            "names": self._names(model),
         })
         return data
+
+    def _names(self, model: Model) -> list[dict[str, Any]]:
+        """Every name of this model's file, when it has more than one — the library's own
+        and the ones it does not list — for the inspector to show where else it is."""
+        path = Path(model.path)
+        got = links.identity(path) if model.state == db.PRESENT else None
+        if got is None or got[1] < 2:
+            return []
+        known = {m.key: m.id for m in self.db.list_models()}
+        return [
+            {"path": str(name), "model_id": known.get(path_key(name)),
+             "this": path_key(name) == path_key(path)}
+            for name in links.names(path)
+        ]
 
     def previews(self, model: Model) -> list[dict[str, Any]]:
         from ..library import previews as remote
@@ -1336,6 +1413,18 @@ class Library:
         if kind == "identify" and model.sha256 and model.hash_source == "download":
             await self._identify(model.id, model.sha256)
             return
+        hub: list[online.HubFile] | None = None
+        if kind == "identify" and not fresh and (model.size or 0) >= QUICK_ABOVE:
+            # The quick look first: a big file is read whole only when one of the services
+            # has something it could be. Most text encoders and VAEs are on neither — or on
+            # the Hub, which is found by name and proven by the hash read next.
+            try:
+                seen, hub = await self._quick_look(model)
+            except (RuntimeError, OSError):
+                seen, hub = True, None
+            if not seen:
+                self._not_found(model, quick=True)
+                return
         if fresh and kind != "verify":
             digest = model.sha256
         else:
@@ -1370,7 +1459,42 @@ class Library:
             self.emit({"type": "toast", "level": "error" if ok is False else "info",
                        "message": message, "models": [model.id]})
         elif kind == "identify":
-            await self._identify(model.id, digest)
+            await self._identify(model.id, digest, hub)
+
+    async def _quick_look(self, model: Model) -> tuple[bool, list[online.HubFile] | None]:
+        """Whether Civitai or the Hub has anything this file could be, without reading it:
+        Civitai by the AutoV1 hash, the Hub by the name and the exact size."""
+        autov1 = model.autov1 if _same_time(model.sampled_mtime, model.mtime) else None
+        if autov1 is None:
+            taken = await asyncio.to_thread(self._sample, model)
+            self.db.update_model(model.id, **taken)
+            autov1 = taken.get("autov1")
+        if autov1:
+            host = str(model.meta.get("host") or "civitai.com")
+            version = await online.civitai_by_hash(
+                self._http(), autov1, host, self.settings.effective_civitai_token
+            )
+            if version is not None and online.civitai_file(version, autov1=autov1, size=model.size):
+                return True, None
+        else:
+            # Nothing to ask Civitai with: only the whole file's hash can say.
+            return True, None
+        hub = await online.find_on_hub(
+            self._http(), model.filename, model.size, None,
+            self.settings.effective_hf_token, self._hub_cache,
+        )
+        return bool(hub), hub
+
+    def _not_found(self, model: Model, quick: bool = False) -> None:
+        current = self.get(model.id)
+        record = dict(current.lookup)
+        record.update(result="not_found", at=time.time(), message=None,
+                      searched=["civitai", "huggingface"], quick=quick)
+        self.db.update_model(model.id, lookup=record)
+        self.announce(model.id, tasks=False)
+        self.emit({"type": "toast", "level": "info", "models": [model.id],
+                   "message": f"{model.filename} is not on Civitai or HuggingFace"
+                              + (" — checked without reading the whole file" if quick else "")})
 
     def _hash(self, path: Path, total: int) -> str:
         digest = hashlib.sha256()
@@ -1392,52 +1516,59 @@ class Library:
                     loop_emit(done=done, total=total)
         return digest.hexdigest()
 
-    async def _identify(self, model_id: int, digest: str) -> None:
+    def _lookup_failed(self, model_id: int, message: str) -> None:
+        current = self.get(model_id)
+        record = dict(current.lookup)
+        record.update(result="error", at=time.time(), message=message)
+        self.db.update_model(model_id, lookup=record)
+        self.announce(model_id, tasks=False)
+
+    async def _identify(
+        self, model_id: int, digest: str, hub: list[online.HubFile] | None = None
+    ) -> None:
+        """Ask Civitai by the file's hash; failing that, the Hub by its name, the answer
+        proven by the same hash. `hub` is what a quick look already found there."""
         model = self.get(model_id)
         host = str(model.meta.get("host") or "civitai.com")
-        url = f"{CIVITAI_API.format(host=host)}/model-versions/by-hash/{digest}"
-        token = self.settings.effective_civitai_token
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
-        lookup = dict(model.lookup)
         try:
-            response = await self._http().get(url, headers=headers)
-        except httpx.HTTPError as exc:
-            lookup.update(result="error", at=time.time(), message=f"Civitai could not be reached: {exc}")
-            self.db.update_model(model_id, lookup=lookup)
-            self.announce(model_id, tasks=False)
-            raise RuntimeError(lookup["message"]) from None
-
-        if response.status_code == 404:
-            lookup.update(result="not_found", at=time.time(), message=None)
-            self.db.update_model(model_id, lookup=lookup)
-            self.announce(model_id, tasks=False)
-            self.emit({"type": "toast", "level": "info", "models": [model_id],
-                       "message": f"{model.filename} is not on Civitai"})
+            version = await online.civitai_by_hash(
+                self._http(), digest, host, self.settings.effective_civitai_token
+            )
+        except RuntimeError as exc:
+            self._lookup_failed(model_id, str(exc))
+            raise
+        if version is None:
+            try:
+                if hub is None:
+                    hub = await online.find_on_hub(
+                        self._http(), model.filename, model.size, digest,
+                        self.settings.effective_hf_token, self._hub_cache,
+                    )
+                else:
+                    hub = [h for h in hub if h.sha256 == digest.lower()]
+            except RuntimeError as exc:
+                self._lookup_failed(model_id, f"not on Civitai; {exc}")
+                raise
+            if hub:
+                await self._found_on_hub(model_id, hub[0])
+            else:
+                self._not_found(model)
             return
-        if response.status_code != 200:
-            lookup.update(result="error", at=time.time(),
-                          message=f"Civitai answered {response.status_code}")
-            self.db.update_model(model_id, lookup=lookup)
-            self.announce(model_id, tasks=False)
-            raise RuntimeError(lookup["message"])
-        try:
-            version = response.json()
-        except ValueError:
-            raise RuntimeError("Civitai sent something that is not JSON") from None
 
+        record = dict(model.lookup)
         path = Path(model.path)
         meta = _meta_for_hash(version, digest, path, model.size)
         meta["host"] = host
         if model.origin == db.DOWNLOADED or (model.provider and model.provider != "civitai"):
             # Downloaded from somewhere else: where it came from is a fact about this file,
             # and Civitai having the same bytes does not change it. Said, not rewritten.
-            lookup.update(
+            record.update(
                 result="found", at=time.time(), message=None,
                 version_id=meta.get("version_id"), model_id=meta.get("model_id"),
                 model_name=meta.get("model_name"), version_name=meta.get("version_name"),
                 page=_page_url(meta),
             )
-            self.db.update_model(model_id, lookup=lookup)
+            self.db.update_model(model_id, lookup=record)
             self.announce(model_id, tasks=False)
             self.emit({"type": "toast", "level": "info", "models": [model_id],
                        "message": f"{model.filename} is also on Civitai, as "
@@ -1447,8 +1578,9 @@ class Library:
         updates: dict[str, Any] = {
             "meta": meta,
             "provider": "civitai",
-            "lookup": {**lookup, "result": "found", "at": time.time(), "message": None,
-                       "version_id": meta.get("version_id"), "model_id": meta.get("model_id")},
+            "lookup": {**record, "result": "found", "source": "civitai", "at": time.time(),
+                       "message": None, "version_id": meta.get("version_id"),
+                       "model_id": meta.get("model_id")},
         }
         if meta.get("version_id") and meta.get("file_id"):
             updates["identity"] = {
@@ -1467,10 +1599,126 @@ class Library:
                    "message": f"{model.filename} is {name}"
                               + (f" / {meta['version_name']}" if meta.get("version_name") else "")})
 
-    async def _write_identified(self, model_id: int, version: dict[str, Any]) -> None:
+    async def find_online(self, model_id: int) -> dict[str, Any]:
+        """Where a model could be downloaded from, when nothing kept says: Civitai by the
+        hash kept for it — the whole file's, which is proof, or the AutoV1, which with the
+        size is a strong hint — and the Hub by its name and size, proven by the hash when
+        the hash is known. The file itself is not needed: a missing model is the usual case.
+
+        Each answer carries what a download of it needs, under keys starting with `_` that
+        the page is never shown.
+        """
+        model = self.get(model_id)
+        host = str(model.meta.get("host") or "civitai.com")
+        token = self.settings.effective_civitai_token
+        found: list[dict[str, Any]] = []
+        problems: list[str] = []
+        for digest, proof in ((model.sha256, True), (model.autov1, False)):
+            if not digest:
+                continue
+            try:
+                version = await online.civitai_by_hash(self._http(), digest, host, token)
+            except RuntimeError as exc:
+                problems.append(str(exc))
+                break
+            entry = version and online.civitai_file(
+                version, sha256=digest if proof else None, autov1=None if proof else digest,
+                size=model.size,
+            )
+            if not entry:
+                continue
+            meta = _meta_for_hash(version, str(entry.get("hashes", {}).get("SHA256") or digest).lower(),
+                                  Path(model.path), model.size)
+            meta["host"] = host
+            found.append({
+                "source": "civitai", "host": host, "proven": proof,
+                "title": " / ".join(str(p) for p in (meta.get("model_name"), meta.get("version_name")) if p)
+                         or "a model on Civitai",
+                "detail": str(entry.get("name") or ""),
+                "size": int(float(entry.get("sizeKB") or 0) * 1024) or None,
+                "page": _page_url(meta),
+                "_identity": {"provider": "civitai",
+                              "ref": {"version_id": meta.get("version_id"), "file_id": entry.get("id")}},
+                "_meta": meta,
+            })
+            break
+        try:
+            hub = await online.find_on_hub(
+                self._http(), model.filename, model.size, model.sha256,
+                self.settings.effective_hf_token, self._hub_cache,
+            )
+        except RuntimeError as exc:
+            problems.append(str(exc))
+            hub = []
+        for hit in hub[:6]:
+            found.append({
+                "source": "huggingface", "host": "huggingface.co",
+                "proven": bool(model.sha256 and hit.sha256 == model.sha256),
+                "same_name": hit.same_name,
+                "title": hit.repo_id, "detail": hit.path, "size": hit.size, "page": hit.page,
+                "downloads": hit.downloads,
+                "_identity": {"provider": "huggingface", "ref": {
+                    "repo_id": hit.repo_id, "repo_type": "model", "revision": "main", "path": hit.path}},
+                "_meta": online.hub_meta(hit),
+            })
+        # Proof first; then the service it came from, since that is where it is likeliest to
+        # stay; then the most downloaded, which is the original more often than its mirrors.
+        found.sort(key=lambda hit: (
+            not hit["proven"], hit["source"] != (model.provider or "civitai"), -(hit.get("downloads") or 0),
+        ))
+        stem = Path(model.filename).stem
+        return {
+            "found": found,
+            "problems": problems,
+            "searched": {"sha256": bool(model.sha256), "autov1": bool(model.autov1)},
+            # Where a person can look for themselves, when the services' own lookups are not
+            # enough — a file renamed on the way here is found by nothing but a person.
+            "search": {
+                "civitai": f"https://{host}/search/models?query={_query(stem)}",
+                "huggingface": f"{online.HUB}/models?search={_query(stem)}",
+            },
+        }
+
+    async def _found_on_hub(self, model_id: int, hit: online.HubFile) -> None:
+        """The Hub has this very file — the hash says so. A model found on disk takes its
+        description from there: the repository, the path in it, its licence and base model,
+        and a way to download it again should it go."""
+        model = self.get(model_id)
+        meta = online.hub_meta(hit)
+        record = dict(model.lookup)
+        record.update(result="found", source="huggingface", at=time.time(), message=None,
+                      repo_id=hit.repo_id, path=hit.path, page=hit.page,
+                      model_name=hit.repo_id, version_name=None)
+        if model.origin == db.DOWNLOADED or (model.provider and model.provider != "huggingface"):
+            self.db.update_model(model_id, lookup=record)
+            self.announce(model_id, tasks=False)
+            self.emit({"type": "toast", "level": "info", "models": [model_id],
+                       "message": f"{model.filename} is also on HuggingFace, in {hit.repo_id}"})
+            return
+        path = Path(model.path)
+        header, sniffed = await asyncio.to_thread(details.inspect, path)
+        verdict = details.judge(path, sniffed, header, meta, model.extras, self.roots)
+        self.db.update_model(
+            model_id,
+            meta=meta,
+            provider="huggingface",
+            identity={"provider": "huggingface", "ref": {
+                "repo_id": hit.repo_id, "repo_type": "model", "revision": "main", "path": hit.path,
+            }},
+            lookup=record,
+            category=verdict.category.value, confidence=verdict.confidence,
+            reason=verdict.reason, base_model=verdict.base_model, header=header,
+        )
+        await self._write_identified(model_id, None)
+        self.announce(model_id, tasks=False)
+        self.emit({"type": "toast", "level": "info", "models": [model_id],
+                   "message": f"{model.filename} is {hit.repo_id} / {hit.path}"})
+
+    async def _write_identified(self, model_id: int, version: dict[str, Any] | None) -> None:
         """Give an identified model the files a download of it would have left, following
         the same settings — and never over what is already there, since it may be another
-        tool's, or somebody's own."""
+        tool's, or somebody's own. From the Hub that is the record alone: the compatibility
+        files are Civitai's own formats, with nothing of the Hub's to put in them."""
         model = self.get(model_id)
         path = Path(model.path)
         places = self.places()
@@ -1483,11 +1731,13 @@ class Library:
             if existing is not None:
                 data = sidecar.read_record(existing) or {}
                 record.note = data.get("note") or model.note
+            civitai = version is not None
             with contextlib.suppress(OSError):
                 written = await asyncio.to_thread(
                     sidecar.write, path, verdict, record,
                     version, places["sidecar_dir"], places["library_root"],
-                    self.settings.write_compat_files, self.settings.write_trigger_txt,
+                    civitai and self.settings.write_compat_files,
+                    civitai and self.settings.write_trigger_txt,
                     places["roots"], True,
                 )
                 self.db.update_model(model_id, record=str(written))
@@ -1607,33 +1857,288 @@ class Library:
     # --- duplicates and rubbish ---------------------------------------------
 
     def duplicates(self) -> dict[str, Any]:
-        """The same file in more than one place: certainly, by hash, and possibly, by size."""
-        present = [m for m in self.db.list_models() if m.state == db.PRESENT and not m.parts]
-        by_hash: dict[str, list[Model]] = {}
-        for model in present:
-            if model.sha256:
-                by_hash.setdefault(model.sha256, []).append(model)
-        exact = [group for group in by_hash.values() if len(group) > 1]
-        in_exact = {m.id for group in exact for m in group}
+        """The same file kept in more than one place.
+
+        A size shared by several files is only a reason to look closer: files of one
+        architecture at one precision come out the same number of bytes. Their fingerprints
+        tell different files apart for the price of a few small reads — taken in the
+        background already, and here for any file that changed since. What is left is either
+        certain, because the hashes of the whole files agree, or very likely, until the
+        files are hashed to be sure.
+        """
+        present = [
+            m for m in self.db.list_models()
+            if m.state == db.PRESENT and not m.parts and (m.size or 0) >= DUPLICATE_MIN
+        ]
         by_size: dict[int, list[Model]] = {}
         for model in present:
-            if model.id in in_exact or not model.size or model.size < 1024 * 1024:
+            by_size.setdefault(model.size or 0, []).append(model)
+        shared = {size: group for size, group in by_size.items() if len(group) > 1}
+
+        buckets: dict[tuple[int, str], list[Model]] = {}
+        for size, group in shared.items():
+            for model in group:
+                mark = self._fresh_fingerprint(model)
+                if mark is not None:
+                    buckets.setdefault((size, mark), []).append(model)
+
+        # Which file each name is, read now: a link made a minute ago changed no date.
+        ident = {m.id: links.identity(m.path) for m in present}
+        groups: list[dict[str, Any]] = []
+        for (size, mark), members in buckets.items():
+            if len(members) < 2:
                 continue
-            by_size.setdefault(model.size, []).append(model)
-        possible = []
-        for group in by_size.values():
-            if len(group) < 2:
-                continue
-            hashes = {m.sha256 for m in group if m.sha256}
-            if len(hashes) == len(group):
-                continue
-            possible.append(group)
-        order = lambda group: -(group[0].size or 0)  # noqa: E731
+            for status, copies in _by_hash(members):
+                files = _physical(copies, ident)
+                # Several names of one file on disk — hard links — take the room of one.
+                if len(files) > 1:
+                    groups.append(self._duplicate_group(size, mark, status, copies, len(files), ident))
+        groups.sort(key=lambda g: (-g["wasted"], g["models"][0]["filename"].lower()))
+        sizes = {g["size"] for g in groups}
+
+        # Files already under several names: nothing to gain, and a way back to copies.
+        by_file: dict[str, list[Model]] = {}
+        for model in present:
+            got = ident.get(model.id)
+            if got is not None and got[1] > 1:
+                by_file.setdefault(got[0], []).append(model)
+        linked = []
+        for file_id, names in by_file.items():
+            count = ident[names[0].id][1]
+            linked.append({
+                "key": f"link:{file_id}",
+                "size": names[0].size or 0,
+                "names": count,
+                # Names the library does not list: in a folder that is not part of it.
+                "outside": max(0, count - len(names)),
+                "saved": (names[0].size or 0) * (count - 1),
+                "models": [self._linked_summary(m, ident) for m in names],
+            })
+        linked.sort(key=lambda g: (-g["saved"], g["models"][0]["filename"].lower()))
         return {
-            "exact": [[self.summary(m) for m in g] for g in sorted(exact, key=order)],
-            "possible": [[self.summary(m) for m in g] for g in sorted(possible, key=order)],
-            "wasted": sum((g[0].size or 0) * (len(g) - 1) for g in exact),
+            "groups": groups,
+            "linked": linked,
+            "wasted": sum(g["wasted"] for g in groups if g["status"] == "same"),
+            "likely": sum(g["wasted"] for g in groups if g["status"] == "likely"),
+            "saved": sum(g["saved"] for g in linked),
+            # How many sizes were shared, and how many of those the fingerprints showed to
+            # be different models — what the old guess by size alone would have listed.
+            "shared_sizes": len(shared),
+            "told_apart": len([size for size in shared if size not in sizes]),
         }
+
+    def _linked_summary(self, model: Model, ident: dict[int, tuple[str, int] | None]) -> dict[str, Any]:
+        got = ident.get(model.id)
+        return {
+            **self.summary(model),
+            "file_id": got[0] if got else None,
+            # The volume: a hard link reaches only as far as it.
+            "volume": got[0].split(":", 1)[0] if got else None,
+        }
+
+    def _fresh_fingerprint(self, model: Model) -> str | None:
+        """The fingerprint of the file as it is now, taking it first if it is out of date."""
+        if model.fingerprint and _same_time(model.sampled_mtime, model.mtime):
+            return model.fingerprint
+        if self.is_busy(model.id):
+            return None
+        updates = self._sample(model)
+        self.db.update_model(model.id, **updates)
+        return updates.get("fingerprint")
+
+    def _duplicate_group(
+        self, size: int, mark: str, status: str, copies: list[Model], files: int,
+        ident: dict[int, tuple[str, int] | None],
+    ) -> dict[str, Any]:
+        keep, why = self._keeper(copies)
+        unhashed = [m for m in copies if not m.sha256]
+        return {
+            # Stable across looks, so the page can remember which copy was chosen to keep.
+            "key": f"{size}:{mark}" + (f":{copies[0].sha256[:16]}" if status == "same" else ""),
+            "status": status,
+            "size": size,
+            "copies": files,
+            "wasted": size * (files - 1),
+            "keep": keep.id,
+            "keep_why": why,
+            "caution": self._caution(copies),
+            "to_hash": [m.id for m in unhashed],
+            "to_read": sum(m.size or 0 for m in unhashed),
+            "models": [self._linked_summary(m, ident) for m in copies],
+        }
+
+    def _caution(self, copies: list[Model]) -> str | None:
+        """Why deleting a copy might break something, when the folders suggest it.
+
+        A folder named for a kind — `vae`, `loras` — is read whole by its loader, whatever is
+        under it. Any other folder is some node's own, and the insightface packs are the
+        usual case: the same `.onnx` in `insightface/models/antelopev2`, `.../buffalo_l` and
+        `simswap/models/buffalo_l`, because each node reads its own folder and each pack is
+        loaded as a set.
+        """
+        loaders = sorted({self._loader_folder(m) for m in copies}, key=str.lower)
+        if len(loaders) > 1:
+            return (
+                f"Kept in folders different nodes read ({', '.join(loaders)}) — each may need "
+                f"its own copy."
+            )
+        parents = sorted({Path(m.path).parent.name for m in copies}, key=str.lower)
+        if len(parents) > 1 and ALIASES.get(loaders[0].lower()) is None:
+            return (
+                f"Kept in different folders of {loaders[0]} ({', '.join(parents)}) — a node may "
+                f"load each folder as a set."
+            )
+        return None
+
+    def _keeper(self, copies: list[Model]) -> tuple[Model, str]:
+        """Which copy to keep when nobody has said: the one the library knows most about,
+        in the folder downloads are filed into."""
+
+        def weigh(model: Model) -> tuple[int, list[str]]:
+            points, reasons = 0, []
+            root, _relative = self.placement(model.path)
+            if root == 0 and len(self.roots) > 1:
+                points += 8
+                reasons.append("in the main library folder")
+            if model.origin == db.DOWNLOADED:
+                points += 4
+                reasons.append("downloaded here")
+            if model.note:
+                points += 2
+                reasons.append("has your note")
+            elif model.identified:
+                points += 2
+                reasons.append("identified")
+            loader = self._loader_folder(model)
+            kind = ALIASES.get(loader.lower())
+            if kind is not None and model.category == kind.value:
+                points += 1
+                reasons.append(f"in the {loader} folder")
+            return points, reasons
+
+        ranked = sorted(copies, key=lambda m: (-weigh(m)[0], m.first_seen, m.id))
+        reasons = weigh(ranked[0])[1]
+        return ranked[0], ", ".join(reasons[:2]) if reasons else "the first one found"
+
+    # --- one file under several names -----------------------------------------
+
+    def link_copies(self, keep_id: int, other_ids: Iterable[int]) -> dict[str, Any]:
+        """Make the other copies of a file names of the one kept.
+
+        Every path and every name keeps working, and the room of each copy is freed. Only
+        for copies whose whole-file hashes prove them the same — the rule deleting a copy
+        follows too, since the copy's own bytes go either way — and only on the drive the
+        kept one is on, which is as far as a hard link reaches. A file that changed since the
+        library last read it is left alone: the hash it carries may no longer be its own.
+        """
+        others = [i for i in dict.fromkeys(other_ids) if i != keep_id]
+        results: list[dict[str, Any]] = []
+        with self.working_on(keep_id, *others):
+            keep = self.get(keep_id)
+            keep_path = self._present(keep)
+            if not keep.sha256:
+                raise ValueError("the copy to keep has no hash yet — confirm by hash first")
+            if not _unchanged(keep, keep_path):
+                raise ValueError(f"{keep.filename} changed since the library read it — look again")
+            kept = links.identity(keep_path)
+            for other_id in others:
+                other = self.db.get_model(other_id)
+                try:
+                    if other is None:
+                        raise LookupError("no such model")
+                    path = self._present(other)
+                    if other.sha256 != keep.sha256:
+                        raise ValueError("not proven the same file — confirm by hash first")
+                    if not _unchanged(other, path):
+                        raise ValueError("changed since the library read it — look again")
+                    now = links.identity(path)
+                    if kept is not None and now is not None and now[0] == kept[0]:
+                        results.append({"id": other_id, "ok": True, "freed": 0, "unchanged": True})
+                        continue
+                    if not links.same_volume(keep_path, path):
+                        raise ValueError("on another drive, where a hard link cannot reach")
+                    # Its own room comes back only if this was the copy's last name.
+                    freed = (other.size or 0) if now is None or now[1] == 1 else 0
+                    links.link_over(keep_path, path)
+                except (LookupError, ValueError, OSError) as exc:
+                    results.append({"id": other_id, "ok": False, "error": _refusal(exc)})
+                    continue
+                # The same bytes as the kept file, so its hash and its pieces hold, for the
+                # dates of the file it is now a name of.
+                self.db.update_model(
+                    other_id,
+                    mtime=keep.mtime,
+                    hashed_mtime=keep.mtime if other.hash_source == "computed" else other.hashed_mtime,
+                    fingerprint=keep.fingerprint, autov1=keep.autov1,
+                    sampled_mtime=keep.sampled_mtime, sniffed_mtime=None,
+                )
+                results.append({"id": other_id, "ok": True, "freed": freed})
+            self._recount([keep_id, *others])
+        for model_id in [keep_id, *others]:
+            self.announce(model_id, tasks=False)
+        self.inspect_soon()
+        return {"results": results, "freed": sum(r.get("freed") or 0 for r in results)}
+
+    def separate(
+        self,
+        model_id: int,
+        progress: relocate.Progress | None = None,
+        stop: threading.Event | None = None,
+    ) -> dict[str, Any]:
+        """Give one name of a shared file a copy of its own again — the way back from linking.
+
+        It takes the file's room again, so the room is asked about first. The copy keeps the
+        file's dates, which keeps its hash and its pieces valid: the bytes are the same.
+        """
+        with self.working_on(model_id):
+            model = self.get(model_id)
+            path = self._present(model)
+            before = links.identity(path)
+            if before is None or before[1] < 2:
+                return {"ok": True, "unchanged": True, "size": 0}
+            size = path.stat().st_size
+            free = free_bytes(path.parent)
+            if free is not None and free < size + SPACE_HEADROOM:
+                raise ValueError(
+                    f"a copy of its own needs {_gib(size)} on the drive, and {_gib(free)} is free"
+                )
+            siblings = [
+                m.id for m in self.db.list_models()
+                if m.id != model_id and m.state == db.PRESENT and m.size == model.size
+                and (links.identity(m.path) or ("",))[0] == before[0]
+            ]
+            links.separate(path, progress, stop)
+            self._recount([model_id, *siblings])
+        for other_id in [model_id, *siblings]:
+            self.announce(other_id, tasks=False)
+        return {"ok": True, "size": size}
+
+    def other_names(self, model_id: int) -> dict[str, Any]:
+        """The other names of this model's file, for the question before deleting it: while
+        one is left, deleting this one frees nothing."""
+        model = self.get(model_id)
+        path = Path(model.path)
+        got = links.identity(path) if model.state == db.PRESENT else None
+        if got is None or got[1] < 2:
+            return {"count": 0, "paths": []}
+        paths = [str(p) for p in links.names(path) if path_key(p) != path_key(path)]
+        return {"count": got[1] - 1, "paths": paths}
+
+    def _recount(self, model_ids: Iterable[int]) -> None:
+        for model_id in model_ids:
+            model = self.db.get_model(model_id)
+            if model is None or model.state != db.PRESENT:
+                continue
+            file_id, count = links.identity(model.path) or (None, None)
+            self.db.update_model(model_id, file_id=file_id, links=count)
+
+    def _loader_folder(self, model: Model) -> str:
+        """The folder under a library folder that a model sits in — the one a loader reads:
+        `insightface` for `insightface/models/buffalo_l/w600k_r50.onnx`."""
+        root, relative = self.placement(model.path)
+        if root is None:
+            return Path(model.path).parent.name
+        return relative.split("/")[0] if relative else self.roots[root].name
 
     def cleanup_scan(self) -> dict[str, Any]:
         """What is on disk that belongs to nothing: fragments of downloads nobody is coming
@@ -1649,10 +2154,12 @@ class Library:
         known = {m.key for m in self.db.list_models()}
         items: list[dict[str, Any]] = []
 
+        suffixes = (".part.corrupt", ".part.json", ".part", ".moving",
+                    links.LINKING, links.SEPARATING)
         groups: dict[str, list[Path]] = {}
         for fragment in scan.fragments:
             name = fragment.name
-            for suffix in (".part.corrupt", ".part.json", ".part", ".moving"):
+            for suffix in suffixes:
                 if name.lower().endswith(suffix):
                     base = fragment.with_name(name[: -len(suffix)])
                     break
@@ -1665,12 +2172,16 @@ class Library:
             names = {f.name.lower() for f in files}
             kind = (
                 "an interrupted move" if any(n.endswith(".moving") for n in names)
+                else "an interrupted copy" if any(n.endswith(links.SEPARATING) for n in names)
+                # A second name of the model's own file, never swapped in: deleting it frees
+                # nothing, and nothing is lost.
+                else "an interrupted link" if any(n.endswith(links.LINKING) for n in names)
                 else "a download that failed its checksum" if any(n.endswith(".part.corrupt") for n in names)
                 else "an unfinished download"
             )
             first = files[0]
             base_name = first.name
-            for suffix in (".part.corrupt", ".part.json", ".part", ".moving"):
+            for suffix in suffixes:
                 if base_name.lower().endswith(suffix):
                     base_name = base_name[: -len(suffix)]
                     break
@@ -1793,34 +2304,251 @@ class Library:
 
     def move_targets(self, model_id: int, layout) -> dict[str, Any]:
         """Folders a model could be moved to, the likeliest first, across every folder of
-        the library — the layout's ranking for the one downloads go to, then the others."""
+        the library. The one it is in now is not among them."""
         model = self.get(model_id)
-        category = None
-        if model.category in Category._value2member_map_:
-            category = Category(model.category)
-        offered: list[dict[str, Any]] = []
+        return {
+            "roots": self.roots_json(),
+            "folders": self.rank_folders(
+                layout, _category(model.category), model.base_model, model.filename,
+                meta=model.meta, exclude=Path(model.path).parent, skip_model=model.id,
+            ),
+        }
+
+    def rank_folders(
+        self,
+        layout,
+        category: Category | None,
+        base_model: str | None,
+        filename: str | None,
+        *,
+        meta: dict[str, Any] | None = None,
+        confidence: str | None = None,
+        hint: tuple[Path, str] | None = None,
+        exclude: Path | None = None,
+        skip_model: int | None = None,
+        limit: int = folders.LIMIT,
+    ) -> list[dict[str, Any]]:
+        """Every folder of the library as an answer to "where does this go?", best first.
+
+        The layout answers from what the folders are called. The library can answer from
+        what is in them, which is the better answer in a library that is actually used:
+        where the other Krea 2 LoRAs are is where a Krea 2 LoRA goes, whatever that folder
+        is called and whichever library folder it is in. Nearer still is where the version
+        already here sits, and where the file itself was. Every row says why it is where it
+        is in the list.
+        """
         roots = self.roots
-        if roots and roots[0].is_dir():
-            for folder in folders.offer(layout, category, model.base_model, model.filename):
-                row = folder.to_json()
-                row["root"] = 0
-                offered.append(row)
+        if not roots:
+            return []
+        meta = meta or {}
+        wanted = category.value if category is not None else None
+        kinds = folders.kind_name(category, 2)
+        rows: dict[tuple[int, str], dict[str, Any]] = {}
+
+        def row(root: int | None, relative: str, exists: bool | None = None) -> dict[str, Any] | None:
+            # The top of a library folder is never where a model goes.
+            if root is None or not relative:
+                return None
+            key = (root, relative)
+            if key not in rows:
+                own = ALIASES.get(Path(relative).name.lower())
+                rows[key] = {
+                    "root": root, "relative": relative,
+                    "category": own.value if own is not None else None,
+                    "models": 0, "score": 0, "reasons": [],
+                    "exists": (roots[root] / relative).is_dir() if exists is None else exists,
+                }
+            return rows[key]
+
+        def say(entry: dict[str, Any] | None, points: int, reason: str) -> None:
+            if entry is not None:
+                entry["score"] += points
+                entry["reasons"].append((points, reason))
+
+        def folder_of(path: Path) -> tuple[int | None, str]:
+            return self.placement(str(path / "_"))
+
+        # What is on disk: every folder the walk saw, and how many models are at or below it.
         if self.last_scan is not None:
             for root, relative, count in self.last_scan.folders:
-                if root == 0:
-                    continue
-                kind = ALIASES.get(Path(relative).name.lower())
-                offered.append({
-                    "root": root, "relative": relative,
-                    "category": kind.value if kind is not None else None,
-                    "models": count,
-                    "reason": f"holds {kind.value}" if kind is not None else "already in the library",
-                    "exists": True,
-                })
-        return {"roots": self.roots_json(), "folders": offered}
+                entry = row(root, relative, True)
+                if entry is not None:
+                    entry["models"] = count
+        else:
+            # Before the first walk has finished — a moment after starting — the main folder
+            # as the layout sees it is all there is to go on.
+            for offered in folders.offer(layout, category, base_model, filename):
+                entry = row(0, offered.relative, offered.exists)
+                if entry is not None:
+                    entry["models"] = offered.models
+
+        # What the library knows is in them.
+        same: dict[tuple[int, str], int] = {}
+        below: dict[tuple[int, str], int] = {}
+        related: set[tuple[int, str]] = set()
+        version_of = meta.get("model_id") if meta.get("version_id") else None
+        repo = meta.get("repo_id")
+        for model in self.db.list_models():
+            if model.state != db.PRESENT or model.id == skip_model:
+                continue
+            root, relative = self.placement(model.path)
+            if root is None or not relative:
+                continue
+            if wanted is not None and model.category == wanted:
+                parts = relative.split("/")
+                for depth in range(1, len(parts) + 1):
+                    key = (root, "/".join(parts[:depth]))
+                    below[key] = below.get(key, 0) + 1
+                if folders.same_base(model.base_model, base_model):
+                    same[(root, relative)] = same.get((root, relative), 0) + 1
+            if (version_of and str(model.meta.get("model_id")) == str(version_of)) or (
+                repo and model.meta.get("repo_id") == repo
+            ):
+                related.add((root, relative))
+
+        # Where the file itself was, and where the version already here is, outrank anything
+        # the folders' contents say: the person put them there.
+        if hint is not None:
+            say(row(*folder_of(hint[0])), 300, hint[1])
+        for key in related:
+            say(row(*key), 250, "the version you have is here" if version_of
+                else "from the same repository")
+        for key, count in same.items():
+            say(row(*key), 80 + min(count, 20), f"{count} {base_model} {folders.kind_name(category, count)} here")
+
+        if category is not None:
+            target = layout.directory_for(Verdict(category, "low", "", base_model=base_model))
+            grouped = target != layout.paths.get(category, target)
+            say(row(*folder_of(target)), 70,
+                f"where {kinds} go" + (f", grouped by {base_model}" if grouped and base_model else ""))
+            for name in layout.ambiguities.get(category, []):
+                say(row(0, name), 25, f"also holds {kinds}")
+
+        # Where the last download of this kind went: the habit, not the rule.
+        for task in sorted(self.db.list([db.DONE]), key=lambda t: t.finished_at or 0, reverse=True):
+            if wanted is None or task.category != wanted or not task.dest:
+                continue
+            if base_model and not folders.same_base(task.base_model, base_model):
+                continue
+            root, relative = self.placement(task.dest)
+            what = f"{base_model} {folders.kind_name(category)}" if base_model else folders.kind_name(category)
+            say(row(root, relative), 40, f"your last {what} went here")
+            break
+
+        # A word of the filename naming a folder is the signal left when the classifier is
+        # unsure — `mystery_sam_model.pt` and the library's own `sams` — and a weaker one
+        # when it is sure.
+        named = 60 if confidence == "low" or category in (None, Category.OTHER) else 35
+        for (root, relative), entry in rows.items():
+            name = Path(relative).name
+            parent = ALIASES.get(Path(relative).parent.name.lower()) if "/" in relative else None
+            count = below.get((root, relative), 0)
+            if category is not None and entry["category"] == wanted:
+                say(entry, 30 + min(count, 10), f"holds {count} {folders.kind_name(category, count)}"
+                    if count else f"the folder for {kinds}")
+            elif count:
+                say(entry, 10 + min(count, 10) // 2, f"holds {count} {folders.kind_name(category, count)}")
+            # An existing folder for the base model, even with nothing in it yet. The one the
+            # layout would make is the layout's answer already, and is not counted twice.
+            if base_model and parent is category and category is not None and entry["exists"] \
+                    and folders.same_base(name, base_model) and (root, relative) not in same:
+                say(entry, 50, f"named after {base_model}")
+            # Inside another kind's folder, a matching word is a coincidence: `krea2` under
+            # text_encoders says nothing about where a Krea 2 LoRA goes.
+            context = next((ALIASES[p.lower()] for p in relative.split("/") if p.lower() in ALIASES), None)
+            if folders.named_in(name, filename) and (context is None or context is category):
+                say(entry, named, "named in the file name")
+
+        # Homes the layout would create for a kind that has none yet: last, but there — the
+        # file may be the first of its kind in this library.
+        for kind, path in layout.paths.items():
+            if not path.is_dir():
+                entry = row(*folder_of(path), False)
+                if entry is not None and not entry["reasons"]:
+                    say(entry, -20, f"the usual home for {folders.kind_name(kind, 2)} — not created yet")
+
+        if exclude is not None:
+            rows.pop(folder_of(exclude), None)
+        ranked = sorted(
+            rows.values(),
+            key=lambda r: (-r["score"], -r["models"], r["root"], r["relative"].lower()),
+        )
+        answer = []
+        for entry in ranked[:limit]:
+            reasons = [text for _points, text in sorted(entry["reasons"], key=lambda p: -p[0])]
+            if not reasons:
+                count = entry["models"]
+                reasons = [f"holds {count} model{'' if count == 1 else 's'}" if count
+                           else "already in the library"]
+            answer.append({
+                "root": entry["root"], "relative": entry["relative"],
+                "category": entry["category"], "models": entry["models"],
+                "exists": entry["exists"], "score": entry["score"],
+                "reason": " · ".join(dict.fromkeys(reasons[:2])),
+            })
+        return answer
 
 
 # --- helpers ---------------------------------------------------------------------
+
+
+def _category(value: str | None) -> Category | None:
+    return Category(value) if value in Category._value2member_map_ else None
+
+
+def _unchanged(model: Model, path: Path) -> bool:
+    """Whether the file is still the one the library last read: its size and its date."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return False
+    return stat.st_size == model.size and _same_time(stat.st_mtime, model.mtime)
+
+
+def _refusal(exc: BaseException) -> str:
+    # On Windows a file a program holds open cannot be replaced, and says so as a denial.
+    if isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in (5, 32):
+        return "in use by another program — close it (ComfyUI, say) and try again"
+    return str(exc).strip("'\"")
+
+
+def _gib(size: float) -> str:
+    return f"{size / 1024**3:.1f} GB"
+
+
+def _query(text: str) -> str:
+    return quote_plus(text)
+
+
+def _same_time(a: float | None, b: float | None) -> bool:
+    """Whether a reading taken of a file at one mtime still stands for it at another."""
+    return a is not None and b is not None and abs(a - b) < 1e-3
+
+
+def _by_hash(members: list[Model]) -> list[tuple[str, list[Model]]]:
+    """Files with one fingerprint, as groups that are certain or only likely.
+
+    Pieces that agree are not proof, and a hash that is known is: two files whose whole
+    hashes differ are two files, however alike their pieces looked. While any of them is
+    unhashed, they stay together as a likely group — hashing it is what sorts them out.
+    """
+    if any(not m.sha256 for m in members):
+        return [("likely", members)]
+    hashes: dict[str, list[Model]] = {}
+    for model in members:
+        hashes.setdefault(str(model.sha256), []).append(model)
+    return [("same", group) for group in hashes.values() if len(group) > 1]
+
+
+def _physical(models: list[Model], ident: dict[int, tuple[str, int] | None]) -> set[str]:
+    """The files on disk behind these paths. A hard link is one file under two names: it
+    takes no more room than one, and deleting a name frees nothing."""
+    found: set[str] = set()
+    for model in models:
+        got = ident.get(model.id)
+        # A file system that numbers no files: every path counts as a file of its own.
+        found.add(got[0] if got is not None else f"path:{model.id}")
+    return found
 
 
 def _stat_outside(model: Model) -> scanning.Found | None:

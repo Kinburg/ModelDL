@@ -35,7 +35,7 @@ function workSummary() {
   const bits = [];
   if (state.moving) {
     const share = state.moving.total ? Math.round((state.moving.copied / state.moving.total) * 100) : 0;
-    bits.push(`<span class="status-item busy">${icon("move")}Moving… ${fmtBytes(state.moving.copied)} of ${fmtBytes(state.moving.total)} (${share}%)
+    bits.push(`<span class="status-item busy">${icon(state.moving.verb ? "copy" : "move")}${esc(state.moving.verb || "Moving")}… ${fmtBytes(state.moving.copied)} of ${fmtBytes(state.moving.total)} (${share}%)
       <button class="mini danger" data-status="stop-move">${state.moving.stopping ? "stopping…" : "Stop"}</button></span>`);
   }
   const job = state.jobs.current;

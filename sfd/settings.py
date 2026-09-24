@@ -32,6 +32,10 @@ class Settings:
     exclude_dirs: list[str] = field(default_factory=list)
     profile: str = "comfyui"
     group_by_base_model: bool = True
+    # Whether a new download is filed on its own, by what it turns out to be, with a question
+    # only when that is uncertain. Off, every download asks where it goes before it starts —
+    # the folder the library already uses for its kind first, so the answer is one keypress.
+    smart_placement: bool = False
     download_dir: str = "downloads"
 
     # Credentials. Environment variables win, so a shared machine need not store them.

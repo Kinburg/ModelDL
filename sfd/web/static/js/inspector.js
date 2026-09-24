@@ -146,9 +146,29 @@ function modelPanel(id) {
     banners.push(banner("warn",
       `Not where the library last saw it — missing since ${esc(fmtDate(model.missing_since))}.
        <div class="mono small">${esc(model.path)}</div>
+       ${model.source ? `<div class="small">${model.origin === "downloaded" ? "Downloaded" : "Identified"}${model.host ? ` from ${esc(model.host)}` : ""} — the link is kept, and can be used again.</div>` : ""}
        ${candidates ? `<div class="candidates"><div class="small">Found on disk under the same name and size:</div>${candidates}</div>` : ""}`,
-      `<button data-do="locate">${icon("search")}Find the file…</button>
+      `${model.source ? `<button class="primary" data-do="again">${icon("download")}Download again…</button>` : ""}
+       <button data-do="online" title="Look for it on Civitai by its hash and on HuggingFace by its name">${icon("globe")}Find online…</button>
+       <button data-do="locate">${icon("search")}Find the file…</button>
        <button class="danger" data-do="forget">${icon("x")}Forget…</button>`));
+  }
+  const names = d.names || [];
+  if (!missing && names.length > 1) {
+    const list = names.map((n) => `
+      <div class="link-name">
+        <span class="mono small" title="${esc(n.path)}">${esc(n.path)}</span>
+        ${n.this ? `<span class="chip quiet">this one</span>`
+          : n.model_id ? `<button class="mini" data-show="${n.model_id}">Show</button>`
+            : `<span class="small muted">outside the library</span>`}
+      </div>`).join("");
+    banners.push(banner("info",
+      `One file under ${names.length} names — the same data, taking the room of one. Deleting this name frees nothing while another is left.
+       <div class="link-names">${list}</div>`,
+      `<button data-do="separate" title="Give this name a copy of its own again">${icon("copy")}Make a separate copy…</button>`));
+  } else if (!missing && model.links > 1) {
+    banners.push(banner("info", `One file under ${model.links} names — deleting this name frees nothing while another is left.`,
+      `<button data-do="separate">${icon("copy")}Make a separate copy…</button>`));
   }
   if (!missing && (d.left_behind_files || []).length) {
     const list = d.left_behind_files.map((p) => `<div class="mono small">${esc(baseName(p.from))}</div>`).join("");
@@ -172,13 +192,17 @@ function modelPanel(id) {
   if (verified && verified.ok === false) {
     banners.push(banner("error", "This file does not match the hash it was downloaded with. It may be damaged, or replaced by another file of the same name."));
   }
-  if (model.lookup === "not_found" && model.origin === "found") {
-    banners.push(banner("quiet", `Not on Civitai — looked up ${esc(fmtAgo((d.lookup_info || {}).at))}.`));
-  }
   const also = d.lookup_info || {};
+  if (model.lookup === "not_found" && model.origin === "found") {
+    const where = (also.searched || []).includes("huggingface") ? "Civitai or HuggingFace" : "Civitai";
+    banners.push(banner("quiet", `Not on ${where} — looked up ${esc(fmtAgo(also.at))}`
+      + (also.quick ? ", without reading the whole file: Civitai does not know its quick hash, and nothing on HuggingFace has its name and size." : ".")));
+  }
   if (model.origin === "downloaded" && also.result === "found" && also.page) {
+    const hub = also.source === "huggingface";
     banners.push(banner("quiet",
-      `Also on Civitai, as <b>${esc([also.model_name, also.version_name].filter(Boolean).join(" / ") || "a model")}</b>.`,
+      hub ? `Also on HuggingFace, in <b>${esc(also.repo_id || "")}</b>.`
+        : `Also on Civitai, as <b>${esc([also.model_name, also.version_name].filter(Boolean).join(" / ") || "a model")}</b>.`,
       `<a class="button" href="${esc(also.page)}" target="_blank" rel="noopener noreferrer">${icon("external")}Open the page</a>`));
   }
 
@@ -240,7 +264,7 @@ function modelPanel(id) {
         <button data-do="reveal" title="Show in Explorer">${icon("external")}Show</button>
         <button data-do="move">${icon("move")}Move to…</button>
         <button data-do="rename">${icon("edit")}Rename</button>
-        ${canIdentify(model) ? `<button data-do="identify" title="Hash the file and look it up on Civitai">${icon("hash")}Identify</button>` : ""}
+        ${canIdentify(model) ? `<button data-do="identify" title="Look it up on Civitai by its hash and on HuggingFace by its name">${icon("hash")}Identify</button>` : ""}
         <button class="icon-button" data-do="more" aria-label="More">${icon("dots")}</button>
       </div>`}
       ${banners.join("")}
@@ -278,6 +302,8 @@ async function wireModel(holder, id) {
   holder.onclick = async (event) => {
     const relink = event.target.closest("[data-relink]");
     if (relink) { await act.relinkModel(id, Number(relink.dataset.relink)); return; }
+    const show = event.target.closest("[data-show]");
+    if (show) { act.showModel(Number(show.dataset.show)); return; }
     const opener = event.target.closest("[data-open]");
     if (opener) {
       if (opener.classList.contains("covered")) {
@@ -298,6 +324,9 @@ async function wireModel(holder, id) {
     else if (what === "hash") act.hashModels([id]);
     else if (what === "delete") act.deleteModels([id]);
     else if (what === "locate") act.locateModel(id);
+    else if (what === "again") act.downloadAgain(id);
+    else if (what === "online") act.findOnline(id);
+    else if (what === "separate") act.separateModels([id]);
     else if (what === "forget") act.forgetModels([id]);
     else if (what === "bring-back") act.bringBack(id);
     else if (what === "download-update") act.downloadUpdate(model);
@@ -512,13 +541,15 @@ function multiPanel(keys) {
   const buttons = [];
   if (present.length) {
     buttons.push(`<button data-multi="move">${icon("move")}Move ${present.length} to…</button>`);
-    buttons.push(`<button data-multi="identify">${icon("hash")}Identify on Civitai</button>`);
+    buttons.push(`<button data-multi="identify">${icon("hash")}Identify</button>`);
     buttons.push(`<button data-multi="updates">${icon("update")}Check for newer versions</button>`);
   }
   if (tasks.length && state.view.kind === "history") buttons.push(`<button class="danger" data-multi="unhistory">${icon("x")}Remove from the history</button>`);
   if (tasks.length && state.view.kind === "downloads") buttons.push(`<button class="danger" data-multi="remove">${icon("x")}Remove from the list</button>`);
   const danger = [];
   if (present.length) danger.push(`<button class="danger" data-multi="delete">${icon("trash")}Delete ${present.length} from disk…</button>`);
+  const again = missing.filter((m) => m.source);
+  if (again.length) buttons.push(`<button data-multi="again">${icon("download")}Download ${again.length} again…</button>`);
   if (missing.length) danger.push(`<button class="danger" data-multi="forget">${icon("x")}Forget ${missing.length} missing…</button>`);
   if (cleanups.length) danger.push(`<button class="danger" data-multi="clean">${icon("trash")}Delete ${cleanups.length} leftovers…</button>`);
   return `
@@ -545,6 +576,7 @@ function wireMulti(holder) {
     if (what === "updates") act.checkUpdates(models.map((m) => m.id));
     if (what === "delete") act.deleteModels(present);
     if (what === "forget") act.forgetModels(models.filter((m) => m.state === "missing").map((m) => m.id));
+    if (what === "again") act.downloadAllAgain(models.filter((m) => m.state === "missing").map((m) => m.id));
     if (what === "unhistory") act.removeFromHistory(taskIds);
     if (what === "remove") taskIds.forEach((id) => act.taskCommand(id, "remove"));
     if (what === "clean") act.deleteCleanup([...state.selection].filter((k) => k[0] === "c").map((k) => Number(k.slice(1))));
@@ -598,14 +630,16 @@ function viewPanel() {
           ${speed ? row("Speed", esc(fmtSpeed(speed))) : ""}
           ${speed ? row("Finishing in", esc(fmtEta(left / speed))) : ""}
         </dl></section>
-        <div class="small muted insp-line">Paste a HuggingFace or Civitai link into the box at the top — or press Ctrl+V anywhere. A file whose placement is uncertain waits for you here instead of being filed by a guess.</div>
+        <div class="small muted insp-line">Paste a HuggingFace or Civitai link into the box at the top — or press Ctrl+V anywhere, or drop it on the window. ${state.settings.smart_placement
+          ? "Each file is filed by what it is; one whose placement is uncertain waits for you here instead of being filed by a guess."
+          : "Before anything downloads, you are asked where it goes — the folder that already holds its kind first."}</div>
       </div>`;
   }
   const texts = {
     history: "Every download that finished, newest first. A renamed model shows its name now and the one it arrived under; a deleted one can be downloaded again from here.",
     missing: "Models the library remembers that are no longer where it last saw them. Select one to find its file or to forget it.",
-    unidentified: "Models that came from somewhere else. What they are is read from the files; identifying one asks Civitai by its hash, and fills in the rest.",
-    duplicates: "The same file kept in more than one place. Select one to see where, and delete the copy you do not need.",
+    unidentified: "Models that came from somewhere else. What they are is read from the files; identifying one looks it up on Civitai by its hash and on HuggingFace by its name, and fills in the rest.",
+    duplicates: "The same file kept in more than one place. In each set, mark the copy to keep — the star — and delete the others once the hashes have confirmed they are the same.",
     cleanup: "Leftovers: unfinished downloads nobody is coming back for, and files named after models that are gone. Select to see what is in each.",
   };
   return `<div class="insp-empty">${esc(texts[view.kind] || "")}</div>`;

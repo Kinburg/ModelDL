@@ -33,6 +33,9 @@ export const state = {
   prefs: {},
   cleanup: null,
   duplicates: null,
+  // Which copy to keep in each set of duplicates, by the set's key, when it is not the one
+  // the library suggests.
+  keepers: new Map(),
 };
 
 // --- redrawing ------------------------------------------------------------------------

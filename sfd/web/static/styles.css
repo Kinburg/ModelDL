@@ -165,6 +165,24 @@ body.dragging-models .tree-row { transition: background .1s; }
   padding: 12px 14px 4px; font-size: 11.5px; color: var(--muted); text-transform: uppercase;
   letter-spacing: .5px; position: sticky; top: 0; background: var(--bg); z-index: 1;
 }
+.dup-head {
+  padding: 12px 14px 5px; position: sticky; top: 0; background: var(--bg); z-index: 1;
+  border-top: 1px solid var(--line-soft);
+}
+.dup-head:first-child { border-top: none; }
+.dup-line { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.dup-line + .dup-line { margin-top: 3px; }
+.dup-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.dup-meta { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.dup-line button { flex: none; }
+.dup-caution { display: flex; gap: 6px; align-items: flex-start; margin-top: 5px; color: var(--warn); font-size: 12px; }
+.dup-caution .i { width: 14px; height: 14px; margin-top: 1px; }
+.keep {
+  display: inline-flex; align-items: center; gap: 4px; flex: none; font-size: 11.5px; padding: 1px 8px;
+  color: var(--muted); background: none; border: 1px solid var(--line-soft); border-radius: 20px;
+}
+.keep .i { width: 13px; height: 13px; }
+.keep.on { color: var(--accent); border-color: var(--accent-dim); background: var(--accent-bg); cursor: default; }
 .row {
   display: flex; align-items: center; gap: 11px; padding: 6px 14px; min-height: 52px;
   border-left: 2px solid transparent; cursor: default;
@@ -206,6 +224,10 @@ body.dragging-models .tree-row { transition: background .1s; }
   white-space: nowrap; flex: none;
 }
 .chip.kind { color: #b9d3ff; background: var(--accent-bg); }
+.chip.link { color: var(--ok); background: var(--ok-bg); }
+.link-names { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+.link-name { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+.link-name .mono { min-width: 0; }
 .chip.quiet { background: none; border: 1px solid var(--line-soft); }
 .chips { display: flex; flex-wrap: wrap; gap: 5px; }
 .mark { display: inline-flex; color: var(--muted); flex: none; }
@@ -377,17 +399,64 @@ button.status-item:hover:not(:disabled) { color: var(--text); }
 .picker-subtitle { margin-bottom: 8px; }
 .picker-search { display: flex; gap: 6px; margin-bottom: 10px; }
 .picker-search input { flex: 1; }
-.picker-list { display: flex; flex-direction: column; gap: 2px; max-height: 52vh; overflow-y: auto; }
+.picker-list { display: flex; flex-direction: column; gap: 2px; max-height: 52vh; overflow-y: auto; overflow-x: hidden; }
 .folder-row {
-  display: flex; gap: 9px; align-items: center; width: 100%; text-align: left;
+  display: flex; gap: 9px; align-items: center; width: 100%; text-align: left; min-width: 0;
   background: none; border: 1px solid transparent; border-radius: 8px; padding: 6px 10px;
 }
 .folder-row:hover, .folder-row:focus { background: var(--hover); border-color: var(--accent-dim); }
 .folder-row .i { color: var(--muted); }
-.folder-row .path { font-family: var(--mono); font-size: 12.5px; }
-.folder-row .note { color: var(--muted); font-size: 12px; margin-left: auto; white-space: nowrap; }
+.folder-row .path {
+  font-family: var(--mono); font-size: 12.5px; flex: 0 1 auto; min-width: 90px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.folder-row .note {
+  color: var(--muted); font-size: 12px; margin-left: auto; white-space: nowrap;
+  flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+}
 .folder-row.new .path, .folder-row.new .i { color: var(--accent); }
 .folder-row.absent .path { color: var(--muted); }
+.folder-row.current { background: var(--selected); border-color: var(--accent-dim); }
+.folder-row.current .i { color: var(--accent); }
+
+/* The add dialog: what is coming, which of its files, and where. */
+.add-head { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; }
+.add-thumb {
+  width: 64px; height: 64px; flex: none; border-radius: 9px; overflow: hidden; background: var(--bar);
+  border: 1px solid var(--line); display: flex; align-items: center; justify-content: center; color: var(--muted);
+}
+.add-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.add-thumb.covered img { filter: blur(10px) saturate(.5); }
+.add-thumb.covered { cursor: pointer; }
+.add-thumb .i { width: 26px; height: 26px; }
+.add-what { min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.add-title { font-weight: 600; font-size: 14px; overflow-wrap: anywhere; }
+.add-why { color: var(--muted); font-size: 12px; }
+.add-dialog .banner { margin-bottom: 12px; }
+.add-files { border: 1px solid var(--line-soft); border-radius: 8px; margin-bottom: 12px; }
+.add-files-head {
+  display: flex; gap: 6px; align-items: center; padding: 6px 10px; font-size: 12.5px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.add-file-list { max-height: 190px; overflow-y: auto; padding: 4px; }
+.add-file { display: flex; gap: 8px; align-items: center; padding: 3px 6px; border-radius: 6px; font-size: 12.5px; cursor: pointer; min-width: 0; }
+.add-file:hover { background: var(--hover); }
+.add-file-name { flex: 1; min-width: 0; font-family: var(--mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.add-file.have .add-file-name { color: var(--muted); }
+.add-file-size { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.add-structure { margin: 0; padding: 7px 10px; border-top: 1px solid var(--line-soft); }
+.add-where { font-size: 11.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; margin: 2px 0 8px; }
+.add-dialog .picker-list { max-height: 34vh; }
+
+/* Found online: where a missing model could come from, and how sure that is. */
+.found-row {
+  display: flex; gap: 12px; align-items: center; padding: 9px 11px; margin-bottom: 6px;
+  border: 1px solid var(--line-soft); border-radius: 8px; background: var(--bg);
+}
+.found-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.found-title { display: flex; gap: 7px; align-items: center; font-weight: 600; overflow-wrap: anywhere; }
+.found-side { display: flex; gap: 6px; flex: none; }
+.found-side button, .found-side a.button { font-size: 12.5px; padding: 4px 10px; }
 
 /* --- the lightbox ------------------------------------------------------------------------------------------ */
 .stage { display: flex; align-items: center; gap: 8px; background: var(--bg); border: 1px solid var(--line-soft); border-radius: 10px; padding: 8px; }

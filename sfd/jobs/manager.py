@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import secrets
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -36,9 +38,10 @@ from ..core.state import PartState
 from ..core.transfer import Transfer, TransferOptions, hash_file
 from ..engines.hf_hub import HfHubEngine, HfHubOptions
 from ..core.types import FileIdentity, ProgressSnapshot
-from ..library import erase, relocate, sidecar
-from ..library.categories import ALIASES
+from ..library import erase, previews, relocate, sidecar
+from ..library.categories import ALIASES, Category
 from ..library.classify import Verdict, classify
+from ..library.files import is_model_file, shard_of, without_variant
 from ..library.inspect import sniff_remote
 from ..library.layout import Layout, adopt, flat
 from ..providers.base import Provider
@@ -46,7 +49,7 @@ from ..providers.civitai import DEFAULT_HOST as CIVITAI_DEFAULT_HOST
 from ..providers.civitai import CivitaiProvider
 from ..providers.direct import DirectProvider
 from ..providers.huggingface import HuggingFaceProvider
-from ..providers.registry import Item, expand, source_url
+from ..providers.registry import Item, Resolution, expand, source_url
 from ..settings import Settings
 from . import db
 from .db import Database, Task
@@ -69,6 +72,16 @@ SPACE_HEADROOM = 64 * 1024**2
 RETRY_DELAYS = (30.0, 120.0, 600.0)
 RETRY_POLL = 5.0
 
+# How long a resolved link waits for the answer to "where does it go?". Long enough to think
+# about it; not so long that a dialog left open overnight queues yesterday's idea.
+RESOLVED_FOR = 1800.0
+# Files of one link read at once to classify them: a repository of twenty quantisations is
+# twenty header reads, and in a row they would keep the dialog waiting half a minute.
+CLASSIFY_AT_ONCE = 4
+# Never ticked for anyone: nobody downloads a repository for its `.gitattributes` or for
+# the pictures in its model card.
+UNWANTED_SUFFIXES = (".gitattributes", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".webm")
+
 # Failures no amount of waiting fixes. Everything else — a reset connection, an expired
 # signature, a chunk that ran out of its own retries — is worth another go later.
 NO_RETRY = (
@@ -79,6 +92,18 @@ NO_RETRY = (
 
 def _gb(size: float) -> str:
     return f"{size / 1024**3:.1f} GB"
+
+
+@dataclass(slots=True)
+class Resolved:
+    """A link expanded and classified, waiting for the page to say which files go where."""
+
+    source: str
+    resolution: Resolution
+    verdicts: list[Verdict]
+    at: float
+    # The model a "download again" puts back, so the new file lands in its history.
+    restores: int | None = None
 
 
 class Manager:
@@ -107,6 +132,10 @@ class Manager:
         self._loop: asyncio.AbstractEventLoop | None = None
         self.library = Library(settings, database, self.emit_threadsafe)
         self._background: set[asyncio.Task[Any]] = set()
+        # Links resolved for the page to place, by token — see `resolve_links`.
+        self._resolved: dict[str, Resolved] = {}
+        # What a search for a missing model found: (model, answers, when), by token.
+        self._found: dict[str, tuple[int, list[dict[str, Any]], float]] = {}
 
     # --- lifecycle --------------------------------------------------------
 
@@ -310,35 +339,348 @@ class Manager:
                 else:
                     state = db.PENDING if self.settings.auto_start else db.PAUSED
 
-                task = self.db.add(
-                    state=state,
-                    source=source,
-                    label=resolution.label,
-                    provider=resolution.provider.name,
-                    identity={
-                        "provider": item.identity.provider,
-                        "ref": item.identity.ref,
-                    },
-                    filename=item.filename,
-                    size=item.size,
-                    sha256=item.sha256,
-                    dest=destination,
-                    category=verdict.category.value if verdict else None,
-                    confidence=verdict.confidence if verdict else None,
-                    reason=verdict.reason if verdict else None,
-                    disagreement=(
-                        verdict.disagreement.value if verdict and verdict.disagreement else None
-                    ),
-                    base_model=verdict.base_model if verdict else None,
-                    meta=item.meta,
-                    position=position,
-                )
+                task = self._add_task(source, resolution, item, verdict, destination, state, position)
                 if task is not None:
                     created.append(task)
-                    self.emit({"type": "task", "task": task.to_json()})
 
         self._wake.set()
         return {"created": created, "skipped": skipped}
+
+    def _add_task(
+        self,
+        source: str,
+        resolution: Resolution,
+        item: Item,
+        verdict: Verdict | None,
+        destination: Path,
+        state: str,
+        position: float,
+        **extra: Any,
+    ) -> Task | None:
+        task = self.db.add(
+            state=state,
+            source=source,
+            label=resolution.label,
+            provider=resolution.provider.name,
+            identity={
+                "provider": item.identity.provider,
+                "ref": item.identity.ref,
+            },
+            filename=item.filename,
+            size=item.size,
+            sha256=item.sha256,
+            dest=destination,
+            category=verdict.category.value if verdict else None,
+            confidence=verdict.confidence if verdict else None,
+            reason=verdict.reason if verdict else None,
+            disagreement=(
+                verdict.disagreement.value if verdict and verdict.disagreement else None
+            ),
+            base_model=verdict.base_model if verdict else None,
+            meta=item.meta,
+            position=position,
+            **extra,
+        )
+        if task is not None:
+            self.emit({"type": "task", "task": task.to_json()})
+        return task
+
+    # --- asking where a download goes -------------------------------------
+
+    async def resolve_links(self, source: str) -> dict[str, Any]:
+        """Expand a pasted link and say what it names and where it could go — queueing
+        nothing. The answer is kept under a token until the page says which files go where.
+
+        Everything that takes the network happens here, before the question is put: the
+        files a link expands into, and what each of them is, read from its header. What is
+        left to answer is the person's alone.
+        """
+        timeout = httpx.Timeout(connect=15.0, read=60.0, write=30.0, pool=15.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+            resolution = await expand(
+                source,
+                client,
+                hf_token=self.settings.effective_hf_token,
+                civitai_token=self.settings.effective_civitai_token,
+            )
+            if not resolution.items:
+                raise ValueError("the link names no files")
+            verdicts = await self._classify_all(resolution, client)
+        return self._hold(Resolved(source, resolution, verdicts, time.time()))
+
+    def _hold(self, resolved: Resolved, hint: tuple[Path, str] | None = None) -> dict[str, Any]:
+        now = time.time()
+        self._resolved = {k: v for k, v in self._resolved.items() if now - v.at < RESOLVED_FOR}
+        token = secrets.token_urlsafe(16)
+        self._resolved[token] = resolved
+        return self._describe(token, resolved, hint)
+
+    async def _classify_all(self, resolution: Resolution, client: httpx.AsyncClient) -> list[Verdict]:
+        """What each file of a link is.
+
+        Only model files are read — a `config.json` is what its name says — and of those,
+        one of each family: twenty quantisations of one model are one kind of file, and
+        reading twenty headers to learn that once kept the question waiting for seconds.
+        The smallest of a family is the one read, its header being the quickest to reach.
+        """
+        gate = asyncio.Semaphore(CLASSIFY_AT_ONCE)
+        items = resolution.items
+        families: dict[tuple[str, str], list[int]] = {}
+        verdicts: list[Verdict | None] = [None] * len(items)
+        for index, item in enumerate(items):
+            if item.filename and not is_model_file(item.filename, item.size):
+                verdicts[index] = classify(item.filename, item.meta, None)
+            else:
+                families.setdefault(_family(item.filename), []).append(index)
+
+        async def one(members: list[int]) -> None:
+            first = min(members, key=lambda i: items[i].size or 0)
+            async with gate:
+                verdict = await self._classify(resolution.provider, items[first], client)
+            for index in members:
+                verdicts[index] = verdict if index == first else Verdict(
+                    verdict.category, verdict.confidence, verdict.reason,
+                    base_model=verdict.base_model, disagreement=verdict.disagreement,
+                )
+
+        await asyncio.gather(*(one(members) for members in families.values()))
+        return [v for v in verdicts if v is not None]
+
+    def _describe(
+        self, token: str, resolved: Resolved, hint: tuple[Path, str] | None = None
+    ) -> dict[str, Any]:
+        """What the page shows while it asks: the files, which of them are worth having,
+        and where they could go — one ranking for each kind of file among them."""
+        resolution = resolved.resolution
+        items = resolution.items
+        have = [self._already_have(item) for item in items]
+        checked, structure = _preselect(resolution, have)
+        layout = self.layout()
+        rankings: dict[str, list[dict[str, Any]]] = {}
+        described = []
+        main = next((i for i, it in enumerate(items) if checked[i] and _model(it)), None)
+        if main is None:
+            main = next((i for i, it in enumerate(items) if _model(it)), 0)
+        for index, (item, verdict) in enumerate(zip(items, resolved.verdicts)):
+            # A config goes wherever the model it belongs to goes.
+            source = verdict if _model(item) else resolved.verdicts[main]
+            key = f"{source.category.value}|{source.base_model or ''}"
+            if key not in rankings:
+                rankings[key] = self.library.rank_folders(
+                    layout, source.category, source.base_model,
+                    item.filename if _model(item) else items[main].filename,
+                    meta=item.meta if _model(item) else items[main].meta,
+                    confidence=source.confidence, hint=hint,
+                )
+            model = have[index]
+            described.append({
+                "index": index,
+                "filename": item.filename,
+                "relative": item.relative,
+                "size": item.size,
+                "model_file": _model(item),
+                "primary": item.primary,
+                "category": verdict.category.value,
+                "confidence": verdict.confidence,
+                "reason": verdict.reason,
+                "base_model": verdict.base_model,
+                "model_name": item.meta.get("model_name"),
+                "version_name": item.meta.get("version_name"),
+                "checked": checked[index],
+                "have": None if model is None else {
+                    **dict(zip(("root", "relative"), self.library.placement(model.path))),
+                    "id": model.id, "path": model.path,
+                },
+                "ranking": key,
+            })
+        first = items[main]
+        return {
+            "token": token,
+            "source": resolved.source,
+            "label": resolution.label,
+            "provider": resolution.provider.name,
+            "host": first.meta.get("host") or (
+                "huggingface.co" if resolution.provider.name == "huggingface" else ""
+            ),
+            "items": described,
+            "main": main,
+            "rankings": rankings,
+            "folder_name": resolution.folder_name if len(items) > 1 else None,
+            "structure": structure,
+            "previews": len(previews.entries(first.meta)),
+            "nsfw": bool(first.meta.get("nsfw")),
+            "roots": self.library.roots_json(),
+        }
+
+    def resolve_again(self, model_id: int | None = None, task_id: int | None = None) -> dict[str, Any]:
+        """A file the library once had, as a resolved link: what its download kept, or what
+        identifying it found — for the page to ask where it goes back to, the folder it was
+        in first. Nothing is fetched to know it; it was all kept."""
+        model = self.db.get_model(model_id) if model_id is not None else None
+        task = None
+        if model_id is not None:
+            if model is None:
+                raise LookupError("no such model")
+            task = next((t for t in self.db.tasks_for_model(model.id) if t.identity.get("ref")), None)
+        elif task_id is not None:
+            task = self.db.get(task_id)
+            if task is None or task.state != db.DONE:
+                raise LookupError("no such download")
+            model = self.db.get_model(task.model_id) if task.model_id else None
+        if model is not None and model.state == db.PRESENT and Path(model.path).is_file():
+            raise ValueError(f"it is still in your library at {model.path}")
+
+        if task is not None:
+            identity = FileIdentity(
+                provider=str(task.identity.get("provider") or task.provider),
+                ref=dict(task.identity.get("ref") or {}),
+            )
+            item = Item(identity=identity, filename=model.filename if model else task.filename,
+                        size=task.size, sha256=task.sha256, meta=task.meta)
+            verdict = Verdict(_category(task.category) if task.category in Category._value2member_map_
+                              else Category.OTHER, task.confidence or "low", task.reason or "",
+                              base_model=task.base_model)
+            source, label = task.source, task.label
+            was = Path(model.path).parent if model else Path(task.dest).parent
+        elif model is not None and model.identity.get("provider"):
+            identity = FileIdentity(provider=str(model.identity["provider"]),
+                                    ref=dict(model.identity.get("ref") or {}))
+            item = Item(identity=identity, filename=model.filename, size=model.size,
+                        sha256=model.sha256, meta=model.meta)
+            verdict = Verdict(_category(model.category) if model.category in Category._value2member_map_
+                              else Category.OTHER, model.confidence or "low", model.reason or "",
+                              base_model=model.base_model)
+            source = source_url(identity, model.meta.get("host")) or ""
+            label = model.title or model.filename
+            was = Path(model.path).parent
+        else:
+            raise ValueError(
+                "nothing says where this file came from — look for it online, or find the file"
+            )
+        resolution = Resolution(
+            provider=self._provider_for(identity.provider, item.meta), items=[item], label=label
+        )
+        resolved = Resolved(source, resolution, [verdict], time.time(),
+                            restores=model.id if model is not None else None)
+        return self._hold(resolved, hint=(was, "where it was"))
+
+    async def find_online(self, model_id: int) -> dict[str, Any]:
+        """Where a model could be downloaded from, looked for on the services. What each
+        answer would download is kept here, under a token; the page is shown what it is and
+        says which one, by its place in the list."""
+        answer = await self.library.find_online(model_id)
+        now = time.time()
+        self._found = {k: v for k, v in self._found.items() if now - v[2] < RESOLVED_FOR}
+        token = secrets.token_urlsafe(16)
+        self._found[token] = (model_id, answer["found"], now)
+        shown = [{k: v for k, v in hit.items() if not k.startswith("_")} for hit in answer["found"]]
+        return {**answer, "found": shown, "token": token}
+
+    def resolve_found(self, token: str, index: int) -> dict[str, Any]:
+        """One of the answers `find_online` gave, as a link resolved — for the page to ask
+        where it goes, the folder the model was in first."""
+        held = self._found.get(token)
+        if held is None or not 0 <= index < len(held[1]):
+            raise LookupError("that search has expired — look again")
+        model_id, found, _at = held
+        model = self.db.get_model(model_id)
+        if model is None:
+            raise LookupError("no such model")
+        hit = found[index]
+        identity = FileIdentity(provider=hit["_identity"]["provider"], ref=dict(hit["_identity"]["ref"]))
+        item = Item(identity=identity, filename=model.filename, size=hit.get("size") or model.size,
+                    sha256=model.sha256 if hit.get("proven") else None, meta=dict(hit["_meta"]))
+        verdict = Verdict(_category(model.category) if model.category in Category._value2member_map_
+                          else Category.OTHER, model.confidence or "low", model.reason or "",
+                          base_model=model.base_model)
+        resolution = Resolution(provider=self._provider_for(identity.provider, item.meta),
+                                items=[item], label=hit.get("title") or model.filename)
+        resolved = Resolved(hit.get("page") or "", resolution, [verdict], time.time(), restores=model.id)
+        return self._hold(resolved, hint=(Path(model.path).parent, "where it was"))
+
+    def redownload_models(self, model_ids: list[int]) -> dict[str, Any]:
+        """Queue several missing models again, each back into the folder it was in — the
+        answer to "where?" given once for all of them, by asking to put them back."""
+        created: list[Task] = []
+        failed: list[dict[str, Any]] = []
+        for model_id in model_ids:
+            try:
+                answer = self.resolve_again(model_id=model_id)
+                model = self.db.get_model(model_id)
+                assert model is not None
+                result = self.queue_resolved(answer["token"], [0], Path(model.path).parent)
+            except (LookupError, ValueError) as exc:
+                failed.append({"id": model_id, "error": str(exc)})
+                continue
+            if result["created"]:
+                created.extend(result["created"])
+            else:
+                failed.append({"id": model_id, "error": "already downloading"})
+        return {"created": created, "failed": failed}
+
+    def resolved_meta(self, token: str) -> dict[str, Any]:
+        """The service's description of the main file of a resolved link — its pictures."""
+        resolved = self._resolved.get(token)
+        if resolved is None:
+            raise LookupError("that link has expired — paste it again")
+        items = resolved.resolution.items
+        main = next((it for it in items if _model(it)), items[0])
+        return main.meta
+
+    def drop_resolved(self, token: str) -> None:
+        self._resolved.pop(token, None)
+
+    def queue_resolved(
+        self, token: str, picks: list[int], folder: Path, keep_structure: bool = False
+    ) -> dict[str, Any]:
+        """Queue the files the page picked, into the folder it chose.
+
+        The folder is taken exactly as given, like a placement confirmed by hand: nothing is
+        added under it, not even a base-model subfolder — except the repository's own
+        folders, when asked to keep them. A folder that names a kind says what the files are
+        as well as where they go.
+        """
+        resolved = self._resolved.get(token)
+        if resolved is None:
+            raise LookupError("that link has expired — paste it again")
+        items = resolved.resolution.items
+        chosen = sorted({i for i in picks if 0 <= i < len(items)})
+        if not chosen:
+            raise ValueError("no file was picked")
+        container = resolved.resolution.folder_name if keep_structure else None
+        kind = ALIASES.get(folder.name.lower())
+        state = db.PENDING if self.settings.auto_start else db.PAUSED
+        # A model put back keeps what was written about it, whichever folder it lands in.
+        back = self.db.get_model(resolved.restores) if resolved.restores else None
+        note = back.note if back is not None else None
+        positions = self.db.reserve_positions(len(chosen), self.settings.queue_position)
+        created: list[Task] = []
+        queued: list[str] = []
+        for index, position in zip(chosen, positions):
+            item = items[index]
+            verdict = resolved.verdicts[index]
+            if container and item.relative:
+                destination = folder / container / Path(*item.relative.split("/"))
+            else:
+                destination = folder / item.filename
+            filed = Verdict(
+                kind or verdict.category,
+                "high" if kind is not None else verdict.confidence,
+                verdict.reason if kind in (None, verdict.category)
+                else f"filed by hand into {folder.name}",
+                base_model=verdict.base_model,
+            )
+            task = self._add_task(
+                resolved.source, resolved.resolution, item, filed, destination, state, position,
+                model_id=resolved.restores, note=note,
+            )
+            if task is None:
+                queued.append(item.filename)
+            else:
+                created.append(task)
+        self._resolved.pop(token, None)
+        self._wake.set()
+        return {"created": created, "queued": queued}
 
     def _already_have(self, item: Item):
         """The model a finished download of this very file left, if it is still on disk."""
@@ -480,6 +822,22 @@ class Manager:
             self._model_moves.pop(model_id, None)
             self.emit({"type": "moved", "model_id": model_id})
 
+    async def separate_model(self, model_id: int) -> dict[str, Any]:
+        """Give one name of a shared file a copy of its own: a copy of the whole file on the
+        same drive, with its progress and a Stop, as a move across drives has."""
+        if model_id in self._model_moves:
+            raise ValueError("this model is being moved or copied already")
+        stop = threading.Event()
+        self._model_moves[model_id] = stop
+        try:
+            return await asyncio.to_thread(
+                self.library.separate, model_id,
+                self._move_progress(model_id, "model_id", verb="Copying"), stop,
+            )
+        finally:
+            self._model_moves.pop(model_id, None)
+            self.emit({"type": "moved", "model_id": model_id})
+
     def stop_model_move(self, model_id: int) -> bool:
         stop = self._model_moves.get(model_id)
         if stop is None:
@@ -495,7 +853,9 @@ class Manager:
         stop.set()
         return True
 
-    def _move_progress(self, task_id: int, field: str = "id") -> relocate.Progress:
+    def _move_progress(
+        self, task_id: int, field: str = "id", verb: str | None = None
+    ) -> relocate.Progress:
         """Report a cross-drive move, which is a copy and therefore has a duration.
 
         Called from the worker thread doing the copying, so the event cannot be put on the
@@ -512,10 +872,10 @@ class Manager:
             if copied < total and now - last < PROGRESS_INTERVAL:
                 return
             last = now
-            loop.call_soon_threadsafe(
-                self.emit,
-                {"type": "moving", field: task_id, "copied": copied, "total": total},
-            )
+            event = {"type": "moving", field: task_id, "copied": copied, "total": total}
+            if verb:
+                event["verb"] = verb
+            loop.call_soon_threadsafe(self.emit, event)
 
         return report
 
@@ -672,6 +1032,8 @@ class Manager:
             raise ValueError(f"it is still in your library at {model.path}")
         dest = model.path if model is not None else old.dest
         task = self.db.add(
+            # The model it puts back, when the library still remembers it.
+            model_id=model.id if model is not None else None,
             state=db.PENDING if self.settings.auto_start else db.PAUSED,
             source=old.source,
             label=old.label,
@@ -1004,6 +1366,12 @@ class Manager:
         # the bytes were moving is in the queue and nowhere else, and this is the write that
         # gives it a home.
         task = self.db.get(task.id) or task
+        # A missing model downloaded again, into another folder: its record comes along
+        # first, so that what is written now adds to it — the note included — rather than
+        # starting a record of its own beside the old one.
+        back = self.db.get_model(task.model_id) if task.model_id else None
+        if back is not None and back.state == db.MISSING:
+            self.library.carry_record(back, path)
         records = self.settings.write_sidecars
         if not records and not task.note:
             return
@@ -1081,9 +1449,69 @@ class Manager:
 
 
 def _category(value: str):
-    from ..library.categories import Category
-
     return Category(value)
+
+
+def _family(filename: str) -> tuple[str, str]:
+    """Files that are one model in different sizes: the name without its variant, and the
+    container, since a GGUF and a safetensors of one name are not read the same way."""
+    stem, _, suffix = (filename or "").lower().rpartition(".")
+    if not stem:
+        stem, suffix = suffix, ""
+    shard = shard_of(filename or "")
+    if shard is not None:
+        stem = shard[0].lower().rpartition(".")[0]
+    return suffix, without_variant(stem)
+
+
+def _model(item: Item) -> bool:
+    """Whether a file of a link is a model, rather than something that comes with one. A
+    direct link names no file until it is fetched, and is taken to be one."""
+    return not item.filename or is_model_file(item.filename, item.size)
+
+
+def _doc(name: str) -> bool:
+    lowered = name.lower()
+    return lowered.endswith(".md") or lowered.split(".")[0] in ("readme", "license", "notice")
+
+
+def _preselect(resolution: Resolution, have: list[Any]) -> tuple[list[bool], bool]:
+    """Which files of a link are ticked when the question is put, and whether they keep the
+    repository's folders.
+
+    One file: that file. A Civitai version: the file its own download button gives. A
+    repository holding one model — its weights, in shards or not — the weights; and when
+    configs come with them, all of it, as the repository lays it out, since a transformers
+    model is a folder that only works whole. A repository of several models — a list of
+    quantisations, a pack of files for different nodes — nothing: which of them is wanted
+    is the question being asked. Nothing already in the library is ticked.
+    """
+    items = resolution.items
+    fresh = [have[i] is None for i in range(len(items))]
+    if len(items) == 1:
+        return [fresh[0]], False
+    if resolution.provider.name == "civitai":
+        if any(item.primary for item in items):
+            return [item.primary and fresh[i] for i, item in enumerate(items)], False
+        first = next((i for i, item in enumerate(items) if _model(item) and fresh[i]), None)
+        return [i == first for i in range(len(items))], False
+    models = [item for item in items if _model(item)]
+    sets = {(shard_of(item.filename) or (item.filename,))[0].lower() for item in models}
+    if len(sets) != 1:
+        return [False] * len(items), False
+    configs = [
+        item for item in items
+        if not _model(item) and not _doc(item.filename)
+        and not item.filename.lower().endswith(UNWANTED_SUFFIXES)
+    ]
+    if configs:
+        checked = [
+            fresh[i] and (_model(item) or item in configs or _doc(item.filename))
+            for i, item in enumerate(items)
+        ]
+        return checked, True
+    nested = any("/" in (item.relative or "") for item in models)
+    return [fresh[i] and _model(item) for i, item in enumerate(items)], nested
 
 
 ProgressCallback = Callable[[ProgressSnapshot], None]

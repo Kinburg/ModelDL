@@ -276,6 +276,21 @@ directory. What stayed behind in the folder it was dragged out of — the previe
 words, a record kept beside the model — is someone's library, and is offered rather than
 moved: *Bring them here* renames each to the model's current name on the way.
 
+*Download again…* is for one that was deleted. Everything needed was kept — which file, from
+where, its hash — so nothing is looked up to fetch it: the same question as any download is
+asked, where it goes, with the folder it was in first. Whichever folder it goes to, the file
+that arrives is that model back — the same entry, its history now two downloads long, its
+note carried into the new record. *Download all again…* does the whole *Missing* view at
+once, each back into the folder it was in, with the total against the free space first.
+
+*Find online…* is for one whose link is gone, or never was: a model Civitai took down, a
+file from a browser. Civitai is asked by the hash the library kept — the whole file's, which
+is proof, or the AutoV1, which with the size is very nearly — and the Hub by the name and
+the size, proven by the hash when it is known. The file itself is not needed, which is the
+point: it is missing. What is found is listed with how sure it is, and downloads into the
+same entry, the same way. A file renamed on its way here is found by nothing but a person,
+so the dialog links the two sites' own searches as well.
+
 *Find the file…* is for the rest: the system's own file dialog, for a model that was renamed
 as well as moved. The rule is the one *Another drive…* follows — the request says which
 model, the operating system asks the person at the keyboard which file, and the page never
@@ -317,14 +332,30 @@ header that is sure is believed over the folder, and the difference is shown —
 in `checkpoints` is a LoRA the checkpoint loader will not open, and *Move to…* is right
 there.
 
-*Identify on Civitai* is the rest, and it is a button, never something done behind anyone's
-back: the file is read in full to work out its SHA256 — a few seconds for a LoRA, minutes for
-a large checkpoint on a mechanical drive — and looked up with Civitai's by-hash endpoint. One
-at a time, in the background, with its progress and a *Stop* in the status bar. A model
-found there gets the files a download of it would have left, by the same settings — its
-record, and the `.civitai.info`, preview and trigger `.txt` — but never over one that is
-already there, which may be another tool's or somebody's own. A download's hash was checked
-against the bytes as they landed, so looking one up needs no second read.
+*Identify* is the rest, and it is a button, never something done behind anyone's back. Two
+services are asked, each proven by the file's SHA256. Civitai looks a file up by its hash.
+The Hub cannot — nothing on it finds a file by its contents — but it can be asked by name:
+which model cards mention the file (a card often links its real home), which repositories
+are called like it; and for any repository it publishes the exact size and SHA256 of every
+file. So on the Hub a file is found by its name, narrowed by its size, and proven by its
+hash. On one real library, nineteen of twenty text encoders, VAEs and detectors that Civitai
+had never heard of were on the Hub under their own names.
+
+Reading a whole file is what takes the time — a few seconds for a LoRA, minutes for a large
+checkpoint on a mechanical drive — so a big one is only read when there is something to
+prove. First the quick look: Civitai by the AutoV1 hash, the one A1111 used to show, which
+is sixty-four kilobytes of the file and which Civitai still answers to; and the Hub by name
+and size. When neither has anything the file could be, that is the answer, in a second or
+two instead of a 27 GB read. When either does, the file is read and the hash settles it.
+One at a time, in the background, with its progress and a *Stop* in the status bar.
+
+A model found on Civitai gets the files a download of it would have left, by the same
+settings — its record, and the `.civitai.info`, preview and trigger `.txt` — but never over
+one that is already there, which may be another tool's or somebody's own. One found on the
+Hub gets its record: the repository and the path in it, the commit, its licence and base
+model from the repository's tags — and so a way to be downloaded again, and checked for a
+newer commit. A download's hash was checked against the bytes as they landed, so looking one
+up needs no second read.
 
 ### The history
 
@@ -333,8 +364,9 @@ list, and they stay in *History* — every download that finished, newest first,
 renamed model shows what it is called now and the name it arrived under, since the name the
 service gave it is what anyone searching that service for it again will type. One whose
 files were deleted, or that went missing and was forgotten, stays too, marked as such, with
-*Download it again*: which file, from where and where it was is all still known. Taking a
-line out of the history is its own button, and touches no model.
+*Download it again*: which file, from where and where it was is all still known, and the one
+question left — where it goes now — is asked with the folder it was in first. Taking a line
+out of the history is its own button, and touches no model.
 
 A link to a file that is still in the library is not queued again; the page says where it
 already is. A file that was deleted, or went missing, is — that is what pasting its link
@@ -342,8 +374,44 @@ again is for.
 
 ### Duplicates, leftovers and newer versions
 
-*Duplicates* lists the same file kept in more than one place: certain when the hashes match,
-and only possible when all that matches is the size, with *Hash to be sure* beside those.
+*Duplicates* lists the same file kept in more than one place. A size shared by several files
+is only a reason to look closer: every LoRA trained at one rank for one architecture comes
+out the same number of bytes — eleven different Krea 2 LoRAs of exactly 228,588,904 bytes
+on one library — and so does every fine-tune saved at one precision. What tells them apart
+is a fingerprint: five pieces of 64 KB each, from the start, the quarters and the end,
+hashed. Pieces that differ prove the files differ, and those files never appear here. It is
+taken in the background, once per version of a file, alongside the header — a third of a
+megabyte per file, and on that library 106 files in a fifth of a second. Of 33 sets of files
+the size alone called duplicates, 18 turned out to be different models.
+
+Pieces that agree are not proof, though: two merges that left the text encoder untouched
+can agree wherever they are sampled. So a set is *very likely identical* until the hashes of
+the whole files are known, and *Confirm by hash* reads only those files; after that it is
+*identical*, and only then can the copies you do not keep be deleted. The star marks the one
+kept — the library suggests the one it knows most about, in the main library folder — and a
+click on another moves it. When the copies sit in folders different nodes read, say
+`insightface/` and `simswap/`, the set says so: each node may need its own copy. A workflow
+names the file it loads, folder included, so one that used a deleted copy needs pointing at
+the kept one.
+
+That is what *Link the copies* is for. The other copies become other names of the one kept —
+NTFS hard links — so every path keeps working, every node and workflow finds the same files
+where it always did, and the room of each copy is freed. There is no original and no link
+afterwards: each name is the file, equally, and a loader sees an ordinary file. Only copies
+the hashes prove the same are linked, only on the drive the kept one is on (a hard link
+cannot cross a volume), and never one that changed since the library last read it. Each is
+swapped in with one rename, so a name is never missing, and one a program holds open is left
+as it was and said so.
+
+A file under several names is marked *linked* wherever it is shown, and the inspector lists
+every name it has, the ones outside the library too. Deleting one name frees nothing while
+another is left, and the delete dialog says so, with the other names. A program that saves
+by writing a new file and renaming it over the old one quietly gives that name a copy of its
+own again; nothing breaks, the room is simply taken again. *Make separate copies* is the way
+back on purpose: every byte copied beside the name, with its dates — so its hash still holds
+— and swapped in, after the free space has been checked, with its progress and a *Stop* in
+the status bar. The Duplicates view lists linked files in a section of their own, with the
+room they save.
 
 *Cleanup* lists what belongs to nothing — the `.part` of a download nobody is coming back
 for (the 40 GB fragment from March), the `.part.corrupt` of one that failed its checksum, the
@@ -363,8 +431,8 @@ hashes differently.
 ### Changing a model
 
 *Move to…* is the question "where does this go?" asked after the fact: the same ranked list
-of the library's real folders, across every folder of the library, with the layout's own
-guess first. Selecting several and dragging them onto a folder in the tree does the same;
+of the library's real folders that a new download is offered, across every folder of the
+library, without the one it is in now. Selecting several and dragging them onto a folder in the tree does the same;
 either way the move takes the model and everything named after it, refuses to overwrite
 anything, and can be undone from the message that says it happened. *Another drive…* opens
 the system's own folder dialog for anywhere else. Across a drive boundary a move is a copy,
@@ -413,21 +481,35 @@ mid-download comes back as pending with its bytes intact, since the `.part` file
 own resume state. Pausing is a real disconnect rather than a held-open socket; there is
 nothing to lose by pausing for an hour.
 
-Uncertain placements arrive as *needs a decision* rather than filed. Adding one Civitai link
-that expands to five quantisations queues 67 GB that will not move until you accept or
-correct each one, with the reason for the guess beside it. *Elsewhere…* answers the same
-question with your library instead of our category names. The list is the folders that are
-really there, best guesses first: the one the layout would have used (base-model grouping
-included, spelled out rather than implied), the runners-up for that kind, any folder whose
-name appears in the filename, then everything else by what is actually in it, and finally
-the canonical homes that have no folder yet. That last group matters because the file may be
-the first LoRA a library has ever had; the folder-name match matters because the categories
-deliberately do not claim `sams`, `insightface`, `reactor` and the rest — a bare `.pt` gives
-nothing to tell them apart — so the right answer for a SAM checkpoint has to be on the list
-as a folder. Typing a folder that does not exist offers it; nothing is created until the
-file lands. Tick **send this kind of model here from now on** and the choice becomes the
-mapping for that kind; a base-model folder like `checkpoints/Krea 2` names no kind, so it
-files the one file and leaves the mapping alone.
+Nothing is queued until you have said where it goes. The link is resolved first — the files
+it names, and what each of them is, read from its header over a range request — and then
+*Add download* asks. Its list is the library's real folders, across every library folder,
+ranked by what is in them rather than by what they are called: where the version you already
+have is; where your other models of the same kind for the same base model are ("55 Krea 2
+LoRAs here", with `Krea 2` and `Krea2` taken for the same base); where your last one went;
+where the layout would have filed it, base-model grouping spelled out; then the folders that
+hold that kind, any folder whose name is a word of the filename, everything else, and the
+canonical homes that have no folder yet — the file may be the first LoRA a library has ever
+had. The top row is marked, so Enter is the whole answer most of the time; the arrows move
+it, a click marks another, typing searches or names a folder that does not exist yet
+(nothing is created until the file lands), and *Another drive…* opens the system's own
+dialog. Tick **send this kind of model here from now on** and the choice becomes the mapping
+for that kind; a base-model folder like `checkpoints/Krea 2` names no kind, so it files the
+one download and leaves the mapping alone.
+
+A link that names several files lists them, ticked the way a person would. A Civitai version
+ticks the file its own download button gives, not every quantisation it carries. A Hub
+repository of one model — its weights, in shards or not, and the configs that go with them —
+ticks all of it, and offers to keep the repository's folders under the one chosen, since a
+transformers model is a folder that only works whole; a repository of several — twenty
+quantisations, a pack of files for different nodes — ticks nothing, because which of them is
+wanted is the question. A file already in the library is shown where it is, unticked. Twenty
+quantisations of one model are one kind of file, so one header is read for all of them.
+
+**Smart download placement**, off by default, files each download on its own by what it is
+instead, and asks only when that is uncertain: such a download arrives as *needs a decision*,
+waiting with the reason for the guess beside it, and *Elsewhere…* answers with the same
+ranked list.
 
 Turn off **start downloads on add** and links pile up paused instead, so an afternoon of
 collecting them costs no bandwidth until you press *Start all*. That releases what is merely

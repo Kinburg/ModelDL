@@ -27,9 +27,9 @@ SKIPPED_DIRS = frozenset({"__pycache__", "node_modules"})
 # back up the tree cannot keep the walk busy forever — the visited set below is the real
 # guard against that, this is the backstop.
 MAX_DEPTH = 16
-# What an interrupted download or move leaves behind. Found here so the cleanup view can
-# offer them; never treated as models.
-FRAGMENT_SUFFIXES = (".part", ".part.json", ".part.corrupt", ".moving")
+# What an interrupted download, move, link or copy leaves behind. Found here so the cleanup
+# view can offer them; never treated as models.
+FRAGMENT_SUFFIXES = (".part", ".part.json", ".part.corrupt", ".moving", ".linking", ".separating")
 
 
 @dataclass(slots=True)

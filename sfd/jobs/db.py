@@ -109,6 +109,17 @@ CREATE TABLE IF NOT EXISTS models (
     -- What the file's own header says, read once per version of the file.
     header        TEXT NOT NULL DEFAULT '{}',
     sniffed_mtime REAL,
+    -- A few small pieces of the file, hashed: tells two files of one size apart without
+    -- reading either. And A1111's AutoV1 hash, read in the same pass, which Civitai still
+    -- answers to. Both for the version of the file at `sampled_mtime`.
+    fingerprint   TEXT,
+    autov1        TEXT,
+    sampled_mtime REAL,
+    -- Which file on its volume this name is, and how many names that file has: more than
+    -- one is a hard link, the same data under several names. Read on every walk, since
+    -- making a link changes no date on the file for anything else to notice.
+    file_id       TEXT,
+    links         INTEGER,
     -- What other tools left beside it: a `.civitai.info`, an A1111 description, a picture.
     extras        TEXT NOT NULL DEFAULT '{}',
     note          TEXT,
@@ -306,6 +317,11 @@ class Model:
     base_model: str | None = None
     header: dict[str, Any] = field(default_factory=dict)
     sniffed_mtime: float | None = None
+    fingerprint: str | None = None
+    autov1: str | None = None
+    sampled_mtime: float | None = None
+    file_id: str | None = None
+    links: int | None = None
     extras: dict[str, Any] = field(default_factory=dict)
     note: str | None = None
     record: str | None = None
@@ -392,6 +408,9 @@ class Model:
             "format": self.header.get("format"),
             "precision": precision,
             "parts": len(self.parts),
+            # How many names its file has: more than one is a hard link, and deleting this
+            # name alone frees nothing.
+            "links": self.links or 1,
             "left_behind": len(self.left_behind),
             "has_record": bool(self.record),
             "first_seen": self.first_seen,
@@ -477,6 +496,19 @@ class Database:
         for column, definition in additions.items():
             if column not in existing:
                 self._conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} {definition}")
+
+        # The library's table grows the same way: a database from the first build that had
+        # one keeps every model, and gains what the walk has learned to keep since.
+        existing = {row["name"] for row in self._conn.execute("PRAGMA table_info(models)")}
+        for column, definition in {
+            "fingerprint": "TEXT",
+            "autov1": "TEXT",
+            "sampled_mtime": "REAL",
+            "file_id": "TEXT",
+            "links": "INTEGER",
+        }.items():
+            if column not in existing:
+                self._conn.execute(f"ALTER TABLE models ADD COLUMN {column} {definition}")
 
         # Backfill, or the queue misbehaves in a way that looks arbitrary: with every
         # existing row at NULL, MAX(position) is NULL, the next task is handed position 1.0,
@@ -879,6 +911,11 @@ def _to_model(row: sqlite3.Row) -> Model:
         reason=row["reason"],
         base_model=row["base_model"],
         sniffed_mtime=row["sniffed_mtime"],
+        fingerprint=row["fingerprint"],
+        autov1=row["autov1"],
+        sampled_mtime=row["sampled_mtime"],
+        file_id=row["file_id"],
+        links=row["links"],
         note=row["note"],
         record=row["record"],
         first_seen=row["first_seen"],

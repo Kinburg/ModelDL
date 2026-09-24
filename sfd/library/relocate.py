@@ -381,15 +381,36 @@ def _transfer(
             raise
 
     partial = target.with_name(target.name + ".moving")
+    copy_bytes(source, partial, progress, stop, what=f"the move of {source.name}")
+    try:
+        os.replace(partial, target)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    source.unlink()
+
+
+def copy_bytes(
+    source: Path,
+    target: Path,
+    progress: Progress | None = None,
+    stop: threading.Event | None = None,
+    what: str | None = None,
+) -> None:
+    """Every byte of `source` into `target`, a block at a time, with its dates.
+
+    Stoppable between blocks, which is the only place a stop can land: nothing is half
+    written, and the bytes so far are in a file about to be deleted. If the copy does not
+    finish — stopped, or failed — `target` goes again: a fragment named after a model is
+    worse than no file, and `source` has not been touched, so there is nothing else to undo.
+    """
     try:
         copied = 0
         total = source.stat().st_size
-        with open(source, "rb") as reader, open(partial, "wb") as writer:
+        with open(source, "rb") as reader, open(target, "wb") as writer:
             while True:
                 if stop is not None and stop.is_set():
-                    # Between blocks, which is the only place it can be: nothing is half
-                    # written, and the bytes so far are in a file about to be deleted.
-                    raise Cancelled(f"the move of {source.name} was stopped")
+                    raise Cancelled(f"{what or f'copying {source.name}'} was stopped")
                 block = reader.read(COPY_CHUNK)
                 if not block:
                     break
@@ -397,14 +418,10 @@ def _transfer(
                 copied += len(block)
                 if progress is not None:
                     progress(copied, total)
-        shutil.copystat(source, partial)
-        os.replace(partial, target)
+        shutil.copystat(source, target)
     except BaseException:
-        # Including cancellation: a fragment named after the model is worse than no file,
-        # and the original has not been touched yet, so there is nothing else to undo.
-        partial.unlink(missing_ok=True)
+        target.unlink(missing_ok=True)
         raise
-    source.unlink()
 
 
 def _destination(

@@ -267,6 +267,7 @@ function onEvent(data) {
       invalidate("status");
       return;
     case "models": {
+      act.duplicatesTouched(data.models);
       let selected = false;
       for (const model of data.models) {
         upsertModel(model);
@@ -284,6 +285,7 @@ function onEvent(data) {
       return;
     }
     case "model_removed":
+      act.duplicatesTouched([], data.id);
       removeModel(data.id);
       invalidate("tree", "list", "inspector");
       return;

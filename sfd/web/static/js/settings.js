@@ -10,7 +10,7 @@ import * as act from "./actions.js";
 
 const FIELDS = ["profile", "connections", "concurrent_downloads", "disk_kind", "sidecar_dir",
   "hf_engine", "queue_position", "max_speed_kb", "download_dir"];
-const CHECKS = ["group_by_base_model", "verify_hash", "write_sidecars", "write_compat_files",
+const CHECKS = ["group_by_base_model", "smart_placement", "verify_hash", "write_sidecars", "write_compat_files",
   "write_trigger_txt", "hf_fallback", "auto_start", "auto_retry", "fetch_previews", "blur_nsfw"];
 
 let dirty = false;
@@ -72,6 +72,7 @@ export function renderSettings() {
         <div class="grid">
           ${field("profile", "Folder names", select("profile", [["comfyui", "ComfyUI"], ["a1111", "A1111"]]), "The names used for a kind of model that has no folder yet")}
           ${field("group_by_base_model", "Group by base model", check("group_by_base_model"), "loras/Pony, checkpoints/Flux.1 D — a subfolder per base model")}
+          ${field("smart_placement", "Smart download placement", check("smart_placement"), "On: each new download is filed into the folder that suits it, and asks only when that is uncertain. Off: every download asks where it goes, the likeliest folder first")}
           ${field("download_dir", "Downloads folder", browse("download_dir", "downloads"), "Where files go while no library folder is set")}
         </div>
         <button data-role="layout">Check folder mapping</button>

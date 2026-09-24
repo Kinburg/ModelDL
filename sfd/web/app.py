@@ -102,10 +102,30 @@ class AddRequest(BaseModel):
     source: str
 
 
+class QueueRequest(BaseModel):
+    # Which files of the resolved link, by their place in it — never a name or a URL.
+    files: list[int] = Field(default_factory=list, max_length=5000)
+    # Which folder of the library, and a folder inside it, confined to it like every other
+    # folder the page names. It does not have to exist: the transfer makes it.
+    root: int = 0
+    folder: str = ""
+    # Keep the repository's own folders under the one chosen.
+    keep_structure: bool = False
+    remember: bool = False
+
+
+class QueueAnywhereRequest(BaseModel):
+    files: list[int] = Field(default_factory=list, max_length=5000)
+    keep_structure: bool = False
+    remember: bool = False
+
+
 class ConfirmRequest(BaseModel):
     category: str | None = None
-    # A folder relative to the library root, as offered by /folders or typed by hand. It does
-    # not have to exist yet — the transfer creates it when the file lands.
+    # A folder of the library — which one, by its place in the list, and a folder inside
+    # it — as offered by /folders or typed by hand. It does not have to exist yet: the
+    # transfer creates it when the file lands.
+    root: int = 0
     folder: str | None = None
     # Make this the home of the folder's kind from now on, not just for this file.
     remember: bool = False
@@ -161,6 +181,13 @@ class IdsRequest(BaseModel):
 
 class BatchAnywhereRequest(IdsRequest):
     remember: bool = False
+
+
+class LinkRequest(BaseModel):
+    # The copy kept, and the copies that become other names of it — all models of the
+    # library, never paths.
+    keep: int
+    ids: list[int] = Field(default_factory=list, max_length=500)
 
 
 class CleanupDeleteRequest(IdsRequest):
@@ -224,6 +251,7 @@ class SettingsPatch(BaseModel):
     exclude_dirs: list[str] | None = Field(None, max_length=256)
     profile: Literal["comfyui", "a1111"] | None = None
     group_by_base_model: bool | None = None
+    smart_placement: bool | None = None
     download_dir: str | None = None
 
     hf_token: str | None = None
@@ -389,12 +417,15 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
             return {"root": "", "folders": [], "category": None}
 
         category = Category(task.category) if task.category in Category._value2member_map_ else None
-        offered = folders.offer(manager.layout(), category, task.base_model, task.filename)
+        offered = await asyncio.to_thread(
+            manager.library.rank_folders, manager.layout(), category, task.base_model,
+            task.filename, meta=task.meta, confidence=task.confidence,
+        )
         return {
             "root": settings.library_root,
             "category": category.value if category else None,
             "base_model": task.base_model,
-            "folders": [f.to_json() for f in offered],
+            "folders": offered,
         }
 
     @app.post("/api/tasks/{task_id}/confirm")
@@ -404,8 +435,11 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
 
         chosen: Path | None = None
         if request.folder:
-            chosen = folders.resolve_inside(Path(settings.library_root), request.folder)
-            if chosen is None:
+            try:
+                chosen = manager.library.resolve_folder(request.root, request.folder)
+            except LookupError:
+                raise HTTPException(400, "no such library folder") from None
+            if chosen is None or not request.folder.strip("/\\ "):
                 raise HTTPException(400, f"{request.folder} is not inside the library root")
 
         manager.confirm(task_id, request.category, chosen)
@@ -851,6 +885,104 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
             raise HTTPException(404, "no such model")
         return model
 
+    # --- asking where a download goes ---------------------------------------
+    #
+    # A link is resolved first and queued second, with the question in between: which of
+    # its files, and where. The page names the files by their place in the resolved link
+    # and the folder the way it names every folder — a library folder and a place inside
+    # it — or leaves the choice to the system's own dialog.
+
+    @app.post("/api/resolve")
+    async def resolve(request: AddRequest) -> dict[str, Any]:
+        source = request.source.strip()
+        if not source:
+            raise HTTPException(400, "nothing to add")
+        try:
+            return await manager.resolve_links(source)
+        except Exception as exc:  # noqa: BLE001 - the message is the useful part here
+            raise HTTPException(400, f"{type(exc).__name__}: {exc}") from exc
+
+    def _queued(result: dict[str, Any], chosen: Path, remember: bool) -> dict[str, Any]:
+        return {
+            "tasks": [t.to_json() for t in result["created"]],
+            # Already downloading: the same file cannot be queued twice at once.
+            "queued": result["queued"],
+            "folder": str(chosen),
+            "remembered": _remember(chosen, remember) if result["created"] else None,
+        }
+
+    @app.post("/api/resolve/{token}/queue")
+    async def queue_resolved(token: str, request: QueueRequest) -> dict[str, Any]:
+        chosen = _library_folder(request.root, request.folder)
+        if not request.folder.strip("/\\ "):
+            raise HTTPException(400, "a model goes into a folder of the library, not on top of it")
+        with _answering():
+            result = manager.queue_resolved(token, request.files, chosen, request.keep_structure)
+        return _queued(result, chosen, request.remember)
+
+    @app.post("/api/resolve/{token}/queue-anywhere")
+    async def queue_resolved_anywhere(token: str, request: QueueAnywhereRequest) -> dict[str, Any]:
+        """Queue into a folder chosen in the system's own dialog — another drive, say. The
+        request cannot name the folder, only ask for the dialog, as with moving anywhere."""
+        from ..desktop import pick_system_folder
+
+        with _answering():
+            manager.resolved_meta(token)
+        chosen = await asyncio.to_thread(pick_system_folder, settings.library_root or "")
+        if not chosen:
+            return {"ok": False, "cancelled": True}
+        with _answering():
+            result = manager.queue_resolved(token, request.files, Path(chosen), request.keep_structure)
+        return _queued(result, Path(chosen), request.remember)
+
+    @app.post("/api/models/{model_id}/again")
+    async def model_again(model_id: int) -> dict[str, Any]:
+        """A missing model's file, as a link resolved from what its download kept, for the
+        page to ask where it goes back to. Queued by /api/resolve/{token}/queue."""
+        with _answering():
+            return manager.resolve_again(model_id=model_id)
+
+    @app.post("/api/history/{task_id}/again")
+    async def history_again(task_id: int) -> dict[str, Any]:
+        with _answering():
+            return manager.resolve_again(task_id=task_id)
+
+    @app.post("/api/models/{model_id}/find-online")
+    async def find_online(model_id: int) -> dict[str, Any]:
+        """Look for a model on Civitai and the Hub, by what the library kept of it: its
+        hashes, its name, its size. Only ever on request — this asks two services about a
+        file of yours."""
+        with _answering():
+            return await manager.find_online(model_id)
+
+    @app.post("/api/found/{token}/{index}")
+    async def resolve_found(token: str, index: int) -> dict[str, Any]:
+        with _answering():
+            return manager.resolve_found(token, index)
+
+    @app.post("/api/models/redownload")
+    async def redownload_models(request: IdsRequest) -> dict[str, Any]:
+        """Download several missing models again, each into the folder it was in."""
+        result = manager.redownload_models(request.ids)
+        return {"tasks": [t.to_json() for t in result["created"]], "failed": result["failed"]}
+
+    @app.delete("/api/resolve/{token}")
+    async def drop_resolved(token: str) -> dict[str, bool]:
+        manager.drop_resolved(token)
+        return {"ok": True}
+
+    @app.get("/api/resolve/{token}/preview")
+    async def resolved_preview(
+        token: str, w: int | None = Query(None, ge=32, le=2048)
+    ) -> FileResponse:
+        """The first sample of what is about to be downloaded — through here, and from the
+        list the service gave, like every other preview."""
+        if not settings.fetch_previews:
+            raise HTTPException(404, "previews are turned off")
+        with _answering():
+            meta = manager.resolved_meta(token)
+        return await _remote_preview(previews.entries(meta), 0, w)
+
     @app.get("/api/library")
     async def get_library() -> dict[str, Any]:
         return await asyncio.to_thread(library.snapshot)
@@ -974,8 +1106,10 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
     async def model_files(model_id: int) -> dict[str, Any]:
         with _answering():
             found = await asyncio.to_thread(library.files, model_id)
+            # The file's other names: while one is left, deleting this name frees nothing.
+            others = await asyncio.to_thread(library.other_names, model_id)
         listed = _listing(found)
-        return {"files": listed, "total": sum(f["size"] or 0 for f in listed)}
+        return {"files": listed, "total": sum(f["size"] or 0 for f in listed), "others": others}
 
     @app.post("/api/models/files")
     async def models_files(request: IdsRequest) -> dict[str, Any]:
@@ -984,9 +1118,41 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
         for model_id in request.ids:
             with contextlib.suppress(LookupError, OSError):
                 listed = _listing(await asyncio.to_thread(library.files, model_id))
-                groups.append({"id": model_id, "files": listed,
+                others = await asyncio.to_thread(library.other_names, model_id)
+                groups.append({"id": model_id, "files": listed, "others": others,
                                "total": sum(f["size"] or 0 for f in listed)})
         return {"groups": groups, "total": sum(g["total"] for g in groups)}
+
+    @app.post("/api/duplicates/link")
+    async def link_copies(request: LinkRequest) -> dict[str, Any]:
+        """Make copies proven identical other names of the one kept: every path keeps
+        working, and the room of each copy is freed. The way back is /separate."""
+        with _answering():
+            return await asyncio.to_thread(library.link_copies, request.keep, request.ids)
+
+    @app.post("/api/models/{model_id}/separate")
+    async def separate_model(model_id: int) -> dict[str, Any]:
+        """Give this name of a shared file a copy of its own again. Stopped like a move."""
+        with _answering():
+            try:
+                return await manager.separate_model(model_id)
+            except relocate.Cancelled:
+                return {"ok": False, "stopped": True}
+
+    @app.post("/api/models/separate")
+    async def separate_models(request: IdsRequest) -> dict[str, Any]:
+        results = []
+        for model_id in request.ids:
+            try:
+                result = await manager.separate_model(model_id)
+            except relocate.Cancelled:
+                results.append({"id": model_id, "ok": False, "stopped": True})
+                break
+            except (LookupError, ValueError, OSError) as exc:
+                results.append({"id": model_id, "ok": False, "error": str(exc)})
+                continue
+            results.append({"id": model_id, **result})
+        return {"results": results}
 
     @app.delete("/api/models/{model_id}/files")
     async def delete_model_files(model_id: int) -> dict[str, Any]:

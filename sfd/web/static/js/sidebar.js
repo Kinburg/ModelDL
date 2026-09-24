@@ -41,7 +41,7 @@ function badge(kind) {
     return count ? `<span class="badge quiet">${count}</span>` : "";
   }
   if (kind === "duplicates" && state.duplicates && !state.duplicates.loading) {
-    const count = (state.duplicates.exact || []).length;
+    const count = (state.duplicates.groups || []).length;
     return count ? `<span class="badge quiet">${count}</span>` : "";
   }
   if (kind === "cleanup" && state.cleanup && !state.cleanup.loading && state.cleanup.total) {

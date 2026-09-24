@@ -925,17 +925,185 @@ def test_pointing_a_model_at_a_file_of_another_size_asks_first(setup, tmp_path):
 # --- duplicates and rubbish -------------------------------------------------------------
 
 
+BIG = 1024 * 1024 + 4096
+
+
+def weights(seed: int = 0, size: int = BIG) -> bytes:
+    """Bytes that look like nothing else: a different seed differs everywhere."""
+    block = hashlib.sha256(f"seed {seed}".encode()).digest() * 2048
+    return (block * (size // len(block) + 1))[:size]
+
+
+def hashed(database: Database, *paths: Path) -> None:
+    """Record the true hash of each file, as a hash job would."""
+    for path in paths:
+        model = database.model_at(path)
+        database.update_model(model.id, sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                              hash_source="computed", hashed_mtime=model.mtime)
+
+
 def test_the_same_file_twice_is_a_duplicate(setup):
     library, root, database, events = setup
-    put(root / "loras" / "a.safetensors")
-    put(root / "loras" / "copy" / "a.safetensors")
+    a = put(root / "loras" / "a.safetensors", weights())
+    b = put(root / "loras" / "copy" / "a.safetensors", weights())
     library.sync()
-    for model in database.list_models():
-        database.update_model(model.id, sha256="ef" * 32, hash_source="computed")
+
+    (group,) = library.duplicates()["groups"]
+    assert group["status"] == "likely", "pieces that agree are a reason to hash, not proof"
+    assert sorted(group["to_hash"]) == sorted(m.id for m in database.list_models())
+
+    hashed(database, a, b)
+    found = library.duplicates()
+
+    (group,) = found["groups"]
+    assert group["status"] == "same" and group["copies"] == 2 and not group["to_hash"]
+    assert found["wasted"] == BIG
+
+
+def test_files_of_one_size_are_not_copies_unless_they_look_alike(setup):
+    """The old guess: a dozen LoRAs of one rank are a dozen files of one size."""
+    library, root, database, events = setup
+    for seed in range(3):
+        put(root / "loras" / f"style{seed}.safetensors", weights(seed))
+    library.sync()
 
     found = library.duplicates()
 
-    assert len(found["exact"]) == 1 and len(found["exact"][0]) == 2
+    assert found["groups"] == []
+    assert found["shared_sizes"] == 1 and found["told_apart"] == 1
+
+
+def test_pieces_that_agree_are_not_proof(setup):
+    """Two files alike wherever they were sampled — merges that left the text encoder alone —
+    are only as alike as their hashes say."""
+    library, root, database, events = setup
+    data = bytearray(weights())
+    a = put(root / "checkpoints" / "merge_a.safetensors", bytes(data))
+    data[200_000] ^= 0xFF
+    b = put(root / "checkpoints" / "merge_b.safetensors", bytes(data))
+    library.sync()
+
+    assert [g["status"] for g in library.duplicates()["groups"]] == ["likely"]
+
+    hashed(database, a, b)
+
+    assert library.duplicates()["groups"] == []
+
+
+def test_the_fingerprint_is_taken_in_the_background_once_per_version(setup, monkeypatch):
+    from sfd.library import fingerprint
+
+    library, root, database, events = setup
+    path = put(root / "loras" / "a.safetensors", weights())
+    library.sync()
+    read = []
+    real = fingerprint.sample
+    monkeypatch.setattr(fingerprint, "sample", lambda p: read.append(p) or real(p))
+
+    library.inspect_pending()
+    library.inspect_pending()
+
+    (model,) = database.list_models()
+    assert read == [path], "read once, then trusted until the file changes"
+    assert model.fingerprint and model.sampled_mtime == model.mtime
+
+    put(path, weights(1))
+    import os
+    os.utime(path, (model.mtime + 10, model.mtime + 10))
+    library.sync()
+    library.inspect_pending()
+
+    assert read == [path, path]
+    assert database.get_model(model.id).fingerprint != model.fingerprint
+
+
+def test_the_autov1_hash_is_the_one_a1111_showed(tmp_path: Path):
+    from sfd.library import fingerprint
+
+    data = weights()
+    big = put(tmp_path / "big.safetensors", data)
+    small = put(tmp_path / "small.safetensors", data[:4096])
+
+    assert fingerprint.sample(big).autov1 == hashlib.sha256(data[0x100000:0x110000]).hexdigest()[:8]
+    assert fingerprint.sample(small).autov1 is None, "too small to reach where it is taken"
+
+
+def test_a_hard_link_is_not_a_copy(setup):
+    import os
+
+    library, root, database, events = setup
+    a = put(root / "insightface" / "inswapper_128.onnx", weights())
+    b = root / "simswap" / "inswapper_128.onnx"
+    b.parent.mkdir(parents=True)
+    try:
+        os.link(a, b)
+    except OSError:
+        pytest.skip("this file system has no hard links")
+    library.sync()
+    hashed(database, a, b)
+
+    assert library.duplicates()["groups"] == [], "one file under two names frees nothing"
+
+
+def test_the_copy_kept_is_the_one_the_library_knows_most_about(setup):
+    library, root, database, events = setup
+    found = put(root / "simswap" / "inswapper_128.onnx", weights())
+    downloaded = put(root / "insightface" / "inswapper_128.onnx", weights())
+    done_task(database, downloaded, sha256=hashlib.sha256(weights()).hexdigest(), size=BIG)
+    library.sync()
+    hashed(database, found)
+
+    (group,) = library.duplicates()["groups"]
+
+    assert group["keep"] == database.model_at(downloaded).id
+    assert "downloaded here" in group["keep_why"]
+    assert "insightface" in group["caution"] and "simswap" in group["caution"], \
+        "different folders are often different nodes, each reading its own copy"
+
+
+def test_copies_in_one_kind_s_folder_carry_no_warning_and_packs_do(setup):
+    """`vae` is read whole by its loader; the insightface packs are each loaded as a set."""
+    library, root, database, events = setup
+    vae = [put(root / "vae" / "ae.safetensors", weights(1)),
+           put(root / "vae" / "flux" / "ae.safetensors", weights(1))]
+    packs = [put(root / "insightface" / "models" / pack / "1k3d68.onnx", weights(2))
+             for pack in ("antelopev2", "buffalo_l")]
+    library.sync()
+    hashed(database, *vae, *packs)
+
+    cautions = {g["models"][0]["filename"]: g["caution"] for g in library.duplicates()["groups"]}
+
+    assert cautions["ae.safetensors"] is None
+    assert "antelopev2" in cautions["1k3d68.onnx"] and "buffalo_l" in cautions["1k3d68.onnx"]
+
+
+def test_an_old_library_gains_the_new_columns(tmp_path: Path):
+    import sqlite3
+
+    Database(tmp_path / "queue.db").close()
+    raw = sqlite3.connect(tmp_path / "queue.db")
+    for column in ("fingerprint", "autov1", "sampled_mtime"):
+        raw.execute(f"ALTER TABLE models DROP COLUMN {column}")
+    raw.commit()
+    raw.close()
+
+    database = Database(tmp_path / "queue.db")
+    model = database.add_model(path=str(tmp_path / "a.safetensors"), fingerprint="ab", autov1="cd")
+
+    assert (model.fingerprint, model.autov1) == ("ab", "cd")
+    database.close()
+
+
+def test_the_page_is_told_which_copies_are_certain(client):
+    put(client.root / "vae" / "ae.safetensors", weights())
+    put(client.root / "vae" / "flux" / "ae.safetensors", weights())
+    client.post("/api/library/rescan")
+
+    body = client.get("/api/duplicates").json()
+
+    (group,) = body["groups"]
+    assert group["status"] == "likely" and len(group["models"]) == 2
+    assert group["to_read"] == 2 * BIG
 
 
 def test_the_cleanup_finds_what_belongs_to_nothing(setup):

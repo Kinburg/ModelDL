@@ -1,0 +1,118 @@
+# Builds ModelDL.exe on Windows and, for a version tag, publishes it as a GitHub release.
+#
+#   git tag v0.2.0
+#   git push origin v0.2.0              tests, builds, releases v0.2.0 with the exe attached
+#
+#   Actions → Release → Run workflow    tests and builds only: the exe stays with the run as
+#                                       an artifact, and nothing is published
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # 3.14, like the local .venv the exe has been built and tried with.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      # The tag names the release and sfd/__init__.py names the program. Checked before
+      # anything is installed, so a forgotten bump costs seconds rather than a build.
+      - name: Check the tag against the version
+        if: github.ref_type == 'tag'
+        run: |
+          $version = python -c "import sfd; print(sfd.__version__)"
+          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+            throw "Tag $env:GITHUB_REF_NAME does not match __version__ = '$version' in sfd/__init__.py"
+          }
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[hf,build,dev]"
+
+      - name: Test
+        run: python -m pytest -q
+
+      - name: Build
+        run: python scripts/build_exe.py
+
+      # A bundle that is missing a module still builds, and then dies on launch without a
+      # word, because the exe has no console. So start it headless with nothing configured
+      # and ask it for the page and for the queue.
+      - name: Smoke test
+        run: |
+          $data = (New-Item -ItemType Directory -Force (Join-Path $env:RUNNER_TEMP smoke)).FullName
+          $probe = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+          $probe.Start(); $port = $probe.LocalEndpoint.Port; $probe.Stop()
+          $exe = Start-Process (Resolve-Path dist\ModelDL.exe).Path -PassThru `
+            -WorkingDirectory $data -ArgumentList '--no-gui', '--port', $port
+          $null = $exe.Handle   # held now, or the exit code is unreadable once it has quit
+          try {
+            $deadline = (Get-Date).AddSeconds(90)
+            while ($true) {
+              if ($exe.HasExited) { throw "ModelDL.exe quit on startup with exit code $($exe.ExitCode)" }
+              try {
+                Invoke-WebRequest "http://127.0.0.1:$port/" -UseBasicParsing -TimeoutSec 5 | Out-Null
+                break
+              } catch {
+                if ((Get-Date) -gt $deadline) { throw "ModelDL.exe did not answer on port $port within 90 s" }
+                Start-Sleep -Seconds 1
+              }
+            }
+            $queue = Invoke-RestMethod "http://127.0.0.1:$port/api/tasks" -TimeoutSec 10
+            if ($null -eq $queue.PSObject.Properties['tasks']) { throw "/api/tasks answered without a task list" }
+            Write-Host "ModelDL.exe answered on port $port"
+          } finally {
+            if (-not $exe.HasExited) { taskkill /PID $exe.Id /T /F | Out-Null }
+          }
+          exit 0
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ModelDL
+          path: dist/ModelDL.exe
+          if-no-files-found: error
+
+  # A job of its own, so the token that can write releases is never where the packages pip
+  # has just installed and run could reach it.
+  release:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ModelDL
+          path: dist
+
+      # A release made by hand on GitHub, with a new tag typed into its form, starts this run
+      # as well. That one keeps its notes and just gets the exe, and so does a re-run.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/ModelDL.exe --clobber
+          else
+            gh release create "$TAG" dist/ModelDL.exe --title "$TAG" --generate-notes --verify-tag
+          fi

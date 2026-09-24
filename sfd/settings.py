@@ -76,6 +76,10 @@ class Settings:
     # Civitai marks its own samples, and a model's pictures appearing unasked in a queue on
     # a shared screen is its own kind of problem. Covered until clicked.
     blur_nsfw: bool = True
+    # Where Save in the sample viewer puts the ComfyUI workflow a picture carries. Empty
+    # means ComfyUI's own workflows folder, when a library folder is the `models` of a
+    # ComfyUI install — and, failing that, the first Save asks.
+    workflow_dir: str = ""
     # Where our own `<name>.json` records go. Empty keeps them beside the model; a path
     # collects them in one place, mirroring the library's folder structure so names cannot
     # collide. The compatibility files stay put regardless — see write_compat_files.

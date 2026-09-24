@@ -109,6 +109,27 @@ def variant_url(url: str, width: int | None = None, still: bool = False) -> str:
     return urlunsplit(parts._replace(path="/".join(segments)))
 
 
+def original_url(url: str) -> str:
+    """The upload itself, rather than a copy the CDN made of it.
+
+    A copy asked for by width is re-encoded and has lost whatever the picture carried —
+    the prompt, the workflow. Older API answers, and the `.civitai.info` other tools wrote
+    from them, name that copy; `original=true` in its place is the file as uploaded.
+    """
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    if not (host.endswith("civitai.com") or host.endswith("civitai.red")):
+        return url
+    segments = parts.path.split("/")
+    for index, segment in enumerate(segments):
+        if segment and all(_TRANSFORM.match(part) for part in segment.split(",")):
+            if segment == "original=true":
+                return url
+            segments[index] = "original=true"
+            return urlunsplit(parts._replace(path="/".join(segments)))
+    return url
+
+
 def cache_path(directory: Path | str, url: str) -> Path:
     """Where a fetched image lives. Keyed by URL, so the width is part of the key.
 

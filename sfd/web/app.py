@@ -31,7 +31,7 @@ from ..jobs import db
 from ..jobs.db import Database
 from ..jobs.library import Busy
 from ..jobs.manager import Manager
-from ..library import details, erase, folders, previews, relocate, sidecar
+from ..library import details, erase, folders, previews, relocate, sidecar, workflows
 from ..library.categories import ALIASES, Category
 from ..library.layout import adopt
 from ..settings import Settings
@@ -163,6 +163,11 @@ class PickFolderRequest(BaseModel):
     initial: str = ""
 
 
+class WorkflowNameRequest(BaseModel):
+    # A name in the workflows folder, as a save reported it — never a path.
+    name: str = Field(..., max_length=260)
+
+
 class ModelMoveRequest(BaseModel):
     # Which folder of the library, by its place in the list, and a folder inside it. The
     # pair is confined exactly as the queue's single folder is: `resolve_inside` the root.
@@ -271,6 +276,7 @@ class SettingsPatch(BaseModel):
     write_sidecars: bool | None = None
     fetch_previews: bool | None = None
     blur_nsfw: bool | None = None
+    workflow_dir: str | None = None
     preview_dir: str | None = None
     sidecar_dir: str | None = None
     write_compat_files: bool | None = None
@@ -1291,6 +1297,155 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
                             headers={"Cache-Control": "no-cache"})
         raise HTTPException(404, "no picture for this model")
 
+    # --- the workflow inside a sample -------------------------------------------
+    #
+    # Named the way the pictures are: which model or download, and which of its samples by
+    # its place in the list the service gave. The picture read is the one that list names;
+    # a workflow is saved into the one folder the settings name, under a name made here.
+
+    finder = workflows.Finder(images)
+
+    def _workflow_folder() -> Path | None:
+        chosen = (settings.workflow_dir or "").strip()
+        if chosen:
+            return Path(chosen)
+        return workflows.comfy_folder(settings.roots)
+
+    def _model_samples(model) -> tuple[list[dict[str, Any]], Path | None]:
+        """A model's samples as the viewer lists them — the service's, or else the one
+        picture it has of its own — and the model's path, for reading that one."""
+        entries = previews.entries(model.meta)
+        if entries:
+            return entries, None
+        if model.extras.get("image") or model.header.get("thumbnail"):
+            return [{"type": "image", "local": True}], Path(model.path)
+        return [], None
+
+    def _task_samples(task_id: int):
+        task = database.get(task_id)
+        if task is None:
+            raise HTTPException(404, "no such task")
+        return task, previews.entries(task.meta)
+
+    def _local_workflow(path: Path) -> workflows.Workflow | None:
+        image = details.local_image(path)
+        if image is not None:
+            return workflows.read_file(image)
+        inside = details.thumbnail(path)
+        return workflows.read_bytes(inside[0]) if inside is not None else None
+
+    def _looked_inside(entry: dict[str, Any]) -> bool:
+        """Only still pictures are read, and a remote one only while previews may be
+        fetched at all: turned off, no picture is ever requested."""
+        if entry.get("type") == "video":
+            return False
+        return bool(entry.get("local")) or settings.fetch_previews
+
+    async def _look(entry: dict[str, Any], local: Path | None) -> workflows.Workflow | None:
+        if entry.get("local"):
+            return await asyncio.to_thread(_local_workflow, local) if local else None
+        return await finder.find(str(entry["url"]), Path(settings.preview_dir or "previews"))
+
+    async def _workflow_states(
+        entries: list[dict[str, Any]], local: Path | None
+    ) -> dict[str, Any]:
+        """What each sample carries, all of them at once, for the viewer to mark."""
+
+        async def state_of(entry: dict[str, Any]) -> dict[str, Any]:
+            if not _looked_inside(entry):
+                return {"kind": "skipped"}
+            try:
+                found = await _look(entry, local)
+            except workflows.Unreadable as exc:
+                return {"kind": "error", "error": str(exc)}
+            if found is None:
+                return {"kind": "none"}
+            return {"kind": found.kind, "nodes": found.nodes}
+
+        states = await asyncio.gather(*(state_of(entry) for entry in entries))
+        return {"workflows": [{"index": i, **state} for i, state in enumerate(states)]}
+
+    async def _workflow_at(
+        entries: list[dict[str, Any]], index: int, local: Path | None
+    ) -> workflows.Workflow:
+        if not 0 <= index < len(entries):
+            raise HTTPException(404, "no such sample")
+        if not _looked_inside(entries[index]):
+            raise HTTPException(404, "this sample is not looked inside")
+        try:
+            found = await _look(entries[index], local)
+        except workflows.Unreadable as exc:
+            raise HTTPException(502, f"the picture could not be read: {exc}") from None
+        if found is None:
+            raise HTTPException(404, "this picture carries no workflow")
+        return found
+
+    async def _save_workflow(found: workflows.Workflow, owner: str, index: int) -> dict[str, Any]:
+        folder = _workflow_folder()
+        if folder is None:
+            # Not a failure: the page asks where, once, and tries again.
+            return {"ok": False, "needs_folder": True}
+        name = workflows.file_name(owner, index, found.kind)
+        try:
+            path, existed = await asyncio.to_thread(workflows.save, folder, name, found.text)
+        except OSError as exc:
+            raise HTTPException(500, f"the workflow could not be saved in {folder}: {exc}") from None
+        return {"ok": True, "name": path.name, "path": str(path), "folder": str(folder),
+                "existed": existed, "kind": found.kind}
+
+    def _workflow_json(found: workflows.Workflow) -> dict[str, Any]:
+        return {"kind": found.kind, "nodes": found.nodes, "text": found.text}
+
+    @app.get("/api/models/{model_id}/workflows")
+    async def model_workflows(model_id: int) -> dict[str, Any]:
+        return await _workflow_states(*_model_samples(_model(model_id)))
+
+    @app.get("/api/models/{model_id}/workflows/{index}")
+    async def model_workflow(model_id: int, index: int) -> dict[str, Any]:
+        entries, local = _model_samples(_model(model_id))
+        return _workflow_json(await _workflow_at(entries, index, local))
+
+    @app.post("/api/models/{model_id}/workflows/{index}/save")
+    async def save_model_workflow(model_id: int, index: int) -> dict[str, Any]:
+        model = _model(model_id)
+        entries, local = _model_samples(model)
+        found = await _workflow_at(entries, index, local)
+        return await _save_workflow(found, model.filename, index)
+
+    @app.get("/api/tasks/{task_id}/workflows")
+    async def task_workflows(task_id: int) -> dict[str, Any]:
+        _, entries = _task_samples(task_id)
+        return await _workflow_states(entries, None)
+
+    @app.get("/api/tasks/{task_id}/workflows/{index}")
+    async def task_workflow(task_id: int, index: int) -> dict[str, Any]:
+        _, entries = _task_samples(task_id)
+        return _workflow_json(await _workflow_at(entries, index, None))
+
+    @app.post("/api/tasks/{task_id}/workflows/{index}/save")
+    async def save_task_workflow(task_id: int, index: int) -> dict[str, Any]:
+        task, entries = _task_samples(task_id)
+        found = await _workflow_at(entries, index, None)
+        return await _save_workflow(found, task.filename, index)
+
+    @app.post("/api/workflows/reveal")
+    async def reveal_workflow(request: WorkflowNameRequest) -> dict[str, bool]:
+        """Show a saved workflow in Explorer.
+
+        By the name a save reported, and only inside the workflows folder: this hands a path
+        to the shell, so the page can say which saved workflow, never where.
+        """
+        folder = _workflow_folder()
+        name = request.name
+        if folder is None or Path(name).name != name or not name.lower().endswith(".json"):
+            raise HTTPException(404, "no such workflow")
+        target = folder / name
+        if not target.is_file():
+            raise HTTPException(404, "no such workflow")
+        from ..desktop import open_system_path
+
+        return {"ok": open_system_path(str(target))}
+
     @app.post("/api/models/{model_id}/reveal")
     async def reveal_model(model_id: int) -> dict[str, bool]:
         model = _model(model_id)
@@ -1474,10 +1629,17 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
 
     # --- settings ---------------------------------------------------------
 
+    def _settings_json() -> dict[str, Any]:
+        data = settings.redacted()
+        # What an empty "Save workflows to" means right now, for the form to show.
+        found = workflows.comfy_folder(settings.roots)
+        data["workflow_dir_found"] = str(found) if found else ""
+        return data
+
     @app.get("/api/settings")
     async def get_settings() -> dict[str, Any]:
         return {
-            "settings": settings.redacted(),
+            "settings": _settings_json(),
             "categories": [c.value for c in Category],
             "error": settings.error,
         }
@@ -1496,7 +1658,7 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
         # "Files at once" and the speed ceiling are live controls, not ones that wait for a
         # restart — you reach for them precisely while something is downloading.
         manager.apply_settings()
-        return {"settings": settings.redacted()}
+        return {"settings": _settings_json()}
 
     @app.get("/api/layout")
     async def get_layout() -> dict[str, Any]:

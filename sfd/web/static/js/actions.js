@@ -1071,6 +1071,16 @@ export async function saveSettings(patch) {
   return settings;
 }
 
+// The system's own folder dialog: through the window when the app runs in one, through the
+// server when it runs in a browser. The answer comes from whoever is at the keyboard.
+export async function pickSystemFolder(initial = "") {
+  try {
+    if (window.pywebview?.api?.pick_folder) return await window.pywebview.api.pick_folder(initial);
+    const { path } = await post("/api/utils/pick-folder", { initial });
+    return path || null;
+  } catch (error) { toast(error.message, { level: "error" }); return null; }
+}
+
 export function afterModelChange(id) {
   state.details.delete(id);
   forgetPreviews({ kind: "model", id });

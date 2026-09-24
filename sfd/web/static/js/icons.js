@@ -48,6 +48,9 @@ const PATHS = {
   "arrow-down": "M12 5v14 M6 13l6 6 6-6",
   star: "M12 3.8l2.5 5.2 5.7.8-4.1 4 1 5.6-5.1-2.7-5.1 2.7 1-5.6-4.1-4 5.7-.8z",
   question: "M9 9.2a3 3 0 1 1 4.2 2.8c-.8.4-1.2 1-1.2 1.9v.6 M12 18h.01",
+  // Three nodes and their links: a ComfyUI graph.
+  workflow: "M3.5 4.5h5v4h-5z M15.5 4.5h5v4h-5z M9.5 15.5h5v4h-5z M8.5 6.5h7 M6 8.5v6.5a2.5 2.5 0 0 0 2.5 2.5h1 M18 8.5v6.5a2.5 2.5 0 0 1-2.5 2.5h-1",
+  save: "M5.5 4h10.5l4 4v10.5a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 18.5v-13A1.5 1.5 0 0 1 5.5 4z M8 4v4.5h7V4 M8 20v-6h8v6",
 };
 
 export function icon(name, cls = "") {

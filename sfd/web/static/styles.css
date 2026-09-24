@@ -470,6 +470,17 @@ button.status-item:hover:not(:disabled) { color: var(--text); }
 .record { margin-top: 12px; display: grid; grid-template-columns: 90px 1fr; gap: 5px 12px; font-size: 12.5px; }
 .record dt { color: var(--muted); }
 .record dd { margin: 0; white-space: pre-wrap; word-break: break-word; }
+.record dd.wf-cell { white-space: normal; display: flex; flex-direction: column; gap: 3px; }
+.wf { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.wf .i { width: 13px; height: 13px; }
+/* A sample that carries its workflow is marked on the strip, so eight pictures need not be
+   opened one by one to find it. */
+.shot-wrap { position: relative; flex: none; display: flex; }
+.shot-mark {
+  position: absolute; right: 4px; bottom: 4px; display: flex; padding: 2px; border-radius: 5px;
+  background: rgba(20, 22, 26, .85); color: var(--accent); pointer-events: none;
+}
+.shot-mark .i { width: 13px; height: 13px; }
 
 /* --- settings --------------------------------------------------------------------------------------------- */
 .settings { overflow-y: auto; flex: 1; padding: 6px 22px 60px; }

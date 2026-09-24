@@ -1,15 +1,15 @@
 // Settings, as a page of its own rather than a dialog: the library's folders come first,
 // because they decide what everything else in the window shows.
 
-import { get, post } from "./api.js";
+import { get } from "./api.js";
 import { esc, fmtBytes } from "./util.js";
 import { icon } from "./icons.js";
 import { state } from "./store.js";
-import { toast, toastError } from "./toasts.js";
+import { toastError } from "./toasts.js";
 import * as act from "./actions.js";
 
 const FIELDS = ["profile", "connections", "concurrent_downloads", "disk_kind", "sidecar_dir",
-  "queue_position", "max_speed_kb", "download_dir"];
+  "queue_position", "max_speed_kb", "download_dir", "workflow_dir"];
 const CHECKS = ["group_by_base_model", "smart_placement", "verify_hash", "write_sidecars", "write_compat_files",
   "write_trigger_txt", "auto_start", "auto_retry", "fetch_previews", "blur_nsfw"];
 
@@ -40,6 +40,13 @@ function rootsHtml() {
       <button class="icon-button" data-root-do="reveal" data-index="${root.index}" title="Show in Explorer">${icon("external")}</button>
       ${root.downloads ? "" : `<button class="icon-button" data-root-do="remove" data-index="${root.index}" title="Take off the list">${icon("x")}</button>`}
     </div>`).join("");
+}
+
+// What an empty field means right now: ComfyUI's own folder if the library is inside an
+// install, otherwise a question the first time a workflow is saved.
+function workflowPlaceholder() {
+  const found = state.settings.workflow_dir_found;
+  return found ? `empty = ComfyUI's own, ${found}` : "empty = asked the first time you save one";
 }
 
 function hiddenHtml() {
@@ -100,6 +107,7 @@ export function renderSettings() {
           ${field("write_trigger_txt", "Trigger words as .txt", check("write_trigger_txt"), "Loaders paste this file into the prompt, so it holds the trigger words and nothing else")}
           ${field("fetch_previews", "Sample images", check("fetch_previews"), "The pictures a model is published with, and the prompts that made them")}
           ${field("blur_nsfw", "Cover adult samples", check("blur_nsfw"), "Uncovered by a click, until the app is restarted")}
+          ${field("workflow_dir", "Save workflows to", browse("workflow_dir", workflowPlaceholder()), "Where Save in the sample viewer puts the ComfyUI workflow a picture carries, named after its model: lenovo_qwen21 - sample 2.json. Empty: ComfyUI's own workflows folder, when a library folder is the models folder of a ComfyUI install")}
         </div>
       </section>
       <section>
@@ -190,7 +198,7 @@ function wire(holder) {
     const browseButton = event.target.closest("[data-browse]");
     if (browseButton) {
       const input = holder.querySelector(`[data-field="${browseButton.dataset.browse}"]`);
-      const chosen = await pickFolder(input.value.trim());
+      const chosen = await act.pickSystemFolder(input.value.trim());
       if (chosen) { input.value = chosen; mark(); }
       return;
     }
@@ -208,14 +216,6 @@ function wire(holder) {
       } catch (error) { toastError(error); }
     }
   });
-}
-
-async function pickFolder(initial) {
-  try {
-    if (window.pywebview?.api?.pick_folder) return await window.pywebview.api.pick_folder(initial);
-    const { path } = await post("/api/utils/pick-folder", { initial });
-    return path || null;
-  } catch (error) { toast(error.message, { level: "error" }); return null; }
 }
 
 // Leaving the page with changes nobody saved is asked about, once, rather than done.

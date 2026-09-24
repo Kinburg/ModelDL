@@ -509,8 +509,9 @@ reads as itself.
 
 A LoRA's trigger words sit in the inspector with a **Copy** button, comma-joined exactly as
 the `.txt` beside the model holds them. The pictures a model is published with are there
-too, and under each one the prompt, sampler, steps, cfg and seed that produced it. Samples the
-service marks as adult are covered until clicked.
+too, and under each one the prompt, sampler, steps, cfg and seed that produced it — and the
+ComfyUI workflow, when the picture carries one. Samples the service marks as adult are
+covered until clicked.
 
 Progress streams over Server-Sent Events; the page patches rows in place rather than
 re-rendering, so a list updating four times a second does not fight with your scrolling.
@@ -645,6 +646,28 @@ about forty kilobytes rather than three megabytes.
 Samples the service marks as adult are covered until clicked. The URLs come from an API
 response, which is remote data, so only `https` and only the hosts we download from are
 ever requested.
+
+#### The workflow inside a sample
+
+A sample made in ComfyUI usually still carries the workflow that made it: ComfyUI writes
+the graph into every picture it saves, and Civitai serves an upload untouched — including
+the samples whose page on the site shows no generation data. The sample viewer looks inside
+all of a model's pictures as it opens and marks the ones that have one. Only the start of
+each file is read, since PNG and JPEG keep their metadata ahead of the pixels: about ten
+kilobytes a picture rather than several megabytes. The answer, found or not, is kept in
+`preview_dir` beside the previews, so a picture is never read twice; a picture named after
+a model on disk is read from there.
+
+**Copy** puts the workflow on the clipboard, and Ctrl+V on the ComfyUI canvas opens it in a
+new tab. **Save** writes it into the folder set as *Save workflows to*, named after the model
+it came with — `lenovo_qwen21 - sample 2.json` — and never over a different file: the same
+sample saved again is found where it already is. Left empty, that folder is ComfyUI's own
+`user/default/workflows` when a library folder is the `models` of a ComfyUI install, where
+the Workflows panel lists it; failing that, the first Save asks where.
+
+Some pictures carry only the API format of the run. ComfyUI does not take that from a
+paste, and its Workflows panel cannot open it, but it does open the file dropped onto its
+canvas — so those are only saved, as `… - sample 5 (API).json`.
 
 Base-model subfolders come from the service, not the file — the opposite of the category
 rule, and deliberately. A Pony LoRA records `sdxl_base_v1-0` in its training metadata:

@@ -711,9 +711,37 @@ or
 ```
 The resulting `ModelDL.exe` will be located in `dist/`.
 
+### Releases
+
+The newest build is always at
+<https://github.com/Kinburg/ModelDL/releases/latest/download/ModelDL.exe>. Give it a folder
+of its own: `queue.db`, `settings.json`, `downloads/` and `previews/` are kept in the folder
+it is started from. The exe is not code-signed, so SmartScreen warns the first time it runs
+— *More info*, then *Run anyway*.
+
+A release is made by pushing a version tag:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The [release workflow](.github/workflows/release.yml) then runs the tests on Windows, builds
+the exe with `scripts/build_exe.py`, starts it headless to see that the bundle came out whole
+— one missing a module still builds, then dies on launch without a word — and attaches it to
+a release named after the tag. The version is written down in one place, `__version__` in
+`sfd/__init__.py`, and a tag that disagrees with it stops the run before anything is built:
+raise it and commit first. Started by hand instead, from *Actions → Release → Run workflow*,
+the workflow builds and tests without publishing anything, and the exe stays with the run as
+an artifact.
+
 ## Status
 
 Working, and verified against the live services end to end: transfer core, the HuggingFace,
 Civitai and generic HTTP providers, model classification, library placement with sidecars,
 the persistent queue, and the desktop UI.
+
+## License
+
+[MIT](LICENSE).
 

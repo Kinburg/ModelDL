@@ -319,6 +319,12 @@ def _raise_for_hf_headers(
     detail = (headers.get("x-error-message") or "").strip()
 
     if code == "GatedRepo" or (status == 403 and "gated" in detail.lower()):
+        if not authenticated:
+            raise AuthRequired(
+                f"{ref.repo_id} is gated — accept the terms at {ref.page_url}, then give "
+                f"this program a token of that account: in Settings, in $HF_TOKEN, or with "
+                f"hf auth login"
+            )
         raise AccessDenied(
             f"{ref.repo_id} is gated — open {ref.page_url} and accept the terms with the "
             f"same account the token belongs to"

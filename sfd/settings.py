@@ -7,9 +7,11 @@ into `downloads/` unsorted.
 
 from __future__ import annotations
 
+import configparser
 import contextlib
 import json
 import os
+import time
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -38,7 +40,8 @@ class Settings:
     smart_placement: bool = False
     download_dir: str = "downloads"
 
-    # Credentials. Environment variables win, so a shared machine need not store them.
+    # Credentials. Environment variables win, so a shared machine need not store them. With
+    # neither, HuggingFace falls back to the token `hf auth login` saved.
     hf_token: str = ""
     civitai_token: str = ""
 
@@ -56,27 +59,12 @@ class Settings:
     auto_retry: bool = True
     min_speed_kb: float = 64.0
     # Ceiling on the whole queue in KB/s, 0 for none. Shared across every connection of
-    # every file: the thing worth protecting is the link, not each download. Applies to the
-    # native transfer; the huggingface_hub engine downloads in a subprocess of its own.
+    # every file: the thing worth protecting is the link, not each download.
     max_speed_kb: float = 0.0
     verify_hash: bool = True
     verify_existing: bool = True
     # "" means detect; set to ssd/hdd when Windows reports Unspecified and you know better.
     disk_kind: str = ""
-
-    # "native" is our own transfer: resume we control, a hash we verify, byte-level
-    # progress. "hf_hub" runs HuggingFace's client in a subprocess instead — worth choosing
-    # for Xet chunk deduplication when re-fetching an updated repo.
-    hf_engine: str = "native"
-    # Try the other engine once when the native path fails outright. Costs one extra attempt
-    # and occasionally succeeds where we cannot, since the official client speaks protocols
-    # we do not.
-    hf_fallback: bool = True
-    hf_disable_xet: bool = False
-    hf_xet_high_performance: bool = False
-    # Xet writes byte ranges in parallel by direct addressing. On a mechanical disk that is
-    # a seek storm; HuggingFace exposes this switch for exactly that case.
-    hf_xet_sequential_writes: bool = False
 
     write_sidecars: bool = True
     # The sample images a model is published with: shown in the queue, and stored beside the
@@ -125,27 +113,13 @@ class Settings:
 
     @property
     def effective_hf_token(self) -> str | None:
-        return os.environ.get("HF_TOKEN") or self.hf_token or None
+        # The login last: a token set for this program is never overruled by one saved for
+        # every tool on the machine.
+        return os.environ.get("HF_TOKEN") or self.hf_token or hf_login()[0]
 
     @property
     def effective_civitai_token(self) -> str | None:
         return os.environ.get("CIVITAI_TOKEN") or self.civitai_token or None
-
-    @property
-    def hf_hub_options(self) -> dict[str, Any]:
-        """Xet tuning, resolved against the target disk.
-
-        A detected mechanical disk turns on sequential writes on its own — the setting is
-        for overriding that, not for having to know about it.
-        """
-        return {
-            "disable_xet": self.hf_disable_xet,
-            "high_performance": self.hf_xet_high_performance,
-            "sequential_writes": (
-                self.hf_xet_sequential_writes or self.effective_disk_kind is DiskKind.HDD
-            ),
-            "max_workers": max(1, self.connections // 2),
-        }
 
     @property
     def effective_disk_kind(self) -> DiskKind | None:
@@ -250,6 +224,9 @@ class Settings:
             data[f"{key}_set"] = bool(getattr(self, key))
         data["hf_token_from_env"] = bool(os.environ.get("HF_TOKEN"))
         data["civitai_token_from_env"] = bool(os.environ.get("CIVITAI_TOKEN"))
+        login, expired = hf_login()
+        data["hf_token_from_login"] = bool(login)
+        data["hf_token_login_expired"] = expired
         return data
 
     def apply(self, patch: dict[str, Any]) -> None:
@@ -262,3 +239,58 @@ class Settings:
             if key in ("hf_token", "civitai_token") and value == "":
                 continue
             setattr(self, key, value)
+
+
+# --- the token `hf auth login` saved -------------------------------------------
+
+
+def hf_login_path() -> Path:
+    """Where `hf auth login` keeps the active token, found the way huggingface_hub finds it.
+
+    $HF_TOKEN_PATH names the file outright. Otherwise it is `token` in $HF_HOME, and that
+    defaults to `huggingface` under $XDG_CACHE_HOME, or under ~/.cache.
+    """
+    explicit = os.environ.get("HF_TOKEN_PATH")
+    if explicit:
+        return Path(os.path.expandvars(os.path.expanduser(explicit)))
+    home = os.environ.get("HF_HOME") or os.path.join(
+        os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache"),
+        "huggingface",
+    )
+    return Path(os.path.expandvars(os.path.expanduser(home))) / "token"
+
+
+def hf_login() -> tuple[str | None, bool]:
+    """The token `hf auth login` left behind, and whether it has run out.
+
+    Read on every call, so a login made while the program runs counts straight away.
+
+    A token pasted in at the login prompt lasts until it is revoked. One from the browser
+    login expires, and the `hf` tool renews it whenever it runs; nothing here does, so a
+    token past the `expires_at` recorded beside it in `stored_tokens` is not used. It
+    cannot open anything a token is needed for, and sent anyway it would only make the
+    error misleading — a gated model the account did accept would read as terms not
+    accepted. Left out, the Settings page can say that the login is what ran out.
+    """
+    path = hf_login_path()
+    try:
+        token = path.read_text("utf-8-sig").strip()
+    except (OSError, UnicodeDecodeError):
+        return None, False
+    if not token:
+        return None, False
+
+    stored = configparser.ConfigParser(interpolation=None)
+    try:
+        stored.read(path.with_name("stored_tokens"), encoding="utf-8")
+    except (configparser.Error, UnicodeDecodeError):
+        return token, False
+    for name in stored.sections():
+        if stored.get(name, "hf_token", fallback=None) != token:
+            continue
+        try:
+            expires_at = float(stored.get(name, "expires_at"))
+        except (configparser.Error, ValueError):
+            return token, False     # a pasted token: nothing recorded, nothing to run out
+        return (None, True) if expires_at <= time.time() else (token, False)
+    return token, False

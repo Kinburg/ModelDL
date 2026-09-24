@@ -18,7 +18,7 @@ if (-not (Test-Path $py)) {
 
     Write-Host 'Installing dependencies...'
     & $py -m pip install --upgrade pip --quiet
-    & $py -m pip install -e '.[hf,desktop]' --quiet
+    & $py -m pip install -e '.[desktop]' --quiet
     Write-Host "Done.`n"
 }
 

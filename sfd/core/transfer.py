@@ -593,7 +593,7 @@ class Transfer:
 
 
 def hash_file(path: Path) -> str:
-    """Plain sequential SHA256 of a finished file, for skip checks and other engines."""
+    """Plain sequential SHA256 of a finished file, for skip checks."""
     digest = hashlib.sha256()
     with open(path, "rb") as fh:
         while block := fh.read(4 * 1024 * 1024):

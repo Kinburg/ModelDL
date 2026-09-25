@@ -132,7 +132,13 @@ one-click toggle for exactly this reason.
 
 ## Getting started
 
-Needs Python 3.12 or newer. On Windows:
+On Windows nothing needs installing: take the program from the
+[latest release](https://github.com/Kinburg/ModelDL/releases/latest) — `ModelDL.exe`, one
+file, or `ModelDL-portable.zip`, the same program unpacked into a folder, which starts
+quicker. Either keeps its settings and history beside itself; more under
+[Releases](#releases).
+
+From source it needs Python 3.12 or newer. On Windows:
 
 ```bash
 run.cmd
@@ -693,6 +699,8 @@ or PowerShell:
 Optional flags:
 - `--browser`: open in default web browser instead of standalone desktop window.
 - `--no-gui`: run headless backend server without opening a window or browser.
+- `--data DIR`: keep the settings, the queue and the caches in `DIR` rather than the folder
+  it is started in — or, for `ModelDL.exe`, the exe's own.
 - `--port 7788`: change port. If that port is unavailable another is picked automatically
   and printed on startup — on Windows, Hyper-V and WSL reserve blocks of ports at boot
   (`netsh interface ipv4 show excludedportrange protocol=tcp`), and a reserved port refuses
@@ -709,13 +717,36 @@ or
 ```
 The resulting `ModelDL.exe` will be located in `dist/`.
 
+`--portable` builds the folder variant instead and packs it as `dist/ModelDL-portable.zip`.
+The folder itself is put together in `build/portable` and removed once packed: PyInstaller
+empties it on the next build, along with anything a run of it had saved there. `--console`
+builds either one with a console window, to see what the app prints.
+
 ### Releases
 
-The newest build is always at
-<https://github.com/Kinburg/ModelDL/releases/latest/download/ModelDL.exe>. Give it a folder
-of its own: `queue.db`, `settings.json`, `downloads/` and `previews/` are kept in the folder
-it is started from. The exe is not code-signed, so SmartScreen warns the first time it runs
-— *More info*, then *Run anyway*.
+Each release carries two builds of the same program:
+
+- [`ModelDL.exe`](https://github.com/Kinburg/ModelDL/releases/latest/download/ModelDL.exe),
+  one file. It unpacks itself into `%TEMP%` every time it starts, which takes a few seconds.
+- [`ModelDL-portable.zip`](https://github.com/Kinburg/ModelDL/releases/latest/download/ModelDL-portable.zip),
+  `ModelDL.exe` beside an `_internal` folder, unpacked already, so it starts at once. Keep
+  the folder together.
+
+Either keeps its own files beside the exe, wherever it is started from: `settings.json`
+with the tokens, `queue.db` with the history and your notes, `previews/`, and `downloads/`
+while no library folder is set. So give it a folder of its own; moving or copying that
+folder takes all of it along. In a folder it cannot write to, such as `Program Files`, they
+go to `%LOCALAPPDATA%\ModelDL` instead. `--data DIR` names another folder, and Settings shows
+the one in use.
+
+To update the portable build, delete `_internal` and unpack the new archive over the folder.
+The archive holds only the program, so nothing the app wrote is replaced. Neither build is
+code-signed, so SmartScreen warns the first time one runs — *More info*, then *Run anyway*.
+
+Unpacking a downloaded archive with Explorer passes Windows' mark of coming from the
+internet on to every file in it, and .NET, which the window runs on, refuses to load
+assemblies that carry it: the window fails and the app opens in the browser instead. The
+`ModelDL.exe.config` beside the exe lets .NET load them (`loadFromRemoteSources`).
 
 A release is made by pushing a version tag:
 
@@ -725,13 +756,13 @@ git push origin v0.2.0
 ```
 
 The [release workflow](.github/workflows/release.yml) then runs the tests on Windows, builds
-the exe with `scripts/build_exe.py`, starts it headless to see that the bundle came out whole
-— one missing a module still builds, then dies on launch without a word — and attaches it to
-a release named after the tag. The version is written down in one place, `__version__` in
-`sfd/__init__.py`, and a tag that disagrees with it stops the run before anything is built:
-raise it and commit first. Started by hand instead, from *Actions → Release → Run workflow*,
-the workflow builds and tests without publishing anything, and the exe stays with the run as
-an artifact.
+both with `scripts/build_exe.py`, starts each headless to see that the bundle came out whole
+— one missing a module still builds, then dies on launch without a word — and that it keeps
+its files where it should, and attaches both to a release named after the tag. The version
+is written down in one place, `__version__` in `sfd/__init__.py`, and a tag that disagrees
+with it stops the run before anything is built: raise it and commit first. Started by hand
+instead, from *Actions → Release → Run workflow*, the workflow builds and tests without
+publishing anything, and both builds stay with the run as an artifact.
 
 ## Status
 

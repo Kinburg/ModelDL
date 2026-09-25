@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
@@ -838,6 +839,20 @@ def test_the_settings_path_cannot_be_changed_through_the_api(client, tmp_path: P
 
 def test_the_settings_path_is_not_sent_to_the_browser(client):
     assert "_path" not in client.get("/api/settings").json()["settings"]
+
+
+def test_the_page_is_told_where_the_app_keeps_its_own_files(client, tmp_path: Path, monkeypatch):
+    """The launcher moves into the data folder, so that is the working one. Settings shows
+    it: beside the exe is not where it is when the exe sits in a folder it cannot write."""
+    import sfd.desktop
+
+    monkeypatch.chdir(tmp_path)
+    assert os.path.samefile(client.get("/api/settings").json()["settings"]["data_dir"], tmp_path)
+
+    opened: list[str] = []
+    monkeypatch.setattr(sfd.desktop, "open_system_path", lambda path: opened.append(path) or True)
+    assert client.post("/api/data-dir/reveal").json() == {"ok": True}
+    assert os.path.samefile(opened[0], tmp_path)
 
 
 def test_settings_never_send_the_tokens_back(client):

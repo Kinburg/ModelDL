@@ -1,5 +1,5 @@
 @echo off
-rem Build standalone ModelDL.exe using PyInstaller.
+rem Build standalone ModelDL.exe using PyInstaller; with --portable, dist\ModelDL-portable.zip.
 setlocal
 cd /d "%~dp0"
 

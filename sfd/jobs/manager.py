@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import secrets
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -37,7 +38,7 @@ from ..core.speed import RateLimiter
 from ..core.state import PartState
 from ..core.transfer import Transfer, TransferOptions
 from ..core.types import FileIdentity, ProgressSnapshot
-from ..library import erase, previews, relocate, sidecar
+from ..library import erase, previews, relocate, sidecar, versions
 from ..library.categories import ALIASES, Category
 from ..library.classify import Verdict, classify
 from ..library.files import is_model_file, shard_of, without_variant
@@ -51,8 +52,8 @@ from ..providers.huggingface import HuggingFaceProvider
 from ..providers.registry import Item, Resolution, expand, source_url
 from ..settings import Settings
 from . import db
-from .db import Database, Task
-from .library import Library
+from .db import Database, Model, Task, path_key
+from .library import Busy, Library
 
 PROGRESS_INTERVAL = 0.4
 # How often progress is written to the queue. Far slower than the event stream, because its
@@ -74,6 +75,10 @@ RETRY_POLL = 5.0
 # How long a resolved link waits for the answer to "where does it go?". Long enough to think
 # about it; not so long that a dialog left open overnight queues yesterday's idea.
 RESOLVED_FOR = 1800.0
+# How long after the window connects the check for newer versions starts: the page is still
+# fetching its first screenful of pictures, and that is what someone opening the app is
+# looking at.
+START_CHECK_DELAY = 3.0
 # Files of one link read at once to classify them: a repository of twenty quantisations is
 # twenty header reads, and in a row they would keep the dialog waiting half a minute.
 CLASSIFY_AT_ONCE = 4
@@ -93,6 +98,19 @@ def _gb(size: float) -> str:
     return f"{size / 1024**3:.1f} GB"
 
 
+# Every state of a download that has not landed yet: each of them still has a claim on the
+# name it is going to land under.
+OPEN_STATES = (db.PENDING, db.BLOCKED, db.RUNNING, db.PAUSED, db.FAILED)
+
+
+def _version_tag(item: Item) -> str:
+    """What tells a file apart from another of its name: the version it is, as its service
+    names it — `v3`, `v2.0-turbo` — or `new` when the service names none."""
+    name = str((item.meta or {}).get("version_name") or "").strip().lower()
+    tag = re.sub(r"[^a-z0-9._-]+", "-", name).strip("-.")
+    return tag[:40] or "new"
+
+
 @dataclass(slots=True)
 class Resolved:
     """A link expanded and classified, waiting for the page to say which files go where."""
@@ -103,6 +121,12 @@ class Resolved:
     at: float
     # The model a "download again" puts back, so the new file lands in its history.
     restores: int | None = None
+    # Which of the files to tick when the question is put, where that is known better than
+    # by the rules of `_preselect`: of a newer version, the counterparts of the files here.
+    picks: list[int] | None = None
+    # For a file that is sold, whether the account of the Civitai key has bought it, by the
+    # file's place in the list — asked while the link was resolved, so the question can say.
+    owned: dict[int, bool | None] = field(default_factory=dict)
 
 
 class Manager:
@@ -135,6 +159,11 @@ class Manager:
         self._resolved: dict[str, Resolved] = {}
         # What a search for a missing model found: (model, answers, when), by token.
         self._found: dict[str, tuple[int, list[dict[str, Any]], float]] = {}
+        # The first walk of the library, and whether the check for newer versions that
+        # follows the window opening has been started — once a run of the app, however many
+        # times the page reloads or reconnects.
+        self._first_walk: asyncio.Task[Any] | None = None
+        self._checked_on_start = False
 
     # --- lifecycle --------------------------------------------------------
 
@@ -147,7 +176,7 @@ class Manager:
         self.library.start()
         # The first walk of the library happens behind the page rather than in front of
         # it: the queue is usable at once, and the tree fills in a moment later.
-        self.spawn(self.library.refresh(), "library-first-walk")
+        self._first_walk = self.spawn(self.library.refresh(), "library-first-walk")
 
     def spawn(self, coroutine, name: str) -> asyncio.Task[Any]:
         """Run something in the background, and keep hold of it until it is done — a task
@@ -251,7 +280,31 @@ class Manager:
     def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=256)
         self._subscribers.add(queue)
+        # A page listening is the window being up: the moment for the one check the app
+        # makes on its own. Not before the queue has started, which is what reads the disk.
+        if self._first_walk is not None and not self._checked_on_start:
+            self._checked_on_start = True
+            self.spawn(self._check_on_start(), "updates-on-start")
         return queue
+
+    async def _check_on_start(self) -> None:
+        """Ask about newer versions once the window is up and the disk has been read.
+
+        After the first walk, so that the question is about what is on the disk now and not
+        about what was there when the app last closed; and a moment after the page
+        connected, so that the answers do not compete with its first screenful of pictures.
+        A check pressed for by hand in that moment is let through, and this one stands down.
+        """
+        if not self.settings.check_updates_on_start:
+            return
+        if self._first_walk is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.shield(self._first_walk)
+        await asyncio.sleep(START_CHECK_DELAY)
+        if self._stopping or not self.settings.check_updates_on_start:
+            return
+        with contextlib.suppress(Busy):
+            await self.library.check_updates(self.library.checkable_ids(), startup=True)
 
     def unsubscribe(self, queue: asyncio.Queue[dict[str, Any]]) -> None:
         self._subscribers.discard(queue)
@@ -356,6 +409,7 @@ class Manager:
         position: float,
         **extra: Any,
     ) -> Task | None:
+        destination = self._unclaimed(destination, item)
         task = self.db.add(
             state=state,
             source=source,
@@ -405,7 +459,22 @@ class Manager:
             if not resolution.items:
                 raise ValueError("the link names no files")
             verdicts = await self._classify_all(resolution, client)
-        return self._hold(Resolved(source, resolution, verdicts, time.time()))
+            owned = await self._ownership(resolution, client)
+        return self._hold(Resolved(source, resolution, verdicts, time.time(), owned=owned))
+
+    async def _ownership(self, resolution: Resolution, client: httpx.AsyncClient) -> dict[int, bool | None]:
+        """Of the files of a link that are sold, which the account of the key has bought —
+        one request for each of them, and none for a link with nothing for sale."""
+        provider = resolution.provider
+        owned: dict[int, bool | None] = {}
+        if not isinstance(provider, CivitaiProvider):
+            return owned
+        for index, item in enumerate(resolution.items):
+            if not (item.meta or {}).get("access"):
+                continue
+            ref = item.identity.ref
+            owned[index] = await provider.owned(ref.get("version_id"), ref.get("file_id"), client)
+        return owned
 
     def _hold(self, resolved: Resolved, hint: tuple[Path, str] | None = None) -> dict[str, Any]:
         now = time.time()
@@ -454,6 +523,8 @@ class Manager:
         items = resolution.items
         have = [self._already_have(item) for item in items]
         checked, structure = _preselect(resolution, have)
+        if resolved.picks is not None:
+            checked = [i in resolved.picks and have[i] is None for i in range(len(items))]
         layout = self.layout()
         rankings: dict[str, list[dict[str, Any]]] = {}
         described = []
@@ -485,6 +556,9 @@ class Manager:
                 "base_model": verdict.base_model,
                 "model_name": item.meta.get("model_name"),
                 "version_name": item.meta.get("version_name"),
+                # Sold or in early access, and whether it is bought — see `_ownership`.
+                "access": {**item.meta["access"], "owned": resolved.owned.get(index)}
+                if item.meta.get("access") else None,
                 "checked": checked[index],
                 "have": None if model is None else {
                     **dict(zip(("root", "relative"), self.library.placement(model.path))),
@@ -617,6 +691,82 @@ class Manager:
                 failed.append({"id": model_id, "error": "already downloading"})
         return {"created": created, "failed": failed}
 
+    # --- newer versions -----------------------------------------------------
+
+    def _update_targets(self, model_ids: list[int]) -> list[tuple[Model, dict[str, Any]]]:
+        """The models among these with a newer version on Civitai to fetch, and which one.
+
+        Only Civitai's: on the Hub the newer file has the name of the one here, so fetching it
+        would mean replacing that one — not something to do as a side effect of a button
+        that says Download.
+        """
+        found = []
+        for model_id in model_ids:
+            model = self.db.get_model(model_id)
+            if model is None or model.state != db.PRESENT or model.provider != "civitai":
+                continue
+            record = versions.normalise(model.updates) or {}
+            pick = record.get("update") or {}
+            if record.get("status") == versions.UPDATE and pick.get("id") and (pick.get("file") or {}).get("id"):
+                found.append((model, pick))
+        return found
+
+    async def resolve_update(self, model_ids: list[int]) -> dict[str, Any]:
+        """A newer version, as a link resolved — for the page to ask where it goes, with the
+        folder of the version it updates first. Every file of the version is listed; the ones
+        ticked are the counterparts of the files here — bf16 for bf16, int8 for int8."""
+        targets = self._update_targets(model_ids)
+        if not targets:
+            raise ValueError("nothing here has a newer version to download")
+        model, pick = targets[0]
+        wanted = {p["file"]["id"] for _m, p in targets if p["id"] == pick["id"]}
+        host = str(model.meta.get("host") or CIVITAI_DEFAULT_HOST)
+        source = f"https://{host}/models/{model.meta['model_id']}?modelVersionId={pick['id']}"
+        timeout = httpx.Timeout(connect=15.0, read=60.0, write=30.0, pool=15.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+            resolution = await expand(
+                source,
+                client,
+                hf_token=self.settings.effective_hf_token,
+                civitai_token=self.settings.effective_civitai_token,
+            )
+            if not resolution.items:
+                raise ValueError("the new version names no files")
+            verdicts = await self._classify_all(resolution, client)
+            owned = await self._ownership(resolution, client)
+        picks = [
+            index for index, item in enumerate(resolution.items)
+            if item.identity.ref.get("file_id") in wanted
+        ]
+        resolved = Resolved(source, resolution, verdicts, time.time(), picks=picks or None, owned=owned)
+        return self._hold(resolved, hint=(Path(model.path).parent, "where the version it updates is"))
+
+    async def download_updates(self, model_ids: list[int]) -> dict[str, Any]:
+        """Queue the newer version of each, into the folder of the version it updates — the
+        answer to "where?" given once, for all of them. Each file is fetched once, however
+        many files here it is the newer version of."""
+        created: list[Task] = []
+        failed: list[dict[str, Any]] = []
+        seen: set[tuple[Any, Any]] = set()
+        for model, pick in self._update_targets(model_ids):
+            key = (pick["id"], pick["file"]["id"])
+            if key in seen:
+                continue
+            seen.add(key)
+            host = str(model.meta.get("host") or CIVITAI_DEFAULT_HOST)
+            source = f"https://{host}/api/download/models/{pick['id']}?fileId={pick['file']['id']}"
+            try:
+                answer = await self.resolve_links(source)
+                result = self.queue_resolved(answer["token"], [0], Path(model.path).parent)
+            except Exception as exc:  # noqa: BLE001 - one version that will not resolve is not all of them
+                failed.append({"id": model.id, "error": str(exc) or type(exc).__name__})
+                continue
+            if result["created"]:
+                created.extend(result["created"])
+            else:
+                failed.append({"id": model.id, "error": "already downloading"})
+        return {"created": created, "failed": failed}
+
     def resolved_meta(self, token: str) -> dict[str, Any]:
         """The service's description of the main file of a resolved link — its pictures."""
         resolved = self._resolved.get(token)
@@ -680,6 +830,53 @@ class Manager:
         self._resolved.pop(token, None)
         self._wake.set()
         return {"created": created, "queued": queued}
+
+    def _unclaimed(self, destination: Path, item: Item) -> Path:
+        """Where a new download can land without taking the place of another file.
+
+        The transfer replaces a file of another size sitting where it is going — a leftover
+        it was asked to fetch again — so a new version named like the old one, filed beside
+        it, would quietly take its place. What is there stays whenever it is not this very
+        file: another download is on its way to that name, or the file there is known to be
+        another one — another hash, another of Civitai's files, another size. The new file
+        then takes a name of its own, its version before the extension, the way Civitai's
+        own variants of a file are told apart. A file of the same size that nothing else is
+        known about is left to the transfer, which compares hashes before fetching a byte.
+        """
+        if not item.filename or destination.is_dir():
+            return destination
+        landing = {path_key(t.dest) for t in self.db.list(OPEN_STATES) if t.dest}
+
+        def free(path: Path) -> bool:
+            if path_key(path) in landing:
+                return False
+            return not path.exists() or self._same_file(path, item)
+
+        if free(destination):
+            return destination
+        tag = _version_tag(item)
+        for attempt in range(1, 100):
+            suffix = tag if attempt == 1 else f"{tag}-{attempt}"
+            candidate = destination.with_name(f"{destination.stem}.{suffix}{destination.suffix}")
+            if free(candidate):
+                return candidate
+        return destination
+
+    def _same_file(self, path: Path, item: Item) -> bool:
+        """Whether the file at `path` may be the very file `item` names."""
+        model = self.db.model_at(path)
+        if model is not None:
+            if model.sha256 and item.sha256:
+                return model.sha256.lower() == item.sha256.lower()
+            ref = (model.identity or {}).get("ref") or {}
+            theirs = item.identity.ref.get("file_id") if item.identity.provider == "civitai" else None
+            if model.provider == "civitai" and ref.get("file_id") and theirs:
+                return ref.get("file_id") == theirs
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return False
+        return item.size is not None and size == item.size
 
     def _already_have(self, item: Item):
         """The model a finished download of this very file left, if it is still on disk."""

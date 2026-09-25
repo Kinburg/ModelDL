@@ -188,6 +188,11 @@ class BatchAnywhereRequest(IdsRequest):
     remember: bool = False
 
 
+class SkipRequest(IdsRequest):
+    # False counts a skipped update again.
+    skip: bool = True
+
+
 class LinkRequest(BaseModel):
     # The copy kept, and the copies that become other names of it — all models of the
     # library, never paths.
@@ -281,6 +286,7 @@ class SettingsPatch(BaseModel):
     sidecar_dir: str | None = None
     write_compat_files: bool | None = None
     write_trigger_txt: bool | None = None
+    check_updates_on_start: bool | None = None
 
     layout_overrides: dict[str, str] | None = None
     ui: dict[str, Any] | None = None
@@ -1263,9 +1269,45 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
     async def stop_jobs() -> dict[str, int]:
         return {"dropped": library.stop_jobs()}
 
+    # --- newer versions -----------------------------------------------------
+    #
+    # A check runs one at a time and says how far it has got over the event stream; these
+    # answer when it is done, with what it found.
+
     @app.post("/api/models/check-updates")
     async def check_updates(request: IdsRequest) -> dict[str, Any]:
-        return await library.check_updates(request.ids)
+        with _answering():
+            return await library.check_updates(request.ids)
+
+    @app.post("/api/updates/check")
+    async def check_all_updates() -> dict[str, Any]:
+        """Every model that came from Civitai or the Hub — what the app asks on its own when
+        it starts, asked for now."""
+        with _answering():
+            return await library.check_updates(library.checkable_ids())
+
+    @app.post("/api/updates/stop")
+    async def stop_update_check() -> dict[str, bool]:
+        return {"stopping": library.stop_update_check()}
+
+    @app.post("/api/models/skip-update")
+    async def skip_update(request: SkipRequest) -> dict[str, int]:
+        return {"changed": library.skip_updates(request.ids, request.skip)}
+
+    @app.post("/api/updates/resolve")
+    async def resolve_update(request: IdsRequest) -> dict[str, Any]:
+        """A newer version as a link resolved, for the page to ask where it goes. Queued by
+        /api/resolve/{token}/queue, like any other."""
+        try:
+            return await manager.resolve_update(request.ids)
+        except Exception as exc:  # noqa: BLE001 - the message is the useful part here
+            raise HTTPException(400, f"{type(exc).__name__}: {exc}") from exc
+
+    @app.post("/api/updates/download")
+    async def download_updates(request: IdsRequest) -> dict[str, Any]:
+        """The newer version of each, into the folder of the version it updates."""
+        result = await manager.download_updates(request.ids)
+        return {"tasks": [t.to_json() for t in result["created"]], "failed": result["failed"]}
 
     @app.get("/api/models/{model_id}/previews")
     async def model_previews(model_id: int) -> dict[str, Any]:

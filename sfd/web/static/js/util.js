@@ -85,6 +85,51 @@ export function dayLabel(epoch) {
 
 export const plural = (n, word, many = `${word}s`) => `${n} ${n === 1 ? word : many}`;
 
+// --- what a Civitai version costs -----------------------------------------------------
+
+// Whether it has to be bought to be downloaded, now: sold for good, or in early access that
+// has not ended. The day early access ends it is free, whenever it was last asked about.
+export function paidNow(access) {
+  if (!access) return false;
+  if (access.permanent) return true;
+  const until = Date.parse(access.until || "");
+  return Number.isFinite(until) ? until > Date.now() : true;
+}
+
+// Paid · bought, Early access · free from 1 Oct 2026 · not bought — or "" for free.
+export function accessLabel(access) {
+  if (!paidNow(access)) return "";
+  const until = Date.parse(access.until || "");
+  const what = access.permanent ? "Paid"
+    : Number.isFinite(until) ? `Early access · free from ${fmtDate(until / 1000)}` : "Early access";
+  return what + (access.owned === true ? " · bought" : access.owned === false ? " · not bought" : "");
+}
+
+// Whether downloading it would be refused: to be bought, and not known to be.
+export const refused = (access) => paidNow(access) && access.owned !== true;
+
+// The same, as a sentence, for wherever there is room to say it before Download is pressed.
+export function paidSentence(access) {
+  if (!paidNow(access)) return "";
+  const until = Date.parse(access.until || "");
+  const what = access.permanent ? "Sold on Civitai"
+    : `In early access on Civitai${Number.isFinite(until) ? ` — free from ${fmtDate(until / 1000)}` : ""}`;
+  const owned = access.owned === true ? "bought with your API key, so it downloads like any other."
+    : access.owned === false ? "not bought with your API key: Civitai refuses the download until it is bought on its page."
+      : "and whether it is bought can be told only with a Civitai API key, in Settings under Accounts.";
+  return `${what}, ${owned}`;
+}
+
+// The chip that says so, coloured by whether it is bought.
+export function accessChip(access) {
+  const label = accessLabel(access);
+  if (!label) return "";
+  const why = access.owned === true ? "Bought by the account of your Civitai API key"
+    : access.owned === false ? "Not bought by the account of your Civitai API key: Civitai refuses the download until it is"
+      : "Whether it is bought could not be told: that takes a Civitai API key, in Settings under Accounts";
+  return `<span class="chip paid ${access.owned === true ? "owned" : ""}" title="${esc(why)}">${esc(label)}</span>`;
+}
+
 export function debounce(fn, wait) {
   let timer = null;
   const wrapped = (...args) => {

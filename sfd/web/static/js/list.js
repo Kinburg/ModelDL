@@ -5,12 +5,13 @@
 import { post } from "./api.js";
 import {
   esc, fmtBytes, fmtSpeed, fmtEta, fmtAgo, fmtDate, fmtTime, fmtDuration, dayLabel, kindLabel,
-  plural, baseName, copyText,
+  plural, baseName, copyText, accessChip, accessLabel, paidNow, refused,
 } from "./util.js";
 import { icon, kindIcon } from "./icons.js";
 import {
   state, invalidate, onRender, modelsIn, downloadsIn, activeTasks, missingModels,
   unidentifiedModels, select, folderLabel, remember, placementOf, selectedModels,
+  standingOf, updateGroups, groupTitle,
 } from "./store.js";
 import { showMenu, menuFrom } from "./menu.js";
 import { covered, openLightbox, previewSrc } from "./lightbox.js";
@@ -142,6 +143,8 @@ function buildView() {
       sortable: false,
     };
   }
+
+  if (view.kind === "updates") return updatesView(query);
 
   if (view.kind === "missing") {
     const models = missingModels().filter((m) => matches(m, query))
@@ -342,6 +345,128 @@ function linkedHead(group) {
     </div>`;
 }
 
+// --- newer versions ---------------------------------------------------------------------------
+
+function updatesView(query) {
+  const groups = updateGroups();
+  const needle = query.toLowerCase();
+  const wanted = (group) => !query || group.models.some((m) => matches(m, query))
+    || [group.record.update?.name, ...(group.others || []).map((o) => o.name)].join("\n").toLowerCase().includes(needle);
+  const sections = [
+    ["updates", "Updates — the same base model, a higher version", updateHead],
+    ["others", "Other new versions — not counted as updates", otherHead],
+    ["gone", "Gone from the site — the copy here may be the last one", reasonHead],
+    ["failed", "Could not be checked", reasonHead],
+  ];
+  const rows = [];
+  for (const [name, title, head] of sections) {
+    const shown = groups[name].filter(wanted);
+    if (!shown.length) continue;
+    rows.push({ key: null, html: `<div class="group-head">${esc(title)}</div>` });
+    for (const group of shown) {
+      rows.push({ key: null, html: head(group) });
+      for (const m of group.models) rows.push({ key: `m${m.id}`, html: modelRow(m, { where: true }) });
+    }
+  }
+  const present = [...state.models.values()].filter((m) => m.state === "present");
+  const checkable = present.filter((m) => m.checkable);
+  const checked = Math.max(0, ...checkable.map((m) => m.update?.checked_at || 0));
+  // A check that could not be made this time leaves what the last one found in place.
+  const unanswered = checkable.filter((m) => m.update?.failed && !(m.update.checked_at > m.update.failed.at));
+  const running = state.updateCheck?.running;
+  // What Download all can fetch: a version that is sold only once it is known to be bought.
+  const fetchable = groups.updates.filter((g) => g.record.update?.id && g.record.update?.file?.id
+    && !refused(g.record.update.access));
+  return {
+    title: "Updates",
+    meta: [
+      plural(groups.updates.length, "update"),
+      `${checkable.length} of ${present.length} models can be checked`,
+      running ? "checking…" : checked ? `checked ${fmtAgo(checked)}` : "not checked yet",
+      unanswered.length ? `<span class="warn" title="${esc(unanswered.slice(0, 10).map((m) => `${m.filename}: ${m.update.failed.error}`).join("\n"))}">${unanswered.length} could not be checked this time</span>` : "",
+    ].filter(Boolean).join(" · "),
+    help: "A newer version counts as an update when it is for the same base model and its name carries a higher version number than the one here — v1.0, then v2.0. The other new versions on a model's page — for another base model, another character of a collection, a variant published beside it — are listed under it, and not counted.",
+    tools: `${running
+      ? `<button data-tool="stop-updates">${icon("stop")}${state.updateCheck.stopping ? "Stopping…" : "Stop"}</button>`
+      : `<button data-tool="check-updates" title="Ask Civitai and HuggingFace about every model that came from them">${icon("refresh")}Check now</button>`}
+      ${fetchable.length ? `<button data-tool="download-updates" class="primary" title="Each into the folder of the version it updates">${icon("download")}Download all…</button>` : ""}`,
+    rows,
+    empty: query ? "No update matches."
+      : running ? "Asking Civitai and HuggingFace…"
+        : !checkable.length ? "Nothing in the library came from Civitai or HuggingFace, so there is nothing to ask about. A model from somewhere else can be identified first, in Unidentified."
+          : checked ? "Everything that can be checked is up to date."
+            : "Not checked yet. Check now asks Civitai and HuggingFace about every model that came from them.",
+    sortable: false,
+  };
+}
+
+// The head of one update: the version it goes to, from the versions here, and what can be done.
+function updateHead(group) {
+  const pick = group.record.update || {};
+  const title = groupTitle(group);
+  const from = [...new Set(group.models.map((m) => m.version_name).filter(Boolean))].join(", ");
+  const when = pick.published_at ? fmtDate(Date.parse(pick.published_at) / 1000) : "";
+  const count = group.record.count || 0;
+  const facts = [pick.base_model, when, count > 1 ? `${count} newer` : "",
+    group.models.length > 1 ? `${group.models.length} files here` : ""].filter(Boolean).join(" · ");
+  const file = pick.file;
+  const hint = file ? `${file.name || ""}${file.size ? ` · ${fmtBytes(file.size)}` : ""}${file.exact ? "" : " — the version's main file"}` : "";
+  return `
+    <div class="dup-head flat">
+      <div class="dup-line">
+        <span class="dup-title" title="${esc(title)}">${esc(title)}</span>
+        <span class="update-step">${from ? `${esc(from)} → ` : ""}<b>${esc(pick.name || "")}</b></span>
+      </div>
+      <div class="dup-line wraps">
+        <span class="dup-meta shrink">${accessChip(pick.access)}${esc(facts)}</span>
+        <span class="dup-actions">
+          ${pick.id && file?.id ? `<button class="mini primary" data-upd="download" data-group="${esc(group.key)}" title="${esc(hint)}">${icon("download")}Download…</button>` : ""}
+          <button class="mini" data-upd="skip" data-group="${esc(group.key)}" title="Skip this version: it is not counted, until a version newer than it comes out">${icon("eye-off")}Skip</button>
+          ${pick.page ? `<a class="button mini" href="${esc(pick.page)}" target="_blank" rel="noopener noreferrer">${icon("external")}Page</a>` : ""}
+        </span>
+      </div>
+    </div>`;
+}
+
+// A model page with new versions that update nothing here, and a version skipped.
+function otherHead(group) {
+  const title = groupTitle(group);
+  const base = group.models[0]?.base_model;
+  const names = group.others.map((o) => {
+    const notes = [o.base_model && o.base_model !== base ? o.base_model : "", paidNow(o.access) ? (o.access.permanent ? "paid" : "early access") : ""];
+    return `${o.name}${notes.some(Boolean) ? ` (${notes.filter(Boolean).join(", ")})` : ""}`;
+  });
+  const extra = Math.max(0, names.length - 3) + (group.more || 0);
+  const line = [
+    group.skipped ? `${group.skipped.name || "the newer version"} skipped` : "",
+    names.length ? `new on its page: ${names.slice(0, 3).join(", ")}${extra ? ` and ${extra} more` : ""}` : "",
+  ].filter(Boolean).join(" · ");
+  const page = group.record.page;
+  return `
+    <div class="dup-head flat">
+      <div class="dup-line"><span class="dup-title" title="${esc(title)}">${esc(title)}</span></div>
+      <div class="dup-line wraps">
+        <span class="dup-meta shrink" title="${esc(names.join(", "))}">${esc(line)}</span>
+        <span class="dup-actions">
+          ${group.skipped ? `<button class="mini" data-upd="unskip" data-group="${esc(group.key)}" title="Count the skipped version as an update again">${icon("eye")}Count it again</button>` : ""}
+          ${page ? `<a class="button mini" href="${esc(page)}" target="_blank" rel="noopener noreferrer">${icon("external")}Page</a>` : ""}
+        </span>
+      </div>
+    </div>`;
+}
+
+// Gone, or not answered: the files it is true of, under what was said.
+function reasonHead(group) {
+  const reason = group.record.error || "no answer";
+  return `
+    <div class="dup-head flat">
+      <div class="dup-line">
+        <span class="dup-title" title="${esc(reason)}">${esc(reason[0].toUpperCase() + reason.slice(1))}</span>
+        <span class="dup-meta">${plural(group.models.length, "file")}</span>
+      </div>
+    </div>`;
+}
+
 function keepToggle({ group, chosen }, id) {
   if (chosen) {
     const why = group.keep === id && group.keep_why ? ` — ${group.keep_why}` : "";
@@ -358,7 +483,7 @@ function modelRow(model, { where = false, base = "", keep = null } = {}) {
     : folderLabel(model.root, model.relative);
   const inner = base && model.relative.startsWith(`${base}/`) ? model.relative.slice(base.length + 1) : model.relative;
   const marks = [
-    model.update ? `<span class="mark accent" title="A newer version: ${esc(model.update.version_name || "")}">${icon("update")}</span>` : "",
+    standingOf(model) === "update" ? `<span class="mark accent" title="A newer version: ${esc(model.update.update?.name || "")}${accessLabel(model.update.update?.access) ? ` — ${esc(accessLabel(model.update.update.access))}` : ""}">${icon("update")}</span>` : "",
     model.left_behind ? `<span class="mark warn" title="Files named after it were left in the folder it came from">${icon("back")}</span>` : "",
     model.note ? `<span class="mark note" title="${esc(model.note)}">${icon("note")}</span>` : "",
     model.trigger_words?.length ? `<span class="mark" title="${esc(model.trigger_words.join(", "))}">${icon("tag")}</span>` : "",
@@ -645,6 +770,8 @@ export function modelMenu(models) {
       { label: "Forget…", icon: "x", danger: true, hint: "Del", run: () => act.forgetModels([model.id]) },
     ];
   }
+  const standing = standingOf(model);
+  const pick = model.update?.update;
   return [
     { label: "Show in Explorer", icon: "external", run: () => act.revealModel(model.id) },
     model.previews && { label: "Samples", icon: "image", run: () => openLightbox({ kind: "model", id: model.id }, 0, model.filename) },
@@ -658,7 +785,10 @@ export function modelMenu(models) {
     "-",
     canIdentify(model) && { label: "Identify", icon: "hash", run: () => act.identify([model.id]) },
     model.hash_source === "download" && { label: "Verify the file", icon: "check", run: () => act.verify([model.id]) },
-    (model.provider === "civitai" || model.provider === "huggingface") && { label: "Check for a newer version", icon: "update", run: () => act.checkUpdates([model.id]) },
+    standing === "update" && pick?.id && pick.file?.id && { label: `Download ${pick.name}…`, icon: "download", run: () => act.downloadUpdate([model.id]) },
+    standing === "update" && { label: "Skip this version", icon: "eye-off", run: () => act.skipUpdate([model.id]) },
+    model.update?.skipped && { label: `Count ${model.update.skipped.name || "the skipped version"} again`, icon: "eye", run: () => act.skipUpdate([model.id], false) },
+    model.checkable && { label: "Check for a newer version", icon: "update", run: () => act.checkUpdates([model.id]) },
     "-",
     { label: "Delete from disk…", icon: "trash", danger: true, hint: "Del", run: () => act.deleteModels([model.id]) },
   ];
@@ -710,6 +840,10 @@ export function wireList() {
     if (crumb) { act.go({ kind: "folder", root: state.view.root, relative: crumb.dataset.crumb }); return; }
     const dup = event.target.closest("[data-dup]");
     if (dup) { event.stopPropagation(); act.duplicateCommand(dup.dataset.dup, dup.dataset.group); return; }
+    const upd = event.target.closest("[data-upd]");
+    if (upd) { event.stopPropagation(); act.updateCommand(upd.dataset.upd, upd.dataset.group); return; }
+    // A link to a model's page opens in the browser; it selects nothing on its way.
+    if (event.target.closest("a[href]")) return;
     const keep = event.target.closest("[data-keep]");
     if (keep) { event.stopPropagation(); act.chooseKeeper(keep.dataset.keep, Number(keep.dataset.id)); return; }
     const command = event.target.closest("[data-cmd]");
@@ -799,11 +933,14 @@ async function runTool(tool) {
   if (name === "forget-all") return act.forgetModels(missingModels().map((m) => m.id));
   if (name === "again-all") return act.downloadAllAgain(missingModels().filter((m) => m.source).map((m) => m.id));
   if (name === "identify-all") return act.identify(unidentifiedModels().map((m) => m.id));
+  if (name === "check-updates") return act.checkAllUpdates();
+  if (name === "stop-updates") return act.stopUpdateCheck();
+  if (name === "download-updates") return act.downloadAllUpdates();
   if (name === "folder-menu") {
     const models = modelsIn(view.root, view.relative);
     const present = models.filter((m) => m.state === "present");
     const unknown = present.filter((m) => m.origin === "found" && !m.identified);
-    const known = present.filter((m) => m.provider === "civitai" || m.provider === "huggingface");
+    const known = present.filter((m) => m.checkable);
     menuFrom(tool, [
       { label: "Show in Explorer", icon: "external", run: () => act.revealFolder(view.root, view.relative) },
       { label: "New folder…", icon: "plus", run: () => act.newFolder(view.root, view.relative) },

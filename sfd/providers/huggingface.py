@@ -24,7 +24,7 @@ from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 
-from ..core.errors import AccessDenied, AuthRequired, ResolveError
+from ..core.errors import AccessDenied, AuthRequired, ResolveError, SfdError
 from ..core.types import FileIdentity, RemoteFileInfo, ResolvedTarget
 from .base import (
     Provider,
@@ -331,16 +331,16 @@ def _raise_for_hf_headers(
         )
     if code == "RepoNotFound":
         if authenticated:
-            raise AccessDenied(
+            raise _coded(AccessDenied(
                 f"{ref.repo_id} does not exist, or the token has no access to it"
-            )
-        raise AuthRequired(
+            ), code)
+        raise _coded(AuthRequired(
             f"{ref.repo_id} does not exist or is private — set a token if it is private"
-        )
+        ), code)
     if code == "EntryNotFound":
-        raise AccessDenied(f"{ref.path} is not in {ref.repo_id} at revision {ref.revision}")
+        raise _coded(AccessDenied(f"{ref.path} is not in {ref.repo_id} at revision {ref.revision}"), code)
     if code == "RevisionNotFound":
-        raise AccessDenied(f"{ref.repo_id} has no revision {ref.revision}")
+        raise _coded(AccessDenied(f"{ref.repo_id} has no revision {ref.revision}"), code)
 
     if status == 401:
         raise AuthRequired(
@@ -352,6 +352,13 @@ def _raise_for_hf_headers(
     if status == 404:
         raise AccessDenied(detail or f"{ref.repo_id} not found")
     raise ResolveError(detail or f"HuggingFace returned {status}")
+
+
+def _coded(error: SfdError, code: str) -> SfdError:
+    """The error, carrying the Hub's name for it: the check for newer versions tells a file
+    taken down from a refusal by that, and not by the wording."""
+    error.code = code
+    return error
 
 
 def _next_link(response: httpx.Response) -> str | None:

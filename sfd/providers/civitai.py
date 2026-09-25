@@ -29,6 +29,7 @@ import httpx
 
 from ..core.errors import AccessDenied, AuthRequired, ResolveError
 from ..core.types import FileIdentity, RemoteFileInfo, ResolvedTarget
+from ..library import versions
 from .base import (
     Provider,
     Walk,
@@ -260,6 +261,38 @@ class CivitaiProvider(Provider):
             meta=entry.meta,
         )
 
+    async def owned(
+        self, version_id: int, file_id: int | None, client: httpx.AsyncClient
+    ) -> bool | None:
+        """Whether the account the key belongs to may download this file — whether it has
+        bought it, for a version that is sold.
+
+        The API does not say; the download link does. It is asked without being followed:
+        Civitai either hands out the file's address, or refuses with 403 until the version
+        is bought. Not a byte of the file is fetched. None when there is no key to ask with,
+        or no clear answer.
+        """
+        if not self._token:
+            return None
+        url = f"https://{self.host}/api/download/models/{version_id}"
+        if file_id is not None:
+            url += f"?fileId={file_id}"
+        try:
+            response = await client.head(url, headers=self._auth, follow_redirects=False)
+            status = response.status_code
+            if status == 405:
+                async with client.stream(
+                    "GET", url, headers=self._auth, follow_redirects=False
+                ) as streamed:
+                    status = streamed.status_code
+        except httpx.HTTPError:
+            return None
+        if status < 400:
+            return True
+        if status == 403:
+            return False
+        return None
+
     # --- catalogue queries -----------------------------------------------
 
     async def version_info(self, version_id: int, client: httpx.AsyncClient) -> dict[str, Any]:
@@ -399,6 +432,9 @@ def _describe_files(version: dict[str, Any]) -> list[CivitaiFile]:
                     "precision": metadata.get("fp"),
                     "format": metadata.get("format"),
                     "quantisation": metadata.get("size"),
+                    # Sold, or in early access: said before the download is queued, not
+                    # learnt from its refusal an hour later.
+                    "access": versions.access(version),
                 },
             )
         )

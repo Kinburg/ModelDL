@@ -18,6 +18,8 @@ export const state = {
   tasks: new Map(),
   jobs: { current: null, queued: [] },
   moving: null,
+  // The check for newer versions under way — how far it has got — or null.
+  updateCheck: null,
   // Which list the middle pane shows. `folder` carries a root and a place inside it.
   view: { kind: "folder", root: 0, relative: "" },
   search: "",
@@ -225,6 +227,74 @@ export const activeTasks = () => [...state.tasks.values()].filter((t) => !t.arch
 export const missingModels = () => [...state.models.values()].filter((m) => m.state === "missing");
 export const unidentifiedModels = () => [...state.models.values()].filter(
   (m) => m.origin === "found" && !m.identified && m.state === "present");
+
+// --- newer versions -------------------------------------------------------------------------
+
+// Every Civitai version the library has on disk. A newer version stops being one to fetch
+// the moment it lands here, long before anything is asked of Civitai again. Worked out once
+// per redraw however many rows ask — kept until the task drawing them is over.
+let hereNow = null;
+export function versionsHere() {
+  if (hereNow) return hereNow;
+  hereNow = new Set();
+  for (const m of state.models.values()) if (m.state === "present" && m.version_id) hereNow.add(m.version_id);
+  queueMicrotask(() => { hereNow = null; });
+  return hereNow;
+}
+
+// Where a model stands as the last check left it, and as the library is now: "update",
+// "other", "gone", "error" — or null for nothing to say.
+export function standingOf(model, here = versionsHere()) {
+  const record = model.update;
+  if (!record || model.state !== "present") return null;
+  if (record.status === "update") return here.has(record.update?.id) ? null : "update";
+  if (record.status === "other") {
+    return record.skipped || (record.others || []).some((o) => !here.has(o.id)) ? "other" : null;
+  }
+  return record.status === "gone" || record.status === "error" ? record.status : null;
+}
+
+// The Updates view, worked out from the models: updates by the version they update to, the
+// other new versions by the model's page, the gone and the unanswered by what was said.
+export function updateGroups() {
+  const here = versionsHere();
+  const sections = { update: new Map(), other: new Map(), gone: new Map(), error: new Map() };
+  for (const model of state.models.values()) {
+    const standing = standingOf(model, here);
+    if (!standing) continue;
+    const record = model.update;
+    const key = standing === "update" ? record.group
+      : standing === "other" ? record.family
+        : `${standing}:${record.error || ""}`;
+    const groups = sections[standing];
+    if (!groups.has(key)) groups.set(key, { key, kind: standing, models: [], record });
+    groups.get(key).models.push(model);
+  }
+  for (const group of sections.other.values()) {
+    const seen = new Map();
+    for (const model of group.models) {
+      for (const other of model.update.others || []) if (!here.has(other.id)) seen.set(other.id, other);
+    }
+    group.others = [...seen.values()];
+    // A record keeps the first few names of a long collection and counts the rest.
+    const counted = Math.max(0, ...group.models.map((m) => m.update.others_count || 0));
+    group.more = Math.max(0, counted - group.others.length);
+    group.skipped = group.models.map((m) => m.update.skipped).find(Boolean) || null;
+  }
+  const byName = (a, b) => groupTitle(a).localeCompare(groupTitle(b), undefined, { sensitivity: "base" });
+  const newest = (g) => Date.parse(g.record.update?.published_at || "") || 0;
+  return {
+    updates: [...sections.update.values()].sort((a, b) => newest(b) - newest(a) || byName(a, b)),
+    others: [...sections.other.values()].sort(byName),
+    gone: [...sections.gone.values()].sort(byName),
+    failed: [...sections.error.values()].sort(byName),
+  };
+}
+
+export function groupTitle(group) {
+  const model = group.models[0];
+  return (model && (model.title || model.filename)) || "";
+}
 
 export function selectedModels() {
   return [...state.selection].filter((k) => k[0] === "m")

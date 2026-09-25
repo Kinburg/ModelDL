@@ -353,7 +353,7 @@ A link to a file that is still in the library is not queued again; the page says
 already is. A file that was deleted, or went missing, is — that is what pasting its link
 again is for.
 
-### Duplicates, leftovers and newer versions
+### Duplicates and leftovers
 
 *Duplicates* lists the same file kept in more than one place. A size shared by several files
 is only a reason to look closer: every LoRA trained at one rank for one architecture comes
@@ -403,11 +403,59 @@ since forgetting it is where that is offered; a record whose model is somewhere 
 library has lost track of it rather than outlived it, and is left alone. Everything else is
 deleted from there, with the list in front of you first.
 
-*Check for a newer version* asks each model's service. Civitai lists a model's versions
-newest first, so anything ahead of this one is newer, and *Download it* queues the new
-version's primary file rather than every quantisation it carries. On the Hub a file keeps its
-name when it changes, so the question there is whether the same path on the same branch now
-hashes differently.
+### Newer versions
+
+*Updates*, under the history, lists what has come out since the models here were downloaded.
+Once each time the app starts — after its window is up and the folders have been read, with
+the progress in the status bar and a *Stop* beside it — Civitai and HuggingFace are asked
+about every model that came from them. It is the one question the library puts to a service
+without a button being pressed, so it is a setting: turn off **Check for newer versions on
+start** and only *Check now* asks. On a library with 136 such models the whole check is about
+125 requests and ten seconds. A check that cannot be made — no network, a service having a bad
+minute — leaves what the last one found where it was. Only what is new since the last check is
+announced, once; the badge on *Updates* counts the rest.
+
+What counts as newer is the hard part. A Civitai model is a page of versions, newest first,
+and "further up the page" is not "a newer version of mine": on one real library that rule
+called 22 of 96 files out of date, and 7 were. A collection is a page of versions too — Bob's
+Bobs is Penelope, Dianda, Kay, then Erica, every version another character. The same LoRA is
+trained again for another base model, and whoever runs Krea 2 cannot update to its Qwen 2.1
+version. A checkpoint publishes Base and Turbo in the same minute. And v2, downloaded last
+week, is sitting beside v1. So an update is a version for the same base model whose name
+carries a higher version number — `v1.0` then `v2.0`, `V1` then `V3` — than any version of
+the model already here. On that library the rule kept exactly the seven and none of the
+fifteen. The other new versions of a page are listed too, under *Other new versions*, and not
+counted. A version whose name carries no number is never taken for an update, which is the
+right way to be wrong: a quiet line that could have been a badge, not a badge that should have
+been nothing.
+
+Each update names the version it goes to and, of that version's files, the counterpart of the
+one here — bf16 for bf16, int8 for int8; the version's main file only when it has none.
+*Download…* asks where it goes, like any download, the folder of the old version first;
+*Download all…* asks once and puts each beside the version it updates. The old version stays
+where it is: the new one is another model, and whether the old one goes is a decision for
+after trying it. The moment the new version is in the library, the old one stops being out of
+date. *Skip this version* stops one being counted — the v3 that was tried and did not please —
+until a version higher than it comes out, and *Count it again* takes that back.
+
+Some versions are sold. Civitai says so for each version — sold for good, or in early access
+until a date, after which it is free like any other — and an update like that is counted all
+the same, marked *Paid* or *Early access · free from* its date: whether to buy it is a choice,
+and *Skip* is there for the other answer. Early access that has ended is free from that day,
+whatever the last check said. Whether it has been bought is not in Civitai's API; the
+download link answers it, asked with the API key without being followed — Civitai hands out
+the file's address, or refuses until the version is bought — so a version that is sold costs
+the check one more request, and one that is not costs none. *Download all…* fetches a paid
+version only once it is known to be bought; without a key nothing is known, and it says so.
+
+On the Hub a file keeps its name when it changes, so the question there is whether the same
+path on the same branch now hashes differently. Such a file is listed with a link to its page
+and not downloaded from here: the new file would take the old one's name, and replacing a
+model is not something to do as a side effect of a button.
+
+*Gone from the site* is what the check learns in passing: a model taken off Civitai, a version
+unpublished, a file removed from its repository. The copy here may be the last one there is,
+which is worth knowing before deleting it.
 
 ### Changing a model
 
@@ -486,6 +534,19 @@ transformers model is a folder that only works whole; a repository of several �
 quantisations, a pack of files for different nodes — ticks nothing, because which of them is
 wanted is the question. A file already in the library is shown where it is, unticked. Twenty
 quantisations of one model are one kind of file, so one header is read for all of them.
+
+A Civitai version that is sold, or in early access, says so in the same dialog, before it is
+queued rather than in the error it would fail with: *Paid*, or *Early access* with the day it
+turns free, and whether the account of your API key has bought it.
+
+A download does not take the place of a file known to be another one. When the name a file
+would land under is taken — by a file of another size, another hash or another of Civitai's
+files, or by another download on its way to it — the file takes its version before the
+extension instead: `style.v3.safetensors`, the way Civitai's own variants of a file are told
+apart. Some uploads name every version alike, and a new version filed beside the old one would
+otherwise take its place. A file of the same name and size that nothing more is known about is
+left to the transfer, which hashes it before fetching a byte and keeps it if it is the very
+file asked for.
 
 **Smart download placement**, off by default, files each download on its own by what it is
 instead, and asks only when that is uncertain: such a download arrives as *needs a decision*,

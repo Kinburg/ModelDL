@@ -3,10 +3,10 @@
 // that each thing is done one way and says the same things when it is done.
 
 import { del, get, post, put } from "./api.js";
-import { baseName, debounce, esc, fmtBytes, kindLabel, plural } from "./util.js";
+import { baseName, debounce, esc, fmtBytes, kindLabel, plural, refused } from "./util.js";
 import { icon } from "./icons.js";
 import {
-  state, invalidate, upsertModel, removeModel, upsertTask, remember, folderLabel,
+  state, invalidate, upsertModel, removeModel, upsertTask, remember, folderLabel, updateGroups,
 } from "./store.js";
 import { toast, toastError } from "./toasts.js";
 import { addDialog, confirmDialog, filesDialog, modal, pickFolder, promptDialog } from "./dialogs.js";
@@ -22,6 +22,7 @@ export async function loadLibrary() {
   state.sep = body.sep || "\\";
   state.syncedAt = body.synced_at;
   state.jobs = body.job || state.jobs;
+  state.updateCheck = body.update_check || null;
   state.models = new Map(body.models.map((m) => [m.id, m]));
   state.details.clear();
   invalidate("tree", "list", "inspector", "status", "header");
@@ -731,34 +732,183 @@ export async function stopJobs() {
   try { await post("/api/jobs/stop"); } catch (error) { toastError(error); }
 }
 
+// --- newer versions ---------------------------------------------------------------------------
+
+// A check asked for by hand says what it found once it is done; its progress, and the Stop,
+// are in the status bar meanwhile.
 export async function checkUpdates(ids) {
-  ids = [].concat(ids).filter((id) => {
-    const m = state.models.get(id);
-    return m && (m.provider === "civitai" || m.provider === "huggingface");
-  });
+  ids = [].concat(ids).filter((id) => state.models.get(id)?.checkable);
   if (!ids.length) {
-    toast("Nothing here came from Civitai or HuggingFace, so there is nothing to check");
+    toast("Nothing here came from Civitai or HuggingFace, so there is nothing to ask about");
     return;
   }
-  const closing = toast(`Checking ${plural(ids.length, "model")} for newer versions…`, { timeout: 0 });
-  try {
-    const result = await post("/api/models/check-updates", { ids });
+  await runCheck(() => post("/api/models/check-updates", { ids }));
+}
+
+export async function checkAllUpdates() {
+  await runCheck(() => post("/api/updates/check"));
+}
+
+async function runCheck(ask) {
+  let result;
+  try { result = await ask(); } catch (error) {
+    // One is under way already — the one the app makes as it starts, say.
+    if (error.status === 409) toast(error.message);
+    else toastError(error);
+    return;
+  }
+  reportCheck(result, { asked: true });
+}
+
+export async function stopUpdateCheck() {
+  try { await post("/api/updates/stop"); } catch (error) { toastError(error); }
+}
+
+// What a check found, said once: to whoever pressed for it, in full — and for the check the
+// app makes as it starts, only when it found something the last one had not.
+export function reportCheck(result, { asked = false } = {}) {
+  if (!result) return;
+  const show = [{ label: "Show", run: () => go({ kind: "updates" }) }];
+  if (!asked) {
+    if (result.new) {
+      toast(`${plural(result.new, "newer version")} of models you have`, { level: "ok", actions: show });
+    }
+    return;
+  }
+  const found = [];
+  if (result.updates) {
+    found.push(plural(result.updates, "update") + (result.new && result.new < result.updates ? `, ${result.new} of them new` : ""));
+  }
+  if (result.gone) found.push(`${plural(result.gone, "model")} gone from the site`);
+  const said = result.stopped ? "Stopped" : `Checked ${plural(result.checked, "model")}`;
+  toast(found.length ? `${said} — ${found.join(" · ")}` : `${said} — nothing newer`, {
+    level: result.updates ? "ok" : "info",
+    actions: found.length ? show : [],
+  });
+  if (result.failed) {
+    toast(`${plural(result.failed, "check")} could not be made — the Updates view says why`, { level: "error" });
+  }
+}
+
+function updateGroup(key) {
+  const groups = updateGroups();
+  return [...groups.updates, ...groups.others, ...groups.gone, ...groups.failed]
+    .find((group) => group.key === key) || null;
+}
+
+// The buttons on the head of a group in the Updates view: what they do is done to every file
+// of the library the group is about.
+export async function updateCommand(what, key) {
+  const group = updateGroup(key);
+  if (!group) return;
+  const ids = group.models.map((m) => m.id);
+  if (what === "download") await downloadUpdate(ids);
+  if (what === "skip") await skipUpdate(ids);
+  if (what === "unskip") await skipUpdate(ids, false);
+}
+
+// A newer version is asked about like any download — where it goes, the folder of the version
+// it updates first. With smart placement it goes straight into that folder.
+export async function downloadUpdate(ids) {
+  ids = [].concat(ids);
+  const pick = ids.map((id) => state.models.get(id)?.update?.update).find(Boolean);
+  if (!pick) return;
+  if (!pick.id || !pick.file?.id) {
+    // A file on the Hub changes under its own name: fetching it here would replace the one
+    // that is here, so it is left to its page.
+    if (pick.page) window.open(pick.page, "_blank", "noopener");
+    return;
+  }
+  if (state.settings.smart_placement || !state.settings.library_root) {
+    await queueUpdates(ids);
+    return;
+  }
+  const closing = toast("Resolving the new version…", { timeout: 0 });
+  let resolved;
+  try { resolved = await post("/api/updates/resolve", { ids }); } catch (error) {
     closing();
-    toast(result.updates
-      ? `${plural(result.updates, "model")} ${result.updates === 1 ? "has" : "have"} a newer version`
-      : `Checked ${plural(result.checked, "model")} — nothing newer`,
-    { level: result.updates ? "ok" : "info" });
-    if (result.failed) toast(`${plural(result.failed, "check")} could not be made`, { level: "error" });
+    toastError(error);
+    return;
+  }
+  closing();
+  await placeResolved(resolved);
+}
+
+// Every update at once, each into the folder of the version it updates — asked once, for all.
+export async function downloadAllUpdates() {
+  const groups = updateGroups().updates;
+  const civitai = groups.filter((g) => g.record.update?.id && g.record.update?.file?.id);
+  const hub = groups.length - civitai.length;
+  // A version that is sold is fetched with the rest only once it is known to be bought: the
+  // others would only be refused, one failed download each.
+  const fetchable = civitai.filter((g) => !refused(g.record.update.access));
+  const sold = civitai.length - fetchable.length;
+  const unbought = civitai.filter((g) => refused(g.record.update.access) && g.record.update.access.owned === false).length;
+  const unknown = sold - unbought;
+  const leftOut = [
+    unbought ? `${plural(unbought, "version")} paid on Civitai and not bought with your API key` : "",
+    unknown ? `${plural(unknown, "version")} paid on Civitai — whether ${unknown === 1 ? "it is" : "they are"} bought is told only with a Civitai API key, in Settings` : "",
+  ].filter(Boolean).join("; ");
+  if (!fetchable.length) {
+    toast(sold ? `Nothing to download: ${leftOut}. Once bought, Download each on its own`
+      : hub ? "These changed on HuggingFace under their own names — open each one's page to fetch it"
+        : "There is no update to download");
+    return;
+  }
+  const files = new Map();
+  for (const group of fetchable) {
+    for (const model of group.models) {
+      const pick = model.update?.update;
+      if (pick?.file?.id) files.set(`${pick.id}:${pick.file.id}`, pick.file);
+    }
+  }
+  const total = [...files.values()].reduce((sum, f) => sum + (f.size || 0), 0);
+  const roots = [...new Set(fetchable.flatMap((g) => g.models.map((m) => m.root))
+    .filter((r) => r !== null && r !== undefined))].map((index) => state.roots[index]).filter(Boolean);
+  const free = roots.filter((r) => r.free != null).map((r) => `${fmtBytes(r.free)} free on ${esc(r.name)}`).join(", ");
+  const room = Math.max(...roots.map((r) => r.free ?? Infinity), 0);
+  const ok = await confirmDialog({
+    title: fetchable.length === 1 ? "Download the newer version" : `Download ${fetchable.length} newer versions`,
+    message: `${plural(files.size, "file")}, each into the folder of the version it updates — which stays where it is.`
+      + ` <b>${fmtBytes(total)}</b> to download${free ? ` · ${free}` : ""}.`
+      + (sold ? `<div class="small warn" style="margin-top:8px">Left out: ${esc(leftOut)}. Once bought, Download ${sold === 1 ? "it" : "each"} on its own.</div>` : "")
+      + (hub ? `<div class="small muted" style="margin-top:8px">${plural(hub, "file")} changed on HuggingFace under ${hub === 1 ? "its" : "their"} own name: open ${hub === 1 ? "its" : "each one's"} page to fetch it.</div>` : "")
+      + (total > room ? `<div class="warn small" style="margin-top:8px">More than there is room for: a download that does not fit waits with an error instead of filling the disk.</div>` : ""),
+    confirm: "Download",
+  });
+  if (!ok) return;
+  await queueUpdates(fetchable.flatMap((g) => g.models.map((m) => m.id)));
+}
+
+async function queueUpdates(ids) {
+  const closing = toast("Resolving the new versions…", { timeout: 0 });
+  try {
+    const { tasks, failed } = await post("/api/updates/download", { ids });
+    closing();
+    tasks.forEach(upsertTask);
+    toast(tasks.length ? `Queued ${plural(tasks.length, "newer version")}` : "Nothing was queued", {
+      level: tasks.length ? "ok" : "info",
+      actions: tasks.length ? [{ label: "Show", run: () => go({ kind: "downloads" }) }] : [],
+    });
+    if (failed.length) {
+      toast(failed.map((f) => `${state.models.get(f.id)?.filename || f.id}: ${f.error}`).join("; "), { level: "error" });
+    }
+    invalidate("tree", "list", "status");
   } catch (error) { closing(); toastError(error); }
 }
 
-export async function downloadUpdate(model) {
-  const update = model.update || {};
-  if (!update.version_id) { window.open(update.page, "_blank", "noopener"); return; }
-  const host = (model.host || "civitai.com").replace(/^www\./, "");
-  // The primary file of the new version: the same one a download button on its page
-  // would give, rather than every quantisation the version carries.
-  await addSource(`https://${host}/api/download/models/${update.version_id}`);
+// Skipping a version stops it being counted — until one higher than it comes out.
+export async function skipUpdate(ids, skip = true) {
+  ids = [].concat(ids);
+  const name = ids.map((id) => state.models.get(id)?.update?.update?.name).find(Boolean) || "the newer version";
+  try {
+    await post("/api/models/skip-update", { ids, skip });
+    if (skip) {
+      toast(`Skipped ${name} — it is counted again if a newer one comes out`, {
+        actions: [{ label: "Undo", run: () => skipUpdate(ids, false) }],
+      });
+    }
+  } catch (error) { toastError(error); }
 }
 
 export function modelLabel(model) {

@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlsplit
 
-from ..library import previews, sidecar
+from ..library import previews, sidecar, versions
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -370,6 +370,17 @@ class Model:
         return []
 
     @property
+    def checkable(self) -> bool:
+        """Whether its service can be asked about a newer version: a Civitai model that
+        knows its version, or a file of a Hub repository."""
+        if self.provider == "civitai":
+            return bool(self.meta.get("model_id") and self.meta.get("version_id"))
+        if self.provider == "huggingface":
+            ref = (self.identity or {}).get("ref") or {}
+            return bool(ref.get("repo_id") and ref.get("path"))
+        return False
+
+    @property
     def preview_count(self) -> int:
         remote = len(previews.entries(self.meta))
         if remote:
@@ -417,7 +428,11 @@ class Model:
             "last_seen": self.last_seen,
             "missing_since": self.missing_since,
             "lookup": self.lookup.get("result"),
-            "update": self.updates if self.updates.get("available") else None,
+            # Which Civitai version this is: an update to it stops being one the moment the
+            # page sees that version land in the library, before anyone asks again.
+            "version_id": self.meta.get("version_id") if self.provider == "civitai" else None,
+            "checkable": self.checkable,
+            "update": versions.normalise(self.updates),
         }
 
 

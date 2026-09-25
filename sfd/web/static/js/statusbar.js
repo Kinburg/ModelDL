@@ -38,6 +38,15 @@ function workSummary() {
     bits.push(`<span class="status-item busy">${icon(state.moving.verb ? "copy" : "move")}${esc(state.moving.verb || "Moving")}… ${fmtBytes(state.moving.copied)} of ${fmtBytes(state.moving.total)} (${share}%)
       <button class="mini danger" data-status="stop-move">${state.moving.stopping ? "stopping…" : "Stop"}</button></span>`);
   }
+  const check = state.updateCheck;
+  if (check && check.running) {
+    const share = check.total ? Math.round((check.done / check.total) * 100) : 0;
+    const found = check.found ? ` · ${plural(check.found, "update")}` : "";
+    bits.push(`<span class="status-item busy">
+      <button class="status-item link" data-status="updates" title="Open the Updates view">${icon("update")}Checking for newer versions · ${check.done} of ${check.total}${found}</button>
+      <span class="track mini" aria-hidden="true"><span class="fill" style="width:${share}%"></span></span>
+      <button class="mini" data-status="stop-updates">${check.stopping ? "stopping…" : "Stop"}</button></span>`);
+  }
   const job = state.jobs.current;
   if (job) {
     const verb = { identify: "Identifying", verify: "Verifying", hash: "Hashing" }[job.kind] || "Hashing";
@@ -77,6 +86,8 @@ export function wireStatus() {
     }
     if (what === "rescan") act.rescan({ quiet: false });
     if (what === "stop-jobs") act.stopJobs();
+    if (what === "updates") act.go({ kind: "updates" });
+    if (what === "stop-updates" && state.updateCheck?.running && !state.updateCheck.stopping) act.stopUpdateCheck();
     if (what === "stop-move" && state.moving && !state.moving.stopping) {
       state.moving.stopping = true;
       renderStatus();

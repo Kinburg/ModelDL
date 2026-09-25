@@ -12,6 +12,11 @@ from __future__ import annotations
 class SfdError(Exception):
     """Base for everything this package raises."""
 
+    # The service's own name for what went wrong, where it gives one — the Hub's
+    # `x-error-code`, say. It tells "not there any more" from "not allowed" without anyone
+    # having to read the message.
+    code: str | None = None
+
 
 class Retryable(SfdError):
     """Transient. Re-resolve the URL and resume from the current offset."""

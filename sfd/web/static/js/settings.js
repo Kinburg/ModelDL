@@ -11,7 +11,7 @@ import * as act from "./actions.js";
 const FIELDS = ["profile", "connections", "concurrent_downloads", "disk_kind", "sidecar_dir",
   "queue_position", "max_speed_kb", "download_dir", "workflow_dir"];
 const CHECKS = ["group_by_base_model", "smart_placement", "verify_hash", "write_sidecars", "write_compat_files",
-  "write_trigger_txt", "auto_start", "auto_retry", "fetch_previews", "blur_nsfw"];
+  "write_trigger_txt", "auto_start", "auto_retry", "fetch_previews", "blur_nsfw", "check_updates_on_start"];
 
 let dirty = false;
 
@@ -81,6 +81,7 @@ export function renderSettings() {
           ${field("group_by_base_model", "Group by base model", check("group_by_base_model"), "loras/Pony, checkpoints/Flux.1 D — a subfolder per base model")}
           ${field("smart_placement", "Smart download placement", check("smart_placement"), "On: each new download is filed into the folder that suits it, and asks only when that is uncertain. Off: every download asks where it goes, the likeliest folder first")}
           ${field("download_dir", "Downloads folder", browse("download_dir", "downloads"), "Where files go while no library folder is set")}
+          ${field("check_updates_on_start", "Check for newer versions on start", check("check_updates_on_start"), "Once each time the app starts, a moment after its window is up: Civitai and HuggingFace are asked about every model that came from them, with the progress in the status bar. Off: only Check now, in Updates, asks")}
         </div>
         <button data-role="layout">Check folder mapping</button>
         <pre class="small muted" data-role="layout-out" hidden></pre>

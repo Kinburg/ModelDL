@@ -2,7 +2,7 @@
 // and the folder picker. Each returns a promise of the answer, so the code asking reads
 // top to bottom: ask, then act on what was said.
 
-import { esc, fmtBytes, kindLabel, plural } from "./util.js";
+import { esc, fmtBytes, kindLabel, plural, accessChip, paidNow, paidSentence } from "./util.js";
 import { icon, kindIcon } from "./icons.js";
 import { state } from "./store.js";
 
@@ -292,11 +292,14 @@ export function addDialog(resolved) {
       ? `<div class="add-thumb ${cover ? "covered" : ""}" data-role="thumb" title="${cover ? "Marked adult — click to uncover" : ""}">
            <img src="/api/resolve/${encodeURIComponent(resolved.token)}/preview?w=160" alt="" draggable="false"></div>`
       : `<div class="add-thumb empty">${icon(kindIcon(main.category))}</div>`;
+    // Sold, or in early access: all the files of a Civitai version are, or none is.
+    const sold = items.find((item) => paidNow(item.access));
     const chips = [
       main.category && `<span class="chip kind">${esc(kindLabel(main.category))}</span>`,
       main.base_model && `<span class="chip">${esc(main.base_model)}</span>`,
       !several && main.size && `<span class="chip quiet">${esc(fmtBytes(main.size))}</span>`,
       resolved.host && `<span class="chip quiet">${esc(resolved.host)}</span>`,
+      sold && accessChip(sold.access),
     ].filter(Boolean).join("");
     const files = several ? `
       <div class="add-files">
@@ -317,9 +320,10 @@ export function addDialog(resolved) {
           <span>Keep the repository's folders, inside <b class="mono">${esc(resolved.folder_name)}/</b></span></label>` : ""}
       </div>` : "";
     const have = main.have;
-    const already = !several && have
+    const already = (!several && have
       ? `<div class="banner banner-warn"><div class="banner-text">Already in your library, in <b>${esc(have.root !== null && have.root !== undefined ? placeName(have) : have.path)}</b>. Downloading it again makes a second copy.</div></div>`
-      : "";
+      : "")
+      + (sold ? `<div class="banner banner-${sold.access.owned === true ? "info" : "warn"}"><div class="banner-text">${esc(paidSentence(sold.access))}</div></div>` : "");
     const handle = modal({
       title: "Add download",
       wide: true,

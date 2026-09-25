@@ -92,6 +92,11 @@ class Settings:
     # extensions and ComfyUI loader nodes, which paste the contents into the prompt — so it
     # carries the trigger words alone; the link and everything else stay in the JSON record.
     write_trigger_txt: bool = True
+    # Ask Civitai and HuggingFace about every model that came from them, once each time the
+    # app starts, once its window is up. The one thing the library asks a service about
+    # without a button being pressed, and so a switch: off, the Updates view still has
+    # Check now.
+    check_updates_on_start: bool = True
 
     # Layout overrides keyed by category value, for correcting an adopted tree.
     layout_overrides: dict[str, str] = field(default_factory=dict)

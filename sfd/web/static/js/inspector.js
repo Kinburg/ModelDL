@@ -7,11 +7,12 @@
 import { post } from "./api.js";
 import {
   esc, fmtBytes, fmtSpeed, fmtEta, fmtWhen, fmtDate, fmtDuration, fmtAgo, kindLabel, plural,
-  copyText, stemOf, suffixOf, baseName,
+  copyText, stemOf, suffixOf, baseName, accessChip, paidNow, paidSentence,
 } from "./util.js";
 import { icon, kindIcon } from "./icons.js";
 import {
   state, invalidate, onRender, modelsIn, folderLabel, placementOf, activeTasks, selectedModels,
+  standingOf, versionsHere,
 } from "./store.js";
 import { menuFrom } from "./menu.js";
 import { covered, openLightbox, previewSrc, previewsOf, flash } from "./lightbox.js";
@@ -119,6 +120,55 @@ function banner(kind, html, buttons = "") {
 
 // --- a model ------------------------------------------------------------------------------------
 
+const capital = (text) => (text ? text[0].toUpperCase() + text.slice(1) : text);
+
+// What buying a newer version comes to: said before Download is pressed, not learnt from
+// Civitai's refusal afterwards.
+function paidLine(access) {
+  if (!paidNow(access)) return "";
+  return `<div class="paid-line ${access.owned === true ? "ok" : "warn"}">${accessChip(access)}${esc(paidSentence(access))}</div>`;
+}
+const pageLink = (url) => (url
+  ? `<a class="button" href="${esc(url)}" target="_blank" rel="noopener noreferrer">${icon("external")}Open the page</a>` : "");
+
+// What the last check for newer versions said about it.
+function updateBanners(model) {
+  const standing = standingOf(model);
+  const record = model.update || {};
+  const pick = record.update || {};
+  if (standing === "update") {
+    const when = pick.published_at ? `, ${esc(fmtDate(Date.parse(pick.published_at) / 1000))}` : "";
+    const file = pick.file?.name
+      ? `<div class="small muted mono">${esc(pick.file.name)}${pick.file.size ? ` · ${esc(fmtBytes(pick.file.size))}` : ""}</div>` : "";
+    return [banner("accent",
+      pick.id
+        ? `A newer version: <b>${esc(pick.name || "")}</b>${pick.base_model ? ` for ${esc(pick.base_model)}` : ""}${when}${record.count > 1 ? ` (${record.count} newer in all)` : ""}.${file}${paidLine(pick.access)}`
+        : `The file has changed on HuggingFace since it came here — ${esc(pick.name || "a newer commit")}. Fetching it would replace this one, so that is left to its page.`,
+      `${pick.id && pick.file?.id ? `<button data-do="download-update">${icon("download")}Download…</button>` : ""}
+       <button data-do="skip-update" title="Stop counting it — until a version newer than it comes out">${icon("eye-off")}Skip this version</button>
+       ${pageLink(pick.page)}`)];
+  }
+  if (standing === "other") {
+    const here = versionsHere();
+    const others = (record.others || []).filter((o) => !here.has(o.id));
+    const names = others.slice(0, 4).map((o) => `<b>${esc(o.name)}</b>${o.base_model && o.base_model !== model.base_model ? ` for ${esc(o.base_model)}` : ""}${paidNow(o.access) ? ` (${o.access.permanent ? "paid" : "early access"})` : ""}`);
+    const more = Math.max(0, (record.others_count || others.length) - names.length);
+    const text = [
+      record.skipped ? `${esc(record.skipped.name || "The newer version")} is skipped: it is counted again if a newer one comes out.` : "",
+      names.length ? `Newer on its page, but not an update of this one: ${names.join(", ")}${more ? ` and ${more} more` : ""}.` : "",
+    ].filter(Boolean).join(" ");
+    return [banner("quiet", text,
+      `${record.skipped ? `<button data-do="unskip-update">${icon("eye")}Count it again</button>` : ""}${pageLink(record.page)}`)];
+  }
+  if (standing === "gone") {
+    return [banner("info", `${esc(capital(record.error || "gone from its site"))} — the copy here may be the last one.`)];
+  }
+  if (standing === "error") {
+    return [banner("quiet", `Its newer versions could not be asked about: ${esc(record.error || "no answer")}.`)];
+  }
+  return [];
+}
+
 function modelPanel(id) {
   const model = state.models.get(id);
   if (!model) return `<div class="insp-empty">That model is not in the library any more.</div>`;
@@ -176,13 +226,7 @@ function modelPanel(id) {
       `${plural(d.left_behind_files.length, "file")} named after it stayed in the folder it was moved out of:${list}`,
       `<button data-do="bring-back">${icon("back")}Bring ${d.left_behind_files.length === 1 ? "it" : "them"} here</button>`));
   }
-  if (model.update) {
-    const u = model.update;
-    banners.push(banner("accent",
-      `A newer version: <b>${esc(u.version_name || "")}</b>${u.base_model ? ` for ${esc(u.base_model)}` : ""}${u.published_at ? `, ${esc(fmtDate(Date.parse(u.published_at) / 1000))}` : ""}${u.count > 1 ? ` (${u.count} newer in all)` : ""}.`,
-      `${u.version_id ? `<button data-do="download-update">${icon("download")}Download it</button>` : ""}
-       ${u.page ? `<a class="button" href="${esc(u.page)}" target="_blank" rel="noopener noreferrer">${icon("external")}Open the page</a>` : ""}`));
-  }
+  banners.push(...updateBanners(model));
   if (header.folder_says && !missing) {
     banners.push(banner("info",
       `The file itself says <b>${esc(kindLabel(model.category))}</b>, but it is in a folder for ${esc(kindLabel(header.folder_says).toLowerCase())}s — the loader that folder is read by may not open it.`,
@@ -329,7 +373,9 @@ async function wireModel(holder, id) {
     else if (what === "separate") act.separateModels([id]);
     else if (what === "forget") act.forgetModels([id]);
     else if (what === "bring-back") act.bringBack(id);
-    else if (what === "download-update") act.downloadUpdate(model);
+    else if (what === "download-update") act.downloadUpdate([id]);
+    else if (what === "skip-update") act.skipUpdate([id]);
+    else if (what === "unskip-update") act.skipUpdate([id], false);
     else if (what === "more") menuFrom(target, modelMenu([model]));
   };
   const input = holder.querySelector('[data-role="rename"]');
@@ -637,6 +683,7 @@ function viewPanel() {
   }
   const texts = {
     history: "Every download that finished, newest first. A renamed model shows its name now and the one it arrived under; a deleted one can be downloaded again from here.",
+    updates: "Newer versions of the models here, by the version they update to. Download asks where it goes, the folder of the old version first; the old version stays where it is. Skip this version stops one being counted until a newer one comes out.",
     missing: "Models the library remembers that are no longer where it last saw them. Select one to find its file or to forget it.",
     unidentified: "Models that came from somewhere else. What they are is read from the files; identifying one looks it up on Civitai by its hash and on HuggingFace by its name, and fills in the rest.",
     duplicates: "The same file kept in more than one place. In each set, mark the copy to keep — the star — and delete the others once the hashes have confirmed they are the same.",

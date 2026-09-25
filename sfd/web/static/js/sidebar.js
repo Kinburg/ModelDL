@@ -8,7 +8,7 @@ import { esc, fmtBytes, plural } from "./util.js";
 import { icon } from "./icons.js";
 import {
   state, tree, invalidate, remember, onRender, activeTasks, missingModels, unidentifiedModels,
-  nodeKey,
+  nodeKey, updateGroups,
 } from "./store.js";
 import { showMenu } from "./menu.js";
 import {
@@ -18,6 +18,7 @@ import {
 const VIEWS = [
   { kind: "downloads", label: "Downloads", icon: "download" },
   { kind: "history", label: "History", icon: "history" },
+  { kind: "updates", label: "Updates", icon: "update" },
   { kind: "missing", label: "Missing", icon: "alert" },
   { kind: "unidentified", label: "Unidentified", icon: "help" },
   { kind: "duplicates", label: "Duplicates", icon: "layers" },
@@ -31,6 +32,11 @@ function badge(kind) {
     const blocked = tasks.filter((t) => t.state === "blocked").length;
     if (blocked) return `<span class="badge warn" title="${plural(blocked, "download")} need a decision">${open}</span>`;
     return open ? `<span class="badge">${open}</span>` : "";
+  }
+  if (kind === "updates") {
+    // Versions to update to, each counted once however many files here it updates.
+    const count = updateGroups().updates.length;
+    return count ? `<span class="badge" title="${plural(count, "newer version")} to update to">${count}</span>` : "";
   }
   if (kind === "missing") {
     const count = missingModels().length;

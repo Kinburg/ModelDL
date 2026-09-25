@@ -1222,17 +1222,22 @@ async def test_a_newer_version_on_civitai_is_noticed(setup):
     (model,) = database.list_models()
     library._client = civitai(lambda request: httpx.Response(200, json={
         "id": 1, "modelVersions": [
-            {"id": 9, "name": "v2", "baseModel": "Flux.1 D", "publishedAt": "2026-09-01"},
-            {"id": 1, "name": "v1"},
+            {"id": 11, "name": "v3", "baseModel": "Flux.1 D", "publishedAt": "2026-09-02"},
+            {"id": 9, "name": "v2", "baseModel": "Pony", "publishedAt": "2026-09-01",
+             "files": [{"id": 90, "name": "style_v2.safetensors", "primary": True, "sizeKB": 1.0}]},
+            {"id": 1, "name": "v1", "baseModel": "Pony"},
         ],
     }))
 
     result = await library.check_updates([model.id])
 
-    assert result == {"checked": 1, "updates": 1, "failed": 0}
-    update = database.get_model(model.id).updates
-    assert update["available"] and update["version_name"] == "v2"
-    assert "modelVersionId=9" in update["page"]
+    assert result == {"checked": 1, "updates": 1, "new": 1, "gone": 0, "failed": 0, "stopped": False}
+    record = database.get_model(model.id).updates
+    assert record["status"] == "update"
+    assert record["update"]["name"] == "v2", "v3 is for another base model"
+    assert record["update"]["file"]["id"] == 90
+    assert "modelVersionId=9" in record["update"]["page"]
+    assert [o["name"] for o in record["others"]] == ["v3"]
     await library.stop()
 
 

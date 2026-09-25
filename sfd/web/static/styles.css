@@ -148,6 +148,9 @@ body.dragging-models .tree-row { transition: background .1s; }
 .list-head {
   display: flex; align-items: center; gap: 10px; padding: 8px 14px; min-height: 46px;
   border-bottom: 1px solid var(--line); flex-wrap: wrap;
+  /* Wrapped onto a second line in a narrow pane, it keeps its height: the list below is
+     what gives way, rather than the buttons being drawn over the help. */
+  flex: none;
 }
 .list-title { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 2px; flex-wrap: wrap; }
 .crumb { background: none; border: none; padding: 1px 4px; font-weight: 600; color: var(--text); }
@@ -158,7 +161,7 @@ body.dragging-models .tree-row { transition: background .1s; }
 .list-tools { display: flex; align-items: center; gap: 6px; }
 .list-tools select { padding: 4px 8px; font-size: 12.5px; }
 .list-tools button { padding: 4px 10px; font-size: 12.5px; }
-.list-help { padding: 8px 14px; color: var(--muted); font-size: 12.5px; border-bottom: 1px solid var(--line-soft); }
+.list-help { padding: 8px 14px; color: var(--muted); font-size: 12.5px; border-bottom: 1px solid var(--line-soft); flex: none; }
 .list { flex: 1; overflow-y: auto; outline: none; padding: 4px 0 24px; }
 .list-empty { color: var(--muted); text-align: center; padding: 50px 30px; }
 .group-head {
@@ -170,11 +173,29 @@ body.dragging-models .tree-row { transition: background .1s; }
   border-top: 1px solid var(--line-soft);
 }
 .dup-head:first-child { border-top: none; }
+/* Heads of groups a file or two long, of different heights: stuck to the top, a short one
+   would show the bottom of a taller one under it. */
+.dup-head.flat { position: static; }
 .dup-line { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .dup-line + .dup-line { margin-top: 3px; }
 .dup-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .dup-meta { color: var(--muted); font-size: 12px; white-space: nowrap; }
 .dup-line button { flex: none; }
+.dup-meta.shrink { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.dup-meta .chip { margin-right: 6px; }
+.paid-line { margin-top: 6px; font-size: 12.5px; }
+.paid-line .chip { margin-right: 6px; }
+/* A narrow list puts the buttons of a head under its facts rather than over them. */
+.dup-line.wraps { flex-wrap: wrap; row-gap: 4px; }
+.dup-line.wraps .dup-meta.shrink { flex: 1 1 160px; }
+.dup-actions { display: inline-flex; gap: 6px; margin-left: auto; flex: none; }
+/* The step an update is: the versions here, then the one it goes to. */
+.update-step { color: var(--muted); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 0 1 auto; max-width: 60%; }
+/* The version it goes to matters more than the rest of the model's name: the title gives
+   way first. */
+.dup-line .dup-title { flex: 0 1000 auto; }
+.update-step b { color: var(--accent); font-weight: 600; }
+a.button.mini { padding: 1px 8px; font-size: 12px; }
 .dup-caution { display: flex; gap: 6px; align-items: flex-start; margin-top: 5px; color: var(--warn); font-size: 12px; }
 .dup-caution .i { width: 14px; height: 14px; margin-top: 1px; }
 .keep {
@@ -229,6 +250,9 @@ body.dragging-models .tree-row { transition: background .1s; }
 .link-name { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
 .link-name .mono { min-width: 0; }
 .chip.quiet { background: none; border: 1px solid var(--line-soft); }
+/* Sold on Civitai: amber until it is bought, green once it is. */
+.chip.paid { color: var(--warn); background: var(--warn-bg); }
+.chip.paid.owned { color: var(--ok); background: var(--ok-bg); }
 .chips { display: flex; flex-wrap: wrap; gap: 5px; }
 .mark { display: inline-flex; color: var(--muted); flex: none; }
 .mark .i { width: 14px; height: 14px; }
@@ -246,6 +270,8 @@ body.dragging-models .tree-row { transition: background .1s; }
 .state.muted { color: var(--faint); }
 .track { height: 5px; background: var(--bar); border-radius: 4px; overflow: hidden; margin: 5px 0 2px; }
 .track.big { height: 7px; margin: 10px 0 5px; }
+.track.mini { display: inline-block; width: 90px; height: 4px; margin: 0; vertical-align: middle; }
+.track.mini .fill { display: block; }
 .fill { height: 100%; background: var(--accent); width: 0; transition: width .3s ease; }
 .fill.paused, .fill.failed, .fill.blocked { background: var(--faint); }
 .drag-label {

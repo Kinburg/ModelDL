@@ -28,6 +28,7 @@ function renderHeader() {
     folder: "Search the library",
     downloads: "Filter the downloads",
     history: "Search the history",
+    updates: "Filter the updates",
     missing: "Filter the missing",
     unidentified: "Filter these",
     duplicates: "Search the library",
@@ -302,6 +303,16 @@ function onEvent(data) {
     case "jobs":
       state.jobs = { current: data.current, queued: data.queued || [] };
       invalidate("status");
+      return;
+    case "update_check":
+      // Driven by the stream, like a move: the check outlives a reload, and a second window
+      // shows it as well.
+      state.updateCheck = data.running ? data : null;
+      invalidate("status", "tree");
+      if (state.view.kind === "updates") invalidate("list");
+      // The check the app makes as it starts has nobody waiting for its answer, so the
+      // stream says it — and only when it found something new.
+      if (!data.running && data.startup) act.reportCheck(data.result);
       return;
     case "toast": {
       const models = data.models || [];

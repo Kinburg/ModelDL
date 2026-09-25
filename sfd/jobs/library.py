@@ -20,8 +20,9 @@ front. The walk is where the three situations the queue could never express are 
 What cannot be rebuilt by a walk is the note, and it is not kept here: it lives in the
 model's `.json` record exactly as it always has, and this table carries a copy.
 
-Nothing in this module talks to the network unless a person pressed something: identifying
-a model and checking for updates are both buttons.
+Nothing in this module talks to the network unless a person pressed something, with one
+exception that Settings can switch off: the check for newer versions made once each time the
+app starts. Identifying a model is only ever a button.
 """
 
 from __future__ import annotations
@@ -40,8 +41,9 @@ from urllib.parse import quote_plus
 import httpx
 
 from ..core.diskinfo import free_bytes
+from ..core.errors import SfdError
 from ..core.types import FileIdentity
-from ..library import details, erase, fingerprint, folders, links, relocate, sidecar
+from ..library import details, erase, fingerprint, folders, links, relocate, sidecar, versions
 from ..library import lookup as online
 from ..library import scan as scanning
 from ..library.categories import ALIASES, Category
@@ -60,6 +62,13 @@ BULK = 150
 PENDING_FOR = 600.0
 CIVITAI_API = "https://{host}/api/v1"
 UPDATE_CONCURRENCY = 4
+# What the Hub's error codes mean for a file that was there once: taken down, or moved out of
+# reach — which, for someone who downloaded it, comes to the same thing.
+HUB_GONE = {
+    "EntryNotFound": "no longer in its repository on HuggingFace",
+    "RepoNotFound": "its repository is gone from HuggingFace, or private now",
+    "RevisionNotFound": "the branch it came from is gone from its repository",
+}
 # Below this, a "copy" is a tokenizer or a config that happens to share a size with another,
 # and nobody is short of disk over it.
 DUPLICATE_MIN = 1024 * 1024
@@ -103,6 +112,11 @@ class Library:
         # What the Hub said about its repositories, for a while: identifying a library asks
         # after the same ones again and again.
         self._hub_cache: dict[str, tuple[float, Any]] = {}
+        # The check for newer versions under way, if one is — how far it has got — and
+        # whether it has been asked to stop. One at a time: the one at start and a Check now
+        # pressed during it would otherwise ask every service everything twice.
+        self._update_run: dict[str, Any] | None = None
+        self._update_stop = False
         self._closing = False
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -228,6 +242,7 @@ class Library:
             "sep": os.sep,
             "hidden": list(self.settings.exclude_dirs),
             "job": self.job_state(),
+            "update_check": self.update_state(),
         }
 
     # --- keeping up with the disk -------------------------------------------
@@ -772,6 +787,9 @@ class Library:
                 values.pop("hash_source", None)
             if not values.get("note"):
                 values["note"] = existing.note
+            # Whatever the last check said was about the file that was here before this
+            # one; the next check speaks for this one.
+            values["updates"] = {}
             self.db.update_model(existing.id, path=str(path), filename=path.name, **values)
             model_id = existing.id
         else:
@@ -1753,106 +1771,263 @@ class Library:
 
     # --- newer versions -----------------------------------------------------
 
-    async def check_updates(self, model_ids: Iterable[int]) -> dict[str, Any]:
+    def checkable_ids(self) -> list[int]:
+        """Every model on disk whose service can be asked about a newer version."""
+        return [m.id for m in self.db.list_models() if m.state == db.PRESENT and m.checkable]
+
+    def update_state(self) -> dict[str, Any] | None:
+        """How far the check under way has got, for a page that opens in the middle of it."""
+        run = self._update_run
+        return None if run is None else {**run, "stopping": self._update_stop}
+
+    def _emit_update_run(self) -> None:
+        self.emit({"type": "update_check", **(self.update_state() or {"running": False})})
+
+    def stop_update_check(self) -> bool:
+        """Ask the check under way to stop: what is being asked right now is answered, and
+        nothing more is asked. Everything learnt so far is kept."""
+        if self._update_run is None:
+            return False
+        self._update_stop = True
+        self._emit_update_run()
+        return True
+
+    async def check_updates(
+        self, model_ids: Iterable[int], *, startup: bool = False
+    ) -> dict[str, Any]:
         """Ask each model's service whether there is something newer than what is here.
 
-        Civitai publishes a model's versions newest first, so anything ahead of this one
-        is newer. On the Hub a file keeps its name when it changes, so the question there
+        What counts as newer is the rule in `library/versions.py`: on Civitai, a version for
+        the same base model whose name carries a higher number than any version of the
+        model here. On the Hub a file keeps its name when it changes, so the question there
         is whether the same path on the same branch now has a different hash.
+
+        Answered with how many were checked; how many updates there are among them — a
+        version counted once, however many files of the library it updates — and how many
+        of those the last check had not seen; how many are gone from their site, and how
+        many could not be asked about this time.
         """
-        models = [m for m in map(self.db.get_model, model_ids) if m is not None]
+        if self._update_run is not None:
+            raise Busy("newer versions are being checked already — see the status bar")
+        models = [
+            m for m in map(self.db.get_model, model_ids)
+            if m is not None and m.state == db.PRESENT and m.checkable
+        ]
+        run = {"running": True, "done": 0, "total": len(models), "found": 0, "startup": startup}
+        self._update_run = run
+        self._update_stop = False
+        self._emit_update_run()
+        have = self._versions_here()
+        pages: dict[int, asyncio.Future[Any]] = {}
         semaphore = asyncio.Semaphore(UPDATE_CONCURRENCY)
-        civitai_cache: dict[tuple[str, int], Any] = {}
-        checked = found = failed = 0
+        found: set[str] = set()
+        new: set[str] = set()
+        counts = {"checked": 0, "gone": 0, "failed": 0}
 
         async def one(model: Model) -> None:
-            nonlocal checked, found, failed
             async with semaphore:
-                try:
-                    result = await self._check_one(model, civitai_cache)
-                except Exception as exc:  # noqa: BLE001 - reported per model
-                    result = {"checked_at": time.time(), "available": False, "error": str(exc)}
-                    failed += 1
-                if result is None:
+                if self._update_stop:
                     return
-                checked += 1
-                if result.get("available"):
-                    found += 1
-                self.db.update_model(model.id, updates=result)
+                before = versions.normalise(model.updates)
+                try:
+                    record = await self._check_one(model, pages, have)
+                except Exception as exc:  # noqa: BLE001 - reported per model
+                    counts["failed"] += 1
+                    failed = {"at": time.time(), "error": str(exc) or type(exc).__name__}
+                    # A check that could not be made this time — the network down, a
+                    # service busy — says nothing new: what the last one found stands.
+                    if before is not None and before.get("status") != versions.FAILED:
+                        record = {**before, "failed": failed}
+                    else:
+                        record = {"error": failed["error"], "failed": failed}
+                        if before and before.get("skipped"):
+                            record["skipped"] = before["skipped"]
+                        record["status"] = versions.status(record)
+                else:
+                    counts["checked"] += 1
+                    record["checked_at"] = time.time()
+                    if before and before.get("skipped"):
+                        record["skipped"] = before["skipped"]
+                    record["status"] = versions.status(record)
+                    if record["status"] == versions.GONE:
+                        counts["gone"] += 1
+                if record["status"] == versions.UPDATE:
+                    found.add(record["group"])
+                    if (
+                        before is None or before.get("status") != versions.UPDATE
+                        or versions.target(before) != versions.target(record)
+                    ):
+                        new.add(record["group"])
+                self.db.update_model(model.id, updates=record)
+                run["done"] += 1
+                run["found"] = len(found)
                 self.announce(model.id, tasks=False)
+                self._emit_update_run()
 
-        await asyncio.gather(*(one(m) for m in models))
-        return {"checked": checked, "updates": found, "failed": failed}
+        result: dict[str, Any] = {}
+        try:
+            await asyncio.gather(*(one(m) for m in models))
+        finally:
+            result = {
+                **counts, "updates": len(found), "new": len(new), "stopped": self._update_stop,
+            }
+            self._update_run = None
+            self._update_stop = False
+            self.emit({"type": "update_check", "running": False, "startup": startup,
+                       "result": result})
+        return result
+
+    def skip_updates(self, model_ids: Iterable[int], skip: bool = True) -> int:
+        """Skip the update each of these has — it stops being counted until a version higher
+        than it comes out — or count it again. Nothing is asked of any service."""
+        changed = 0
+        for model_id in model_ids:
+            model = self.db.get_model(model_id)
+            record = versions.normalise(model.updates) if model is not None else None
+            if record is None:
+                continue
+            updated = versions.skip(record) if skip else versions.unskip(record)
+            if updated is None:
+                continue
+            self.db.update_model(model_id, updates=updated)
+            self.announce(model_id, tasks=False)
+            changed += 1
+        return changed
+
+    def _versions_here(self) -> dict[int, set[int]]:
+        """Every Civitai version the library has on disk, by the model it is a version of:
+        none of them is anything to download, and the highest is the one to beat."""
+        here: dict[int, set[int]] = {}
+        for model in self.db.list_models():
+            meta = model.meta
+            if model.state != db.PRESENT or model.provider != "civitai":
+                continue
+            with contextlib.suppress(TypeError, ValueError):
+                here.setdefault(int(meta["model_id"]), set()).add(int(meta["version_id"]))
+        return here
+
+    async def _civitai_page(
+        self, host: str, model_id: int, pages: dict[int, asyncio.Future[Any]]
+    ) -> dict[str, Any] | None:
+        """A model's page on Civitai — every version of it — fetched once per check however
+        many files of it are here. None when the model is not there any more."""
+        if model_id not in pages:
+            pages[model_id] = asyncio.ensure_future(self._fetch_civitai_page(host, model_id))
+        return await asyncio.shield(pages[model_id])
+
+    async def _fetch_civitai_page(self, host: str, model_id: int) -> dict[str, Any] | None:
+        token = self.settings.effective_civitai_token
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        response = await self._http().get(
+            f"{CIVITAI_API.format(host=host)}/models/{model_id}", headers=headers
+        )
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return response.json()
+
+    async def _owned(self, host: str, version_id: Any, file_id: Any) -> bool | None:
+        """Whether the account of the Civitai key has bought a version that is sold: one
+        request, to its download link, and only for a version that is sold."""
+        from ..providers.civitai import CivitaiProvider
+
+        provider = CivitaiProvider(self.settings.effective_civitai_token, host)
+        return await provider.owned(int(version_id), file_id, self._http())
+
+    def _hub_http(self) -> httpx.AsyncClient:
+        """A client for asking the Hub about one file. It follows no redirect itself: the
+        provider does, so that it can tell the Hub's own answer from the CDN's."""
+        return httpx.AsyncClient(timeout=httpx.Timeout(20.0), follow_redirects=False)
 
     async def _check_one(
-        self, model: Model, cache: dict[tuple[str, int], Any]
-    ) -> dict[str, Any] | None:
+        self, model: Model, pages: dict[int, asyncio.Future[Any]], have: dict[int, set[int]]
+    ) -> dict[str, Any]:
+        """What the service says about this one file now: the record a check leaves, but for
+        when it was made and what was skipped, which are the caller's."""
         meta = model.meta
-        client = self._http()
-        if model.provider == "civitai" and meta.get("model_id") and meta.get("version_id"):
+        if model.provider == "civitai":
             host = str(meta.get("host") or "civitai.com")
-            key = (host, int(meta["model_id"]))
-            if key not in cache:
-                token = self.settings.effective_civitai_token
-                headers = {"Authorization": f"Bearer {token}"} if token else {}
-                response = await client.get(
-                    f"{CIVITAI_API.format(host=host)}/models/{meta['model_id']}", headers=headers
-                )
-                if response.status_code == 404:
-                    cache[key] = None
-                else:
-                    response.raise_for_status()
-                    cache[key] = response.json()
-            data = cache[key]
+            model_id = int(meta["model_id"])
+            page = f"https://{host}/models/{model_id}"
+            record: dict[str, Any] = {"family": f"civitai:{model_id}", "page": page}
+            data = await self._civitai_page(host, model_id, pages)
             if data is None:
-                return {"checked_at": time.time(), "available": False,
-                        "error": "the model is no longer on Civitai"}
-            versions = data.get("modelVersions") or []
-            ids = [v.get("id") for v in versions]
+                return {**record, "gone": True, "error": "the model is no longer on Civitai"}
+            listed = data.get("modelVersions") or []
             mine = int(meta["version_id"])
-            if mine not in ids:
-                return {"checked_at": time.time(), "available": False,
-                        "error": "this version is no longer published"}
-            newer = versions[: ids.index(mine)]
-            if not newer:
-                return {"checked_at": time.time(), "available": False}
-            latest = newer[0]
-            return {
-                "checked_at": time.time(),
-                "available": True,
-                "count": len(newer),
-                "version_id": latest.get("id"),
-                "version_name": latest.get("name"),
-                "base_model": latest.get("baseModel"),
-                "published_at": latest.get("publishedAt") or latest.get("createdAt"),
-                "page": f"https://{host}/models/{meta['model_id']}?modelVersionId={latest.get('id')}",
-            }
-        ref = (model.identity or {}).get("ref") or {}
-        if model.provider == "huggingface" and ref.get("repo_id") and ref.get("path"):
-            from ..providers.huggingface import HuggingFaceProvider
-
-            provider = HuggingFaceProvider(self.settings.effective_hf_token)
-            identity = FileIdentity(provider="huggingface", ref={
-                "repo_id": ref["repo_id"], "repo_type": ref.get("repo_type") or "model",
-                "revision": "main" if len(str(ref.get("revision") or "")) == 40 else
-                ref.get("revision") or "main",
-                "path": ref["path"],
-            })
-            async with httpx.AsyncClient(timeout=httpx.Timeout(20.0), follow_redirects=False) as hub:
-                info = await provider.probe(identity, hub)
-            if not info.sha256 or not model.sha256:
-                return {"checked_at": time.time(), "available": False,
-                        "error": "the Hub does not say what this file hashes to"}
-            available = info.sha256 != model.sha256
-            result = {"checked_at": time.time(), "available": available}
-            if available:
-                result.update(
-                    commit=(info.meta or {}).get("commit"),
-                    page=f"https://huggingface.co/{ref['repo_id']}/blob/main/{ref['path']}",
-                    version_name="a newer commit on main",
+            standing = versions.assess(listed, mine, have.get(model_id, set()))
+            if standing.gone:
+                return {**record, "gone": True, "error": standing.gone}
+            if standing.pick is not None:
+                pick = standing.pick
+                own = next((v for v in listed if v.get("id") == mine), {})
+                ref = (model.identity or {}).get("ref") or {}
+                here = versions.find_file(
+                    own.get("files"), ref.get("file_id") or meta.get("file_id"), model.sha256
                 )
-            return result
-        return None
+                file = versions.choose_file(pick.get("files"), here)
+                paid = versions.access(pick)
+                if paid is not None:
+                    # Still counted: the choice to buy it is someone else's. Whether it has
+                    # been bought is what decides whether Download all fetches it.
+                    paid["owned"] = await self._owned(host, pick.get("id"), (file or {}).get("id"))
+                record.update(
+                    update={
+                        "id": pick.get("id"),
+                        "name": pick.get("name"),
+                        "base_model": pick.get("baseModel"),
+                        "published_at": pick.get("publishedAt") or pick.get("createdAt"),
+                        "number": list(versions.number(pick.get("name")) or ()),
+                        "file": file,
+                        "page": f"{page}?modelVersionId={pick.get('id')}",
+                        "access": paid,
+                    },
+                    count=standing.count,
+                    group=f"civitai:{model_id}:{pick.get('id')}",
+                )
+            if standing.others:
+                record["others"] = [
+                    {"id": v.get("id"), "name": v.get("name"), "base_model": v.get("baseModel"),
+                     "access": versions.access(v)}
+                    for v in standing.others[: versions.OTHERS_KEPT]
+                ]
+                record["others_count"] = len(standing.others)
+            return record
+
+        from ..providers.huggingface import HuggingFaceProvider
+
+        ref = (model.identity or {}).get("ref") or {}
+        revision = str(ref.get("revision") or "main")
+        # A download pinned to a commit is compared with the branch it would have followed.
+        if len(revision) == 40:
+            revision = "main"
+        page = f"https://huggingface.co/{ref['repo_id']}/blob/{revision}/{ref['path']}"
+        record = {"family": f"huggingface:{ref['repo_id']}:{ref['path']}", "page": page}
+        provider = HuggingFaceProvider(self.settings.effective_hf_token)
+        identity = FileIdentity(provider="huggingface", ref={
+            "repo_id": ref["repo_id"], "repo_type": ref.get("repo_type") or "model",
+            "revision": revision, "path": ref["path"],
+        })
+        try:
+            async with self._hub_http() as hub:
+                info = await provider.probe(identity, hub)
+        except SfdError as exc:
+            if exc.code in HUB_GONE:
+                return {**record, "gone": True, "error": HUB_GONE[exc.code]}
+            raise
+        if not info.sha256 or not model.sha256:
+            return {**record, "error": "the Hub does not say what this file hashes to"}
+        if info.sha256.lower() != model.sha256.lower():
+            record.update(
+                update={
+                    "sha256": info.sha256.lower(),
+                    "commit": (info.meta or {}).get("commit"),
+                    "name": f"a newer commit on {revision}",
+                    "page": page,
+                },
+                group=record["family"],
+            )
+        return record
 
     # --- duplicates and rubbish ---------------------------------------------
 

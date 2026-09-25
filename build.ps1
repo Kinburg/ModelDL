@@ -1,4 +1,4 @@
-# Build standalone ModelDL.exe using PyInstaller.
+# Build standalone ModelDL.exe using PyInstaller; with --portable, dist\ModelDL-portable.zip.
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 

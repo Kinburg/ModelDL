@@ -1634,7 +1634,17 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
         # What an empty "Save workflows to" means right now, for the form to show.
         found = workflows.comfy_folder(settings.roots)
         data["workflow_dir_found"] = str(found) if found else ""
+        # The folder the app's own files are in: the one relative paths are resolved
+        # against, which the launcher makes the data folder. Beside the exe, as a rule — in
+        # the user's application data when that could not be written.
+        data["data_dir"] = str(Path.cwd())
         return data
+
+    @app.post("/api/data-dir/reveal")
+    async def reveal_data_dir() -> dict[str, bool]:
+        from ..desktop import open_system_path
+
+        return {"ok": open_system_path(str(Path.cwd()))}
 
     @app.get("/api/settings")
     async def get_settings() -> dict[str, Any]:

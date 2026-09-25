@@ -1,10 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
+#
+# Built by scripts/build_exe.py, which picks the variant through the environment — a spec
+# file takes no options of its own on the PyInstaller command line:
+#   MODELDL_ONEDIR=1   the portable folder, ModelDL.exe beside _internal, instead of one exe
+#   MODELDL_CONSOLE=1  with a console window, for seeing what the app prints
+import os
 from pathlib import Path
 import sys
 
 block_cipher = None
 
 ROOT = Path.cwd()
+ONEDIR = os.environ.get("MODELDL_ONEDIR") == "1"
+CONSOLE = os.environ.get("MODELDL_CONSOLE") == "1"
 
 datas = [
     (str(ROOT / "sfd" / "web" / "static"), "sfd/web/static"),
@@ -55,13 +63,16 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# One file carries everything and unpacks it into %TEMP% on every start; the folder variant
+# keeps it unpacked in _internal beside the exe, which COLLECT puts together.
+bundled = [] if ONEDIR else [a.binaries, a.zipfiles, a.datas]
+
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
+    *bundled,
     [],
+    exclude_binaries=ONEDIR,
     name="ModelDL",
     debug=False,
     bootloader_ignore_signals=False,
@@ -69,7 +80,7 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,  # Windowed GUI application
+    console=CONSOLE,  # Windowed GUI application, unless asked otherwise
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
@@ -77,3 +88,15 @@ exe = EXE(
     entitlements_file=None,
     icon=str(ROOT / "sfd" / "logo" / "logo.ico"),
 )
+
+if ONEDIR:
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.zipfiles,
+        a.datas,
+        strip=False,
+        upx=True,
+        upx_exclude=[],
+        name="ModelDL",
+    )

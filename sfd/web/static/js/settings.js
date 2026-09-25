@@ -1,7 +1,7 @@
 // Settings, as a page of its own rather than a dialog: the library's folders come first,
 // because they decide what everything else in the window shows.
 
-import { get } from "./api.js";
+import { get, post } from "./api.js";
 import { esc, fmtBytes } from "./util.js";
 import { icon } from "./icons.js";
 import { state } from "./store.js";
@@ -117,6 +117,12 @@ export function renderSettings() {
           ${field("civitai_token", "Civitai API key", `<input id="set-civitai_token" data-token="civitai_token" type="password" autocomplete="off">`)}
         </div>
       </section>
+      <section>
+        <h3>This app's own files</h3>
+        <p class="small muted">These settings, the download history and the cache of sample pictures are kept in this folder.</p>
+        <div class="root-row quiet">${icon("drive")}<div class="root-main mono">${esc(state.settings.data_dir || "")}</div>
+          <button class="icon-button" data-role="data-dir" title="Show in Explorer">${icon("external")}</button></div>
+      </section>
     </div>`;
   fill(holder);
   wire(holder);
@@ -195,6 +201,7 @@ function wire(holder) {
     }
     const unhide = event.target.closest("[data-unhide]");
     if (unhide) { await act.unhideFolder(Number(unhide.dataset.unhide)); renderSettings(); return; }
+    if (event.target.closest('[data-role="data-dir"]')) { post("/api/data-dir/reveal").catch(toastError); return; }
     const browseButton = event.target.closest("[data-browse]");
     if (browseButton) {
       const input = holder.querySelector(`[data-field="${browseButton.dataset.browse}"]`);

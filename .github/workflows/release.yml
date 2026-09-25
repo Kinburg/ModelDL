@@ -1,10 +1,11 @@
-# Builds ModelDL.exe on Windows and, for a version tag, publishes it as a GitHub release.
+# Builds ModelDL.exe and ModelDL-portable.zip on Windows and, for a version tag, publishes
+# them as a GitHub release.
 #
 #   git tag v0.2.0
-#   git push origin v0.2.0              tests, builds, releases v0.2.0 with the exe attached
+#   git push origin v0.2.0              tests, builds, releases v0.2.0 with both attached
 #
-#   Actions → Release → Run workflow    tests and builds only: the exe stays with the run as
-#                                       an artifact, and nothing is published
+#   Actions → Release → Run workflow    tests and builds only: the builds stay with the run
+#                                       as an artifact, and nothing is published
 name: Release
 
 on:
@@ -49,44 +50,64 @@ jobs:
       - name: Test
         run: python -m pytest -q
 
-      - name: Build
+      - name: Build the exe
         run: python scripts/build_exe.py
 
+      - name: Build the portable archive
+        run: python scripts/build_exe.py --portable
+
       # A bundle that is missing a module still builds, and then dies on launch without a
-      # word, because the exe has no console. So start it headless with nothing configured
-      # and ask it for the page and for the queue.
+      # word, because the exe has no console. So start each build headless with nothing
+      # configured and ask it for the page and for the queue. The portable one is unpacked
+      # from its archive, as a user would, and started from another folder: its files belong
+      # beside the exe, not wherever it happened to be started.
       - name: Smoke test
         run: |
-          $data = (New-Item -ItemType Directory -Force (Join-Path $env:RUNNER_TEMP smoke)).FullName
-          $probe = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
-          $probe.Start(); $port = $probe.LocalEndpoint.Port; $probe.Stop()
-          $exe = Start-Process (Resolve-Path dist\ModelDL.exe).Path -PassThru `
-            -WorkingDirectory $data -ArgumentList '--no-gui', '--port', $port
-          $null = $exe.Handle   # held now, or the exit code is unreadable once it has quit
-          try {
-            $deadline = (Get-Date).AddSeconds(90)
-            while ($true) {
-              if ($exe.HasExited) { throw "ModelDL.exe quit on startup with exit code $($exe.ExitCode)" }
-              try {
-                Invoke-WebRequest "http://127.0.0.1:$port/" -UseBasicParsing -TimeoutSec 5 | Out-Null
-                break
-              } catch {
-                if ((Get-Date) -gt $deadline) { throw "ModelDL.exe did not answer on port $port within 90 s" }
-                Start-Sleep -Seconds 1
+          function Test-Launch([string] $exe, [string[]] $options, [string] $from) {
+            $probe = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+            $probe.Start(); $port = $probe.LocalEndpoint.Port; $probe.Stop()
+            $process = Start-Process $exe -PassThru -WorkingDirectory $from `
+              -ArgumentList (@($options) + @('--no-gui', '--port', $port))
+            $null = $process.Handle   # held now, or the exit code is unreadable once it has quit
+            try {
+              $deadline = (Get-Date).AddSeconds(90)
+              while ($true) {
+                if ($process.HasExited) { throw "$exe quit on startup with exit code $($process.ExitCode)" }
+                try {
+                  Invoke-WebRequest "http://127.0.0.1:$port/" -UseBasicParsing -TimeoutSec 5 | Out-Null
+                  break
+                } catch {
+                  if ((Get-Date) -gt $deadline) { throw "$exe did not answer on port $port within 90 s" }
+                  Start-Sleep -Seconds 1
+                }
               }
+              $queue = Invoke-RestMethod "http://127.0.0.1:$port/api/tasks" -TimeoutSec 10
+              if ($null -eq $queue.PSObject.Properties['tasks']) { throw "/api/tasks answered without a task list" }
+              Write-Host "$exe answered on port $port"
+            } finally {
+              if (-not $process.HasExited) { taskkill /PID $process.Id /T /F | Out-Null }
             }
-            $queue = Invoke-RestMethod "http://127.0.0.1:$port/api/tasks" -TimeoutSec 10
-            if ($null -eq $queue.PSObject.Properties['tasks']) { throw "/api/tasks answered without a task list" }
-            Write-Host "ModelDL.exe answered on port $port"
-          } finally {
-            if (-not $exe.HasExited) { taskkill /PID $exe.Id /T /F | Out-Null }
           }
+
+          $from = (New-Item -ItemType Directory -Force (Join-Path $env:RUNNER_TEMP smoke-from)).FullName
+          $data = (New-Item -ItemType Directory -Force (Join-Path $env:RUNNER_TEMP smoke-data)).FullName
+          Test-Launch (Resolve-Path dist\ModelDL.exe).Path @('--data', $data) $from
+          if (-not (Test-Path (Join-Path $data queue.db))) { throw "ModelDL.exe kept its queue somewhere other than --data" }
+
+          $unpacked = Join-Path $env:RUNNER_TEMP portable
+          Expand-Archive dist\ModelDL-portable.zip $unpacked
+          $portable = Join-Path $unpacked ModelDL
+          Test-Launch (Join-Path $portable ModelDL.exe) @() $from
+          if (-not (Test-Path (Join-Path $portable queue.db))) { throw "the portable ModelDL.exe kept its queue somewhere other than beside itself" }
+          if (Get-ChildItem $from) { throw "files were left in the folder the builds were started from" }
           exit 0
 
       - uses: actions/upload-artifact@v7
         with:
           name: ModelDL
-          path: dist/ModelDL.exe
+          path: |
+            dist/ModelDL.exe
+            dist/ModelDL-portable.zip
           if-no-files-found: error
 
   # A job of its own, so the token that can write releases is never where the packages pip
@@ -104,7 +125,7 @@ jobs:
           path: dist
 
       # A release made by hand on GitHub, with a new tag typed into its form, starts this run
-      # as well. That one keeps its notes and just gets the exe, and so does a re-run.
+      # as well. That one keeps its notes and just gets the builds, and so does a re-run.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -112,7 +133,8 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           if gh release view "$TAG" > /dev/null 2>&1; then
-            gh release upload "$TAG" dist/ModelDL.exe --clobber
+            gh release upload "$TAG" dist/ModelDL.exe dist/ModelDL-portable.zip --clobber
           else
-            gh release create "$TAG" dist/ModelDL.exe --title "$TAG" --generate-notes --verify-tag
+            gh release create "$TAG" dist/ModelDL.exe dist/ModelDL-portable.zip \
+              --title "$TAG" --generate-notes --verify-tag
           fi

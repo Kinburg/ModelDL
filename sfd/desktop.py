@@ -236,8 +236,12 @@ def open_system_path(path: str) -> bool:
         system = platform.system()
         if system == "Windows":
             if p.is_file():
-                # /select,<path> highlights the downloaded file in Explorer
-                subprocess.Popen(["explorer.exe", f"/select,{p}"])
+                # /select,<path> highlights the file in Explorer. Written out as one line,
+                # the path in quotes of its own: given as a list, a path with a space in it
+                # — `loras\Krea 2\…` — has the whole `/select,…` quoted for it, which
+                # explorer.exe does not parse, and it opens Documents instead. A Windows path
+                # cannot hold a quote, so there is nothing inside to escape.
+                subprocess.Popen(f'explorer.exe /select,"{p}"')
             else:
                 os.startfile(str(p))
             return True

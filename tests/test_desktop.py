@@ -99,6 +99,21 @@ def test_open_system_path_existing_dir(tmp_path: Path):
         mock_startfile.assert_called_once_with(str(tmp_path.resolve()))
 
 
+def test_a_file_whose_path_has_a_space_is_shown_where_it_is(tmp_path: Path):
+    """Given as a list, `/select,<path>` with a space in the path is quoted whole — and
+    explorer.exe, which reads its own command line, opens Documents instead. The path is
+    quoted on its own, after `/select,`."""
+    model = tmp_path / "loras" / "Krea 2" / "Private & Leaked Selfie_v1.safetensors"
+    model.parent.mkdir(parents=True)
+    model.write_bytes(b"weights")
+
+    with patch("sfd.desktop.platform.system", return_value="Windows"), \
+            patch("sfd.desktop.subprocess.Popen") as popen:
+        assert open_system_path(str(model)) is True
+
+    popen.assert_called_once_with(f'explorer.exe /select,"{model.resolve()}"')
+
+
 @pytest.fixture
 def client(tmp_path: Path):
     settings = Settings.load(tmp_path / "settings.json")

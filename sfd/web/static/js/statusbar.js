@@ -9,6 +9,7 @@ import { toastError } from "./toasts.js";
 import * as act from "./actions.js";
 
 let space = null;
+let ticking = 0;
 
 export const refreshSpace = debounce(async () => {
   try { space = await get("/api/space"); } catch { space = null; }
@@ -37,6 +38,17 @@ function workSummary() {
     const share = state.moving.total ? Math.round((state.moving.copied / state.moving.total) * 100) : 0;
     bits.push(`<span class="status-item busy">${icon(state.moving.verb ? "copy" : "move")}${esc(state.moving.verb || "Moving")}… ${fmtBytes(state.moving.copied)} of ${fmtBytes(state.moving.total)} (${share}%)
       <button class="mini danger" data-status="stop-move">${state.moving.stopping ? "stopping…" : "Stop"}</button></span>`);
+  }
+  // A service that asked for a pause: what is asking it waits, and says so rather than look
+  // stuck. The seconds count down on their own.
+  const now = Date.now();
+  for (const [service, until] of Object.entries(state.slowDown)) {
+    if (until <= now) { delete state.slowDown[service]; continue; }
+    bits.push(`<span class="status-item warn" title="${esc(service)} answered with “too many requests”. Everything that asks it waits, then asks again">${icon("alert")}${esc(service)} asked to slow down — continuing in ${Math.ceil((until - now) / 1000)} s</span>`);
+  }
+  if (Object.keys(state.slowDown).length) {
+    clearTimeout(ticking);
+    ticking = setTimeout(() => invalidate("status"), 1000);
   }
   const check = state.updateCheck;
   if (check && check.running) {

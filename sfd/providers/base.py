@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, unquote, urljoin, urlsplit
 
 import httpx
 
+from ..core import polite
 from ..core.errors import AccessDenied, AuthRequired, NotBinaryContent, ResolveError
 from ..core.types import FileIdentity, RemoteFileInfo, ResolvedTarget
 
@@ -104,9 +105,11 @@ async def walk_redirects(
     for _ in range(MAX_HOPS):
         request_headers = {**headers, "Accept-Encoding": "identity", **(extra or {})}
         try:
-            async with client.stream(
-                method, url, headers=request_headers, follow_redirects=False
-            ) as resp:
+            # At the service's pace, and a 429 waited out, on the hops that reach the
+            # service itself; the CDN it sends us on to is asked as it is.
+            request = client.build_request(method, url, headers=request_headers)
+            resp = await polite.send(client, request, stream=True, follow_redirects=False)
+            try:
                 hop = {k.lower(): v for k, v in resp.headers.items()}
                 merged.update(hop)
 
@@ -132,6 +135,8 @@ async def walk_redirects(
                     authenticated=bool(auth_headers),
                     hops=hops,
                 )
+            finally:
+                await resp.aclose()
         except httpx.HTTPError as exc:
             raise ResolveError(f"could not resolve {canonical}: {exc}") from exc
 

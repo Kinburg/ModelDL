@@ -24,6 +24,7 @@ from urllib.parse import quote, urlencode
 
 import httpx
 
+from ..core import polite
 from .files import without_variant
 
 HUB = "https://huggingface.co"
@@ -69,13 +70,16 @@ async def civitai_by_hash(
     """The model version holding a file with this hash — SHA256 or AutoV1 — or None."""
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     try:
-        response = await client.get(f"https://{host}/api/v1/model-versions/by-hash/{digest}", headers=headers)
+        response = await polite.get(
+            client, f"https://{host}/api/v1/model-versions/by-hash/{digest}", headers=headers
+        )
     except httpx.HTTPError as exc:
         raise RuntimeError(f"Civitai could not be reached: {exc}") from None
     if response.status_code == 404:
         return None
     if response.status_code == 429:
-        raise SlowDown("Civitai asked for fewer requests — try again in a few minutes")
+        # Only once the waits in core/polite.py are spent.
+        raise SlowDown("Civitai asked for fewer requests, and kept asking — try again in a few minutes")
     if response.status_code != 200:
         raise RuntimeError(f"Civitai answered {response.status_code}")
     try:
@@ -229,11 +233,11 @@ async def _get(
             return held[1]
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     try:
-        response = await client.get(url, params=params, headers=headers)
+        response = await polite.get(client, url, params=params, headers=headers)
     except httpx.HTTPError as exc:
         raise RuntimeError(f"HuggingFace could not be reached: {exc}") from None
     if response.status_code == 429:
-        raise SlowDown("HuggingFace asked for fewer requests — try again in a few minutes")
+        raise SlowDown("HuggingFace asked for fewer requests, and kept asking — try again in a few minutes")
     if response.status_code in (401, 403, 404):
         value = None
     elif response.status_code >= 400:

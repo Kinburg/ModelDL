@@ -20,6 +20,8 @@ export const state = {
   moving: null,
   // The check for newer versions under way — how far it has got — or null.
   updateCheck: null,
+  // Services that asked for a pause, by name: when it ends, in ms since the epoch.
+  slowDown: {},
   // Which list the middle pane shows. `folder` carries a root and a place inside it.
   view: { kind: "folder", root: 0, relative: "" },
   search: "",

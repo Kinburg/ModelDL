@@ -23,6 +23,7 @@ from typing import Any, Callable
 
 import httpx
 
+from ..core import polite
 from ..core.diskinfo import free_bytes
 from ..core.errors import (
     AccessDenied,
@@ -173,6 +174,9 @@ class Manager:
         self.reconcile()
         self.resize()
         self._retries = asyncio.create_task(self._retry_loop(), name="queue-retries")
+        # A service asking for a pause is said on the page, or a check waiting it out
+        # would look like one that hung.
+        polite.listen(self._slowed)
         self.library.start()
         # The first walk of the library happens behind the page rather than in front of
         # it: the queue is usable at once, and the tree fills in a moment later.
@@ -243,6 +247,7 @@ class Manager:
             event.set()
         for event in self._moves.values():
             event.set()
+        polite.unlisten(self._slowed)
         await self.library.stop()
         for task in list(self._background):
             task.cancel()
@@ -336,6 +341,12 @@ class Manager:
         else:
             with contextlib.suppress(RuntimeError):
                 loop.call_soon_threadsafe(self.emit, event)
+
+    def _slowed(self, service: str, seconds: float) -> None:
+        self.emit_threadsafe({
+            "type": "slow_down", "service": service,
+            "seconds": round(seconds, 1), "until": time.time() + seconds,
+        })
 
     def _emit_task(self, task_id: int) -> None:
         task = self.db.get(task_id)

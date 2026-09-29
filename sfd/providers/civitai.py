@@ -27,6 +27,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import httpx
 
+from ..core import polite
 from ..core.errors import AccessDenied, AuthRequired, ResolveError
 from ..core.types import FileIdentity, RemoteFileInfo, ResolvedTarget
 from ..library import versions
@@ -278,13 +279,17 @@ class CivitaiProvider(Provider):
         if file_id is not None:
             url += f"?fileId={file_id}"
         try:
-            response = await client.head(url, headers=self._auth, follow_redirects=False)
+            response = await polite.send(
+                client, client.build_request("HEAD", url, headers=self._auth), follow_redirects=False
+            )
             status = response.status_code
             if status == 405:
-                async with client.stream(
-                    "GET", url, headers=self._auth, follow_redirects=False
-                ) as streamed:
-                    status = streamed.status_code
+                streamed = await polite.send(
+                    client, client.build_request("GET", url, headers=self._auth),
+                    stream=True, follow_redirects=False,
+                )
+                status = streamed.status_code
+                await streamed.aclose()
         except httpx.HTTPError:
             return None
         if status < 400:
@@ -336,7 +341,7 @@ class CivitaiProvider(Provider):
 
     async def _get(self, client: httpx.AsyncClient, url: str) -> dict[str, Any]:
         try:
-            response = await client.get(url, headers=self._auth, follow_redirects=True)
+            response = await polite.get(client, url, headers=self._auth, follow_redirects=True)
         except httpx.HTTPError as exc:
             raise ResolveError(f"Civitai API request failed: {exc}") from exc
         if response.status_code >= 400:
@@ -364,6 +369,12 @@ class CivitaiProvider(Provider):
             )
         if status == 404:
             raise AccessDenied("no such model, version or file on Civitai")
+        if status == 429:
+            # Waited out and asked again already (see core/polite.py), and still refused.
+            # Retryable: the queue comes back to it later on its own.
+            raise ResolveError(
+                "Civitai asked for fewer requests, and kept asking — it is tried again later"
+            )
         raise ResolveError(f"Civitai returned {status}")
 
     @staticmethod

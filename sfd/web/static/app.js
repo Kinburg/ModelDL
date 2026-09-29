@@ -304,6 +304,11 @@ function onEvent(data) {
       state.jobs = { current: data.current, queued: data.queued || [] };
       invalidate("status");
       return;
+    case "slow_down":
+      // A service asked for fewer requests, and everything asking it is waiting.
+      state.slowDown = { ...state.slowDown, [data.service]: Math.max(state.slowDown[data.service] || 0, data.until * 1000) };
+      invalidate("status");
+      return;
     case "update_check":
       // Driven by the stream, like a move: the check outlives a reload, and a second window
       // shows it as well.

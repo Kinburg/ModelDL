@@ -410,10 +410,12 @@ Once each time the app starts — after its window is up and the folders have be
 the progress in the status bar and a *Stop* beside it — Civitai and HuggingFace are asked
 about every model that came from them. It is the one question the library puts to a service
 without a button being pressed, so it is a setting: turn off **Check for newer versions on
-start** and only *Check now* asks. On a library with 136 such models the whole check is about
-125 requests and ten seconds. A check that cannot be made — no network, a service having a bad
-minute — leaves what the last one found where it was. Only what is new since the last check is
-announced, once; the badge on *Updates* counts the rest.
+start** and only *Check now* asks. Civitai is asked for its pages a hundred models at a time:
+on a library with 96 Civitai files of 85 models, spread over civitai.com and civitai.red, that
+is four requests where it used to be 85 in six seconds; the Hub, one quick question per file.
+The whole check of 136 models takes about thirteen seconds. A check that cannot be made — no
+network, a service having a bad minute — leaves what the last one found where it was. Only
+what is new since the last check is announced, once; the badge on *Updates* counts the rest.
 
 What counts as newer is the hard part. A Civitai model is a page of versions, newest first,
 and "further up the page" is not "a newer version of mine": on one real library that rule
@@ -565,6 +567,16 @@ licence, a hash that did not match and a disk with no room left are all answered
 person, and asking the service again every thirty seconds is how a temporary refusal becomes
 a ban. **Speed limit** caps the whole queue rather than each connection, and takes effect
 while downloads are running.
+
+Civitai and the Hub are asked no faster than they like. Every request to their APIs — a link
+resolved, a model identified or looked for, the check for newer versions — goes through the
+gate of its service: two at a time and two a second for Civitai, four for the Hub. The files
+themselves come from CDNs and are not held back. A service answering 429, too many requests,
+is waited out and asked again: for as long as it says in `Retry-After`, and when it does not
+say, for 5, 15, 45 and then 120 seconds. The pause is everyone's — while Civitai has asked for
+a rest, nothing else in the app asks it anything — and the status bar says so, counting down,
+rather than look stuck. Only a request still refused after the fourth wait is reported, the way
+it always was; a download refused like that is picked back up later on its own.
 
 The status bar says what the queue as a whole is doing — fetched of total, current speed,
 ETA — and warns when what is left does not fit on the disk, which is worth more before the

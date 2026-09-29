@@ -7,6 +7,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 @pytest.fixture(autouse=True)
+def _no_pacing(monkeypatch):
+    """Stub servers answer at once, and a 429 one of them sends is the answer under test:
+    waiting it out would only slow the suite down. tests/test_polite.py turns it back on."""
+    from sfd.core import polite
+
+    monkeypatch.setattr(polite, "ENABLED", False)
+
+
+@pytest.fixture(autouse=True)
 def _no_hf_credentials(monkeypatch, tmp_path_factory):
     """Keep the machine's own HuggingFace token out of every test.
 

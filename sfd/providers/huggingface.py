@@ -24,6 +24,7 @@ from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 
+from ..core import polite
 from ..core.errors import AccessDenied, AuthRequired, ResolveError, SfdError
 from ..core.types import FileIdentity, RemoteFileInfo, ResolvedTarget
 from .base import (
@@ -285,8 +286,8 @@ class HuggingFaceProvider(Provider):
         params: dict[str, str] | None = None,
     ) -> httpx.Response:
         try:
-            response = await client.get(
-                url, headers=self._auth, params=params, follow_redirects=True
+            response = await polite.get(
+                client, url, headers=self._auth, params=params, follow_redirects=True
             )
         except httpx.HTTPError as exc:
             raise ResolveError(f"HuggingFace API request failed: {exc}") from exc
@@ -342,6 +343,11 @@ def _raise_for_hf_headers(
     if code == "RevisionNotFound":
         raise _coded(AccessDenied(f"{ref.repo_id} has no revision {ref.revision}"), code)
 
+    if status == 429:
+        # Waited out and asked again already (see core/polite.py), and still refused.
+        raise ResolveError(
+            "HuggingFace asked for fewer requests, and kept asking — it is tried again later"
+        )
     if status == 401:
         raise AuthRequired(
             "HuggingFace rejected the token" if authenticated

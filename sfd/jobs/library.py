@@ -40,6 +40,7 @@ from urllib.parse import quote_plus
 
 import httpx
 
+from ..core import polite
 from ..core.diskinfo import free_bytes
 from ..core.errors import SfdError
 from ..core.types import FileIdentity
@@ -62,6 +63,9 @@ BULK = 150
 PENDING_FOR = 600.0
 CIVITAI_API = "https://{host}/api/v1"
 UPDATE_CONCURRENCY = 4
+# Models asked for in one request by the check for newer versions — the most the listing
+# answers with at once.
+CIVITAI_BATCH = 100
 # What the Hub's error codes mean for a file that was there once: taken down, or moved out of
 # reach — which, for someone who downloaded it, comes to the same thing.
 HUB_GONE = {
@@ -1866,6 +1870,7 @@ class Library:
 
         result: dict[str, Any] = {}
         try:
+            await self._prefetch_pages(models, pages)
             await asyncio.gather(*(one(m) for m in models))
         finally:
             result = {
@@ -1916,15 +1921,67 @@ class Library:
         return await asyncio.shield(pages[model_id])
 
     async def _fetch_civitai_page(self, host: str, model_id: int) -> dict[str, Any] | None:
-        token = self.settings.effective_civitai_token
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
-        response = await self._http().get(
-            f"{CIVITAI_API.format(host=host)}/models/{model_id}", headers=headers
+        response = await polite.get(
+            self._http(), f"{CIVITAI_API.format(host=host)}/models/{model_id}",
+            headers=self._civitai_auth(),
         )
         if response.status_code == 404:
             return None
         response.raise_for_status()
         return response.json()
+
+    def _civitai_auth(self) -> dict[str, str]:
+        token = self.settings.effective_civitai_token
+        return {"Authorization": f"Bearer {token}"} if token else {}
+
+    async def _prefetch_pages(
+        self, models: list[Model], pages: dict[int, asyncio.Future[Any]]
+    ) -> None:
+        """Every Civitai page the check needs, a hundred to a request: one request for a
+        library of 85 Civitai models, where asking page by page was 85 of them in six seconds
+        — the burst a rate limit is there to stop.
+
+        A model the list leaves out is asked for on its own afterwards, which is also how one
+        taken down is told apart; a list that cannot be had is no reason to stop, only to ask
+        page by page. `nsfw=true` is not a filter: without it the list quietly leaves out
+        every model marked adult.
+        """
+        wanted: dict[str, set[int]] = {}
+        for model in models:
+            if model.provider != "civitai":
+                continue
+            with contextlib.suppress(KeyError, TypeError, ValueError):
+                host = str(model.meta.get("host") or "civitai.com")
+                wanted.setdefault(host, set()).add(int(model.meta["model_id"]))
+        loop = asyncio.get_running_loop()
+        for host, ids in wanted.items():
+            listed = sorted(ids)
+            for start in range(0, len(listed), CIVITAI_BATCH):
+                chunk = listed[start:start + CIVITAI_BATCH]
+                try:
+                    found = await self._fetch_civitai_batch(host, chunk)
+                except Exception:  # noqa: BLE001 - each is asked for on its own instead
+                    continue
+                for model_id, page in found.items():
+                    if model_id not in pages:
+                        future: asyncio.Future[Any] = loop.create_future()
+                        future.set_result(page)
+                        pages[model_id] = future
+
+    async def _fetch_civitai_batch(self, host: str, ids: list[int]) -> dict[int, dict[str, Any]]:
+        response = await polite.get(
+            self._http(), f"{CIVITAI_API.format(host=host)}/models",
+            params={"ids": ",".join(map(str, ids)), "limit": str(CIVITAI_BATCH), "nsfw": "true"},
+            headers=self._civitai_auth(),
+        )
+        response.raise_for_status()
+        body = response.json()
+        items = body.get("items") if isinstance(body, dict) else None
+        wanted = set(ids)
+        return {
+            item["id"]: item for item in items or []
+            if isinstance(item, dict) and item.get("id") in wanted
+        }
 
     async def _owned(self, host: str, version_id: Any, file_id: Any) -> bool | None:
         """Whether the account of the Civitai key has bought a version that is sold: one

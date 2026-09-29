@@ -301,19 +301,67 @@ async def test_a_page_is_asked_for_once_however_many_files_of_it_are_here(setup)
 
     def answer(request):
         asked.append(request.url.path)
-        return httpx.Response(200, json=page(1,
+        return httpx.Response(200, json={"items": [page(1,
             v(3, "V3.0 Turbo", files=[f(30, "bf16", primary=True), f(31, "int8")], published="2026-09-25"),
             v(1, "v1.0", files=[f(10, "bf16", primary=True), f(11, "int8")]),
-        ))
+        )]})
     library._client = civitai(answer)
 
     result = await library.check_updates(library.checkable_ids())
 
-    assert asked == ["/api/v1/models/1"]
+    assert asked == ["/api/v1/models"], "the list, and no page on its own"
     assert result == {"checked": 2, "gone": 0, "failed": 0, "updates": 1, "new": 1, "stopped": False}
     picks = {m.filename: m.updates["update"]["file"]["id"] for m in database.list_models()}
     assert picks == {"noct_bf16.safetensors": 30, "noct_int8.safetensors": 31}, "bf16 for bf16, int8 for int8"
     await library.stop()
+
+
+async def test_the_pages_are_asked_for_a_hundred_at_a_time(setup, monkeypatch):
+    from sfd.jobs import library as library_module
+
+    monkeypatch.setattr(library_module, "CIVITAI_BATCH", 2)
+    library, root, database, events = setup
+    for n in (1, 2, 3):
+        civitai_model(database, root / "loras" / f"m{n}.safetensors", model_id=n, version_id=10 * n,
+                      file_id=100 + n, sha=f"{n:02x}" * 32)
+    library.sync()
+    asked = []
+
+    def answer(request):
+        asked.append((request.url.path, dict(request.url.params)))
+        if request.url.path == "/api/v1/models":
+            ids = [int(i) for i in request.url.params["ids"].split(",")]
+            # Model 2 is not in the list: taken down, or hidden from it.
+            return httpx.Response(200, json={"items": [page(i, v(10 * i, "v1")) for i in ids if i != 2]})
+        return httpx.Response(404)
+    library._client = civitai(answer)
+
+    result = await library.check_updates(library.checkable_ids())
+
+    lists = [params for path, params in asked if path == "/api/v1/models"]
+    assert [p["ids"] for p in lists] == ["1,2", "3"]
+    assert all(p["nsfw"] == "true" for p in lists), "without it the list leaves out adult models"
+    assert [path for path, _ in asked if path != "/api/v1/models"] == ["/api/v1/models/2"]
+    assert result["checked"] == 3 and result["gone"] == 1
+
+
+async def test_a_list_that_cannot_be_had_is_asked_page_by_page(setup):
+    library, root, database, events = setup
+    civitai_model(database, root / "loras" / "a.safetensors")
+    library.sync()
+    asked = []
+
+    def answer(request):
+        asked.append(request.url.path)
+        if request.url.path == "/api/v1/models":
+            return httpx.Response(500)
+        return httpx.Response(200, json=page(1, v(2, "v2", files=[f(20)]), v(1, "v1")))
+    library._client = civitai(answer)
+
+    result = await library.check_updates(library.checkable_ids())
+
+    assert asked == ["/api/v1/models", "/api/v1/models/1"]
+    assert result["updates"] == 1 and result["failed"] == 0
 
 
 async def test_the_check_says_how_far_it_has_got_and_when_it_is_done(setup):
@@ -431,6 +479,9 @@ async def test_a_stopped_check_asks_nothing_more(setup):
     asked = []
 
     async def answer(request):
+        if request.url.path == "/api/v1/models":
+            # The list has none of them, so each page is asked for on its own.
+            return httpx.Response(200, json={"items": []})
         asked.append(request.url.path)
         library.stop_update_check()
         model_id = int(request.url.path.rsplit("/", 1)[-1])
@@ -487,7 +538,7 @@ async def test_a_free_update_asks_nothing_about_buying(setup):
 
     await library.check_updates(library.checkable_ids())
 
-    assert methods == ["GET"]
+    assert "HEAD" not in methods, "nothing on sale, so nothing to ask about buying"
     assert database.list_models()[0].updates["update"]["access"] is None
     await library.stop()
 

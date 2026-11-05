@@ -15,9 +15,10 @@ import {
   standingOf, versionsHere,
 } from "./store.js";
 import { menuFrom } from "./menu.js";
-import { covered, openLightbox, previewSrc, previewsOf, flash } from "./lightbox.js";
+import { covered, openLightbox, previewSrc, previewPair, previewsOf, flash } from "./lightbox.js";
 import { toast, toastError } from "./toasts.js";
 import { chips, historyStatus, modelMenu, canIdentify } from "./list.js";
+import { foundPanel, wireFound, foundMulti, wireFoundMulti, SEARCH_HELP } from "./search.js";
 import * as act from "./actions.js";
 
 let note = null;   // {key, id, kind, value, dirty}
@@ -91,7 +92,7 @@ function preview(source, count, nsfw, title) {
   const hide = covered(source, nsfw);
   return `
     <button class="insp-preview ${hide ? "covered" : ""}" data-open="0" title="${hide ? "Marked adult — click to uncover" : count > 1 ? `${count} samples` : "Full size"}">
-      <img src="${previewSrc(source, 0, 640)}" alt="" draggable="false" onerror="this.parentElement.remove()">
+      ${previewPair(source, 0, 640)}
       ${count > 1 ? `<span class="preview-count">${count}</span>` : ""}
     </button>`;
 }
@@ -688,6 +689,7 @@ function viewPanel() {
     unidentified: "Models that came from somewhere else. What they are is read from the files; identifying one looks it up on Civitai by its hash and on HuggingFace by its name, and fills in the rest.",
     duplicates: "The same file kept in more than one place. In each set, mark the copy to keep — the star — and delete the others once the hashes have confirmed they are the same.",
     cleanup: "Leftovers: unfinished downloads nobody is coming back for, and files named after models that are gone. Select to see what is in each.",
+    civitai: SEARCH_HELP,
   };
   return `<div class="insp-empty">${esc(texts[view.kind] || "")}</div>`;
 }
@@ -738,6 +740,10 @@ function renderInspector() {
   } else if (!keys.length) {
     html = viewPanel();
     wire = () => wireView(holder);
+  } else if (keys.length > 1 && keys.every((k) => k[0] === "s")) {
+    const ids = keys.map((k) => Number(k.slice(1)));
+    html = foundMulti(ids);
+    wire = () => wireFoundMulti(holder, ids);
   } else if (keys.length > 1) {
     html = multiPanel(keys);
     wire = () => wireMulti(holder);
@@ -752,6 +758,9 @@ function renderInspector() {
       if (shownModel) { html = modelPanel(shownModel); wire = () => wireModel(holder, shownModel); }
       else if (isHistory) { html = historyPanel(id); wire = () => wireHistory(holder, id); }
       else { html = taskPanel(id); wire = () => wireTask(holder, id); }
+    } else if (key[0] === "s") {
+      html = foundPanel(id);
+      wire = () => wireFound(holder, id);
     } else if (key[0] === "c") {
       html = cleanupPanel(id);
       wire = () => {

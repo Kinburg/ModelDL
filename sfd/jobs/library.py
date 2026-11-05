@@ -1899,6 +1899,10 @@ class Library:
             changed += 1
         return changed
 
+    def civitai_versions_here(self) -> dict[int, set[int]]:
+        """What a search of Civitai marks as already here: see `_versions_here`."""
+        return self._versions_here()
+
     def _versions_here(self) -> dict[int, set[int]]:
         """Every Civitai version the library has on disk, by the model it is a version of:
         none of them is anything to download, and the highest is the one to beat."""

@@ -19,6 +19,7 @@ import { wireSidebar } from "./js/sidebar.js";
 import { wireList, patchProgress, moveSelection, selectAll } from "./js/list.js";
 import { patchInspectorProgress, startRename, flushNoteOnExit } from "./js/inspector.js";
 import { wireStatus, refreshSpace } from "./js/statusbar.js";
+import { loadCivitai, focusQuery, flushSeenOnExit } from "./js/search.js";
 
 // --- the header ---------------------------------------------------------------------------
 
@@ -36,6 +37,9 @@ function renderHeader() {
     settings: "Search the library",
   }[state.view.kind] || "Search";
   if (search.placeholder !== placeholder) search.placeholder = placeholder;
+  // A search of Civitai has a box of its own, over its list; one filtering the library
+  // beside it would be two boxes that look the same and do different things.
+  search.closest(".search-box").hidden = state.view.kind === "civitai";
   $("open-settings").classList.toggle("on", state.view.kind === "settings");
 }
 onRender("header", renderHeader);
@@ -193,7 +197,12 @@ function wireKeys() {
       return;
     }
     if (dialogOpen() || menuOpen()) return;
-    if (mod && event.key.toLowerCase() === "f") { event.preventDefault(); $("search").focus(); $("search").select(); return; }
+    if (mod && event.key.toLowerCase() === "f") {
+      event.preventDefault();
+      if (state.view.kind === "civitai") focusQuery();
+      else { $("search").focus(); $("search").select(); }
+      return;
+    }
     // Paste anywhere and the link lands in the box it was meant for — unless something is
     // already taking the keystroke.
     if (mod && event.key.toLowerCase() === "v" && !typing) { $("source").focus(); return; }
@@ -428,6 +437,8 @@ async function start() {
   const settings = await act.loadSettings();
   restore(settings);
   await Promise.all([act.loadLibrary(), act.loadTasks()]);
+  // The presets in the sidebar: from the database, no question to Civitai.
+  loadCivitai();
   state.view = firstView();
   if (state.view.kind === "cleanup") act.loadCleanup();
   if (state.view.kind === "duplicates") act.loadDuplicates();
@@ -437,7 +448,7 @@ async function start() {
   // Whatever happened to the folders while the window was in the background — a model
   // dragged in Explorer, a download finished by a browser — is read in when it comes back.
   window.addEventListener("focus", () => act.rescan());
-  window.addEventListener("beforeunload", () => { flushNoteOnExit(); flushPrefs(); });
+  window.addEventListener("beforeunload", () => { flushNoteOnExit(); flushSeenOnExit(); flushPrefs(); });
 }
 
 start().catch((error) => toast(error.message || String(error), { level: "error" }));

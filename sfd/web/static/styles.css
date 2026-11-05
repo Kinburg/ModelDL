@@ -292,8 +292,10 @@ body.drop-link #center::after {
   border: 1px solid var(--line); padding: 0; position: relative; display: flex;
   align-items: center; justify-content: center; cursor: pointer;
 }
-.insp-preview img { width: 100%; height: 100%; object-fit: contain; }
-.insp-preview.covered img { filter: blur(22px) saturate(.5); }
+/* The small copy and the picture in the same place, the one still loading drawn over it. */
+.insp-preview img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+.insp-preview img.low { filter: blur(1.5px); }
+.insp-preview.covered img, .insp-preview.covered img.low { filter: blur(22px) saturate(.5); }
 .insp-preview.empty { cursor: default; color: var(--faint); height: 120px; }
 .insp-preview.empty .i { width: 38px; height: 38px; stroke-width: 1.3; }
 .preview-count {
@@ -489,6 +491,17 @@ button.status-item:hover:not(:disabled) { color: var(--text); }
 .stage .frame { flex: 1; min-width: 0; position: relative; display: flex; align-items: center; justify-content: center; }
 .stage img, .stage video { max-width: 100%; max-height: min(62vh, 720px); border-radius: 7px; display: block; }
 .stage .frame.covered img, .stage .frame.covered video { filter: blur(28px) saturate(.55); }
+/* The small copy and the full picture in one place, at the size the full one will be: the
+   one loading is drawn over the one shown, and nothing moves when it arrives. */
+.stage .picture { display: grid; place-items: center; position: relative; max-width: 100%; }
+.stage .picture > img { grid-area: 1 / 1; height: auto; object-fit: contain; }
+.stage .picture .low { filter: blur(1.5px); }
+.stage .frame.covered .picture .low { filter: blur(28px) saturate(.55); }
+.stage .loading-note {
+  position: absolute; left: 10px; bottom: 10px; padding: 2px 9px; border-radius: 5px;
+  background: rgba(20, 22, 26, .8); color: var(--muted); font-size: 12px; pointer-events: none;
+}
+.stage .picture:not(.loading) .loading-note { display: none; }
 .stage .uncover { position: absolute; padding: 7px 14px; background: rgba(20, 22, 26, .85); }
 .stage .nav { background: none; border: none; color: var(--muted); padding: 6px; }
 .stage .nav .i { width: 28px; height: 28px; }
@@ -530,6 +543,52 @@ button.status-item:hover:not(:disabled) { color: var(--text); }
 .root-row > .i { color: var(--muted); }
 .root-main { flex: 1; min-width: 0; }
 .settings pre { background: var(--bg); padding: 10px; border-radius: 8px; overflow-x: auto; }
+
+/* --- a search of Civitai ------------------------------------------------------------------------------- */
+.search-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.search-head .search-box { max-width: none; min-width: 160px; }
+.search-head .mini .i { width: 13px; height: 13px; }
+.changed-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--warn); margin-left: 7px; display: inline-block; }
+.search-summary {
+  display: flex; align-items: center; gap: 8px; padding: 6px 14px; min-width: 0; flex: none;
+  border-bottom: 1px solid var(--line-soft); color: var(--muted); font-size: 12px;
+}
+.search-summary .ellipsis { cursor: pointer; min-width: 0; }
+.search-summary .nowrap { white-space: nowrap; flex: none; }
+.search-head [data-role="apply"] { padding: 4px 11px; font-size: 12.5px; }
+.list-empty .empty-action { margin-top: 14px; }
+.search-summary .ellipsis:hover { color: var(--text); }
+/* Folded or not, the filters never take the list's room: a long panel scrolls in itself. */
+.search-panel {
+  padding: 9px 14px 3px; border-bottom: 1px solid var(--line); background: var(--panel);
+  flex: none; max-height: 45%; overflow-y: auto;
+}
+.filter-line { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 7px; }
+.filter-label { width: 92px; flex: none; color: var(--muted); font-size: 12px; }
+.filter-gap { width: 10px; }
+.filter-line select, .filter-line .tag-input { padding: 2px 8px; font-size: 12px; }
+.filter-line .tag-input { width: 200px; }
+.filter-line .toggle { padding: 2px 9px; font-size: 12px; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+.seg button { border: none; border-radius: 0; padding: 2px 9px; font-size: 12px; background: var(--panel-2); color: var(--muted); }
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button:hover:not(:disabled) { color: var(--text); border-color: var(--line); }
+.seg button.on { background: var(--accent-bg); color: var(--accent); }
+.chip.pick {
+  display: inline-flex; align-items: center; gap: 2px; padding: 1px 2px 1px 8px; font-size: 12px;
+  color: var(--text); background: var(--accent-bg);
+}
+.chip.pick.no { background: var(--bad-bg); color: var(--bad); }
+.chip.pick button { background: none; border: none; padding: 0 2px; color: inherit; opacity: .7; }
+.chip.pick button:hover:not(:disabled) { opacity: 1; }
+.chip.pick .i { width: 12px; height: 12px; }
+.row.found .version { color: var(--muted); font-size: 12px; white-space: nowrap; flex: none; }
+.row.found .new-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none; }
+.row.found.dim { opacity: .5; }
+/* A column of its own, so the Download buttons line up whatever the authors are called. */
+.row.found .row-side { width: 120px; min-width: 0; }
+.row.found .row-side .size { max-width: 100%; }
+.search-foot { display: flex; align-items: center; gap: 10px; padding: 12px 14px; flex-wrap: wrap; }
 
 /* --- the browser's own furniture ---------------------------------------------------------------------------- */
 ::-webkit-scrollbar { width: 9px; height: 9px; }

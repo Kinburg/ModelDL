@@ -17,6 +17,7 @@ import { showMenu, menuFrom } from "./menu.js";
 import { covered, openLightbox, previewSrc } from "./lightbox.js";
 import { toast } from "./toasts.js";
 import { renderSettings } from "./settings.js";
+import { renderSearch, foundMenu, foundCard, revealFound, keepPlace } from "./search.js";
 import * as act from "./actions.js";
 
 let visible = [];
@@ -640,11 +641,19 @@ let shownView = "";
 
 function renderList() {
   const holder = document.getElementById("center");
+  // A search's list is about to be drawn over: where it was is kept for coming back to it.
+  if (state.view.kind !== "civitai") keepPlace();
   if (state.view.kind === "settings") {
     // Nothing on this page is a row: what the keyboard can select must not be the rows of
     // whatever list was on screen before it.
     visible = [];
     renderSettings();
+    return;
+  }
+  if (state.view.kind === "civitai") {
+    // A search draws itself, in parts — the box being typed into is never redrawn.
+    visible = renderSearch();
+    shownView = "";
     return;
   }
   const built = buildView();
@@ -739,6 +748,7 @@ export function rowMenu(event, key) {
   else if (kind === "c") items = [
     { label: "Delete…", icon: "trash", danger: true, run: () => act.deleteCleanup(ids("c")) },
   ];
+  else if (kind === "s") items = foundMenu(ids("s"));
   showMenu(event.clientX, event.clientY, items);
 }
 
@@ -859,6 +869,7 @@ export function wireList() {
     if (picture && picture.classList.contains("covered")) {
       event.stopPropagation();
       const key = picture.dataset.thumb;
+      if (key[0] === "s") { revealFound(Number(key.slice(1))); return; }
       state.revealed.add(key[0] === "m" ? `model${key.slice(1)}` : `task${key.slice(1)}`);
       invalidate("list", "inspector");
       return;
@@ -880,6 +891,9 @@ export function wireList() {
     } else if (key[0] === "t") {
       const task = state.tasks.get(id);
       if (task?.model_id && state.view.kind !== "downloads") act.showModel(task.model_id);
+    } else if (key[0] === "s") {
+      const card = foundCard(id);
+      if (card?.previews) openLightbox({ kind: "civitai", id }, 0, card.name);
     }
   });
 

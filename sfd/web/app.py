@@ -31,6 +31,7 @@ from ..jobs import db
 from ..jobs.db import Database
 from ..jobs.library import Busy
 from ..jobs.manager import Manager
+from ..jobs.search import Filters, SearchError
 from ..library import details, erase, folders, previews, relocate, sidecar, workflows
 from ..library.categories import ALIASES, Category
 from ..library.layout import adopt
@@ -236,6 +237,37 @@ class FolderRequest(BaseModel):
 
 class UnhideRequest(BaseModel):
     index: int
+
+
+class SearchRequest(BaseModel):
+    # What to ask Civitai and what to leave out of its answer, read by `search.Filters`:
+    # anything it does not understand is its default, not a refusal.
+    filters: dict[str, Any] = Field(default_factory=dict)
+    # The preset the search was opened from, whose count in the sidebar it keeps.
+    preset_id: int | None = None
+
+
+class AdoptRequest(BaseModel):
+    # The preset a search was just saved as.
+    preset_id: int
+
+
+class SeenRequest(BaseModel):
+    # Civitai versions, as a search found them.
+    ids: list[int] = Field(default_factory=list, max_length=5000)
+    seen: bool = True
+    # The search they were on screen in, whose preset's count goes down with them.
+    token: str = Field("", max_length=64)
+
+
+class AuthorRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=100)
+    hidden: bool = True
+
+
+class PresetRequest(BaseModel):
+    name: str | None = Field(None, max_length=80)
+    filters: dict[str, Any] | None = None
 
 
 class UiPatch(BaseModel):
@@ -1469,6 +1501,134 @@ def create_app(settings: Settings, database: Database) -> FastAPI:
         task, entries = _task_samples(task_id)
         found = await _workflow_at(entries, index, None)
         return await _save_workflow(found, task.filename, index)
+
+    # --- looking through Civitai ------------------------------------------------------
+    #
+    # A search is started, and asked for more as its list is scrolled; what it found is named
+    # afterwards by the Civitai version, like a model by its id — its pictures, its workflows.
+    # Presets, the versions seen and the authors hidden are kept in the database.
+
+    search = manager.search
+
+    def _card(version_id: int):
+        try:
+            return search.card(version_id)
+        except KeyError:
+            raise HTTPException(404, "that version is not in a search any more — search again") from None
+
+    @contextlib.contextmanager
+    def _searching():
+        try:
+            yield
+        except SearchError as exc:
+            raise HTTPException(502, str(exc)) from None
+        except KeyError:
+            raise HTTPException(404, "that search is over — search again") from None
+
+    def _preset(preset_id: int) -> dict[str, Any]:
+        preset = database.get_preset(preset_id)
+        if preset is None:
+            raise HTTPException(404, "no such preset")
+        return preset
+
+    def _preset_name(name: str | None) -> str:
+        cleaned = " ".join((name or "").split())
+        if not cleaned:
+            raise HTTPException(400, "a preset needs a name")
+        return cleaned
+
+    @app.get("/api/civitai/options")
+    async def civitai_options() -> dict[str, Any]:
+        return await search.options()
+
+    @app.get("/api/civitai/state")
+    async def civitai_state() -> dict[str, Any]:
+        return search.state()
+
+    @app.post("/api/civitai/search")
+    async def civitai_search(request: SearchRequest) -> dict[str, Any]:
+        if request.preset_id is not None:
+            _preset(request.preset_id)
+        with _searching():
+            return await search.start(Filters.read(request.filters), request.preset_id)
+
+    @app.post("/api/civitai/search/{token}/more")
+    async def civitai_more(token: str) -> dict[str, Any]:
+        with _searching():
+            return await search.more(token)
+
+    @app.post("/api/civitai/search/{token}/adopt")
+    async def civitai_adopt(token: str, request: AdoptRequest) -> dict[str, Any]:
+        """A search saved as a preset goes on as that preset's, rather than being asked of
+        Civitai again for the preset's list."""
+        _preset(request.preset_id)
+        with _searching():
+            return search.adopt(token, request.preset_id)
+
+    @app.post("/api/civitai/seen")
+    async def civitai_seen(request: SeenRequest) -> dict[str, Any]:
+        return search.mark_seen(request.ids, request.seen, request.token or None)
+
+    @app.post("/api/civitai/authors")
+    async def civitai_author(request: AuthorRequest) -> dict[str, Any]:
+        return search.hide_author(request.username.strip(), request.hidden)
+
+    @app.post("/api/civitai/presets")
+    async def add_preset(request: PresetRequest) -> dict[str, Any]:
+        name = _preset_name(request.name)
+        preset = database.add_preset(name, Filters.read(request.filters).to_json())
+        return {"preset": preset, "presets": database.list_presets()}
+
+    @app.put("/api/civitai/presets/{preset_id}")
+    async def change_preset(preset_id: int, request: PresetRequest) -> dict[str, Any]:
+        _preset(preset_id)
+        preset = database.update_preset(
+            preset_id,
+            name=_preset_name(request.name) if request.name is not None else None,
+            filters=Filters.read(request.filters).to_json() if request.filters is not None else None,
+        )
+        return {"preset": preset, "presets": database.list_presets()}
+
+    @app.delete("/api/civitai/presets/{preset_id}")
+    async def delete_preset(preset_id: int) -> dict[str, Any]:
+        _preset(preset_id)
+        database.delete_preset(preset_id)
+        search.forget(preset_id)
+        return {"presets": database.list_presets()}
+
+    @app.post("/api/civitai/presets/reorder")
+    async def reorder_presets(request: ReorderRequest) -> dict[str, Any]:
+        database.reorder_presets(request.ids)
+        return {"presets": database.list_presets()}
+
+    @app.get("/api/civitai/versions/{version_id}/previews")
+    async def found_previews(version_id: int) -> dict[str, Any]:
+        return {"blur_nsfw": settings.blur_nsfw, "previews": _card(version_id).previews}
+
+    @app.get("/api/civitai/versions/{version_id}/preview/{index}")
+    async def found_preview(
+        version_id: int, index: int, w: int | None = Query(None, ge=32, le=2048)
+    ) -> FileResponse:
+        if not settings.fetch_previews:
+            raise HTTPException(404, "previews are turned off")
+        return await _remote_preview(_card(version_id).previews, index, w)
+
+    @app.get("/api/civitai/versions/{version_id}/workflows")
+    async def found_workflows(version_id: int) -> dict[str, Any]:
+        return await _workflow_states(_card(version_id).previews, None)
+
+    @app.get("/api/civitai/versions/{version_id}/workflows/{index}")
+    async def found_workflow(version_id: int, index: int) -> dict[str, Any]:
+        return _workflow_json(await _workflow_at(_card(version_id).previews, index, None))
+
+    @app.post("/api/civitai/versions/{version_id}/workflows/{index}/save")
+    async def save_found_workflow(version_id: int, index: int) -> dict[str, Any]:
+        card = _card(version_id)
+        found = await _workflow_at(card.previews, index, None)
+        # Named after the file it would be downloaded as, like a workflow saved from a model
+        # here: that is the name ComfyUI's loaders will list. The suffix is the one dropped.
+        owner = next((f["name"] for f in card.files if f.get("primary") and f.get("name")), "")
+        return await _save_workflow(found, owner or f"{card.name or f'civitai-{version_id}'}.json", index)
 
     @app.post("/api/workflows/reveal")
     async def reveal_workflow(request: WorkflowNameRequest) -> dict[str, bool]:

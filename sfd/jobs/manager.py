@@ -55,6 +55,7 @@ from ..settings import Settings
 from . import db
 from .db import Database, Model, Task, path_key
 from .library import Busy, Library
+from .search import Search
 
 PROGRESS_INTERVAL = 0.4
 # How often progress is written to the queue. Far slower than the event stream, because its
@@ -155,6 +156,9 @@ class Manager:
         self._model_moves: dict[int, threading.Event] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self.library = Library(settings, database, self.emit_threadsafe)
+        # Looking through Civitai for what is new — see jobs/search.py. A version the
+        # library has is marked in what it finds.
+        self.search = Search(settings, database, self.library.civitai_versions_here)
         self._background: set[asyncio.Task[Any]] = set()
         # Links resolved for the page to place, by token — see `resolve_links`.
         self._resolved: dict[str, Resolved] = {}
@@ -249,6 +253,7 @@ class Manager:
             event.set()
         polite.unlisten(self._slowed)
         await self.library.stop()
+        await self.search.close()
         for task in list(self._background):
             task.cancel()
         for task in list(self._background):

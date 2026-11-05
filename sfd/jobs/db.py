@@ -138,6 +138,34 @@ CREATE TABLE IF NOT EXISTS models (
     missing_since REAL,
     updated_at    REAL NOT NULL
 );
+
+-- Searches of Civitai kept under a name, in the order the sidebar lists them. What a search
+-- asks is `filters`, as the page sent it and `search.Filters` reads it back.
+CREATE TABLE IF NOT EXISTS search_presets (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL,
+    position   REAL NOT NULL,
+    filters    TEXT NOT NULL DEFAULT '{}',
+    -- What the last look at it found not seen yet: how many, and whether there was more to
+    -- look through — the sidebar's count, kept until it is opened again.
+    unseen     TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+-- Civitai versions that have been on screen in a search. A version, not a model: a model
+-- seen last week that has a new version today is news again.
+CREATE TABLE IF NOT EXISTS search_seen (
+    version_id INTEGER PRIMARY KEY,
+    model_id   INTEGER,
+    seen_at    REAL NOT NULL
+);
+
+-- Authors whose models a search leaves out, unless it is asked to show them.
+CREATE TABLE IF NOT EXISTS search_hidden_authors (
+    username  TEXT PRIMARY KEY COLLATE NOCASE,
+    hidden_at REAL NOT NULL
+);
 """
 
 # Indexes are created separately, after migration. `CREATE TABLE IF NOT EXISTS` is a no-op
@@ -826,6 +854,163 @@ class Database:
         task = _to_task(row)
         task.state = RUNNING
         return task
+
+    # --- searches of Civitai ------------------------------------------------
+
+    def list_presets(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM search_presets ORDER BY position, id"
+            ).fetchall()
+        return [_to_preset(row) for row in rows]
+
+    def get_preset(self, preset_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM search_presets WHERE id = ?", (preset_id,)
+            ).fetchone()
+        return _to_preset(row) if row else None
+
+    def add_preset(self, name: str, filters: dict[str, Any]) -> dict[str, Any]:
+        """A new preset, at the bottom of the list."""
+        now = time.time()
+        with self._lock:
+            last = self._conn.execute("SELECT MAX(position) FROM search_presets").fetchone()[0]
+            cursor = self._conn.execute(
+                "INSERT INTO search_presets (name, position, filters, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (name, (last or 0) + 1, json.dumps(filters), now, now),
+            )
+            self._conn.commit()
+            preset_id = cursor.lastrowid
+        return self.get_preset(preset_id)   # type: ignore[return-value]
+
+    def update_preset(
+        self,
+        preset_id: int,
+        *,
+        name: str | None = None,
+        filters: dict[str, Any] | None = None,
+        unseen: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        values: dict[str, Any] = {}
+        if name is not None:
+            values["name"] = name
+        if filters is not None:
+            values["filters"] = json.dumps(filters)
+        if unseen is not None:
+            values["unseen"] = json.dumps(unseen)
+        if values:
+            # The count moving is not the preset changing: what was saved stays dated by the
+            # last time it was.
+            if name is not None or filters is not None:
+                values["updated_at"] = time.time()
+            assignments = ", ".join(f"{k} = ?" for k in values)
+            with self._lock:
+                self._conn.execute(
+                    f"UPDATE search_presets SET {assignments} WHERE id = ?",
+                    (*values.values(), preset_id),
+                )
+                self._conn.commit()
+        return self.get_preset(preset_id)
+
+    def delete_preset(self, preset_id: int) -> bool:
+        with self._lock:
+            cursor = self._conn.execute("DELETE FROM search_presets WHERE id = ?", (preset_id,))
+            self._conn.commit()
+        return cursor.rowcount > 0
+
+    def reorder_presets(self, ids: list[int]) -> None:
+        """Put the presets named in this order; any not named keep their place after them."""
+        with self._lock:
+            for position, preset_id in enumerate(ids, start=1):
+                self._conn.execute(
+                    "UPDATE search_presets SET position = ? WHERE id = ?", (position, preset_id)
+                )
+            rest = self._conn.execute(
+                f"SELECT id FROM search_presets WHERE id NOT IN ({','.join('?' * len(ids)) or 'NULL'}) "
+                "ORDER BY position, id",
+                tuple(ids),
+            ).fetchall()
+            for offset, row in enumerate(rest, start=len(ids) + 1):
+                self._conn.execute(
+                    "UPDATE search_presets SET position = ? WHERE id = ?", (offset, row["id"])
+                )
+            self._conn.commit()
+
+    def seen_versions(self, version_ids: Iterable[int]) -> set[int]:
+        """Which of these versions have been on screen in a search before."""
+        wanted = list(dict.fromkeys(version_ids))
+        found: set[int] = set()
+        with self._lock:
+            # SQLite takes a limited number of variables in one statement.
+            for start in range(0, len(wanted), 500):
+                chunk = wanted[start:start + 500]
+                rows = self._conn.execute(
+                    f"SELECT version_id FROM search_seen WHERE version_id IN ({','.join('?' * len(chunk))})",
+                    tuple(chunk),
+                ).fetchall()
+                found.update(row["version_id"] for row in rows)
+        return found
+
+    def mark_seen(self, versions: Iterable[tuple[int, int | None]], seen: bool = True) -> int:
+        """Mark versions — (version, model) pairs — as seen, or as not seen again."""
+        pairs = list(versions)
+        now = time.time()
+        with self._lock:
+            if seen:
+                cursor = self._conn.executemany(
+                    "INSERT OR IGNORE INTO search_seen (version_id, model_id, seen_at) VALUES (?, ?, ?)",
+                    [(version_id, model_id, now) for version_id, model_id in pairs],
+                )
+            else:
+                cursor = self._conn.executemany(
+                    "DELETE FROM search_seen WHERE version_id = ?",
+                    [(version_id,) for version_id, _ in pairs],
+                )
+            self._conn.commit()
+        return cursor.rowcount
+
+    def hidden_authors(self) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT username FROM search_hidden_authors ORDER BY username COLLATE NOCASE"
+            ).fetchall()
+        return [row["username"] for row in rows]
+
+    def set_author_hidden(self, username: str, hidden: bool = True) -> bool:
+        """Hide an author's models from searches, or show them again. Whether it changed."""
+        with self._lock:
+            if hidden:
+                cursor = self._conn.execute(
+                    "INSERT OR IGNORE INTO search_hidden_authors (username, hidden_at) VALUES (?, ?)",
+                    (username, time.time()),
+                )
+            else:
+                cursor = self._conn.execute(
+                    "DELETE FROM search_hidden_authors WHERE username = ?", (username,)
+                )
+            self._conn.commit()
+        return cursor.rowcount > 0
+
+
+def _to_preset(row: sqlite3.Row) -> dict[str, Any]:
+    def decoded(text: str) -> dict[str, Any]:
+        try:
+            value = json.loads(text or "{}")
+        except ValueError:
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "position": row["position"],
+        "filters": decoded(row["filters"]),
+        "unseen": decoded(row["unseen"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
 
 
 def _origin(provider: str, identity: dict[str, Any], meta: dict[str, Any]) -> str:

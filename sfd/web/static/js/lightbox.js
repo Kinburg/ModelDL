@@ -13,9 +13,10 @@ import * as act from "./actions.js";
 
 const cache = new Map();
 
-// `source` is {kind: "model" | "task", id}.
+// `source` is {kind: "model" | "task" | "civitai", id} — the last a version a search found.
 export const previewBase = (source) =>
-  source.kind === "task" ? `/api/tasks/${source.id}` : `/api/models/${source.id}`;
+  source.kind === "task" ? `/api/tasks/${source.id}`
+    : source.kind === "civitai" ? `/api/civitai/versions/${source.id}` : `/api/models/${source.id}`;
 
 export async function previewsOf(source) {
   const key = `${source.kind}${source.id}`;
@@ -29,6 +30,15 @@ export function forgetPreviews(source) {
 
 export const previewSrc = (source, index, width) =>
   `${previewBase(source)}/preview/${index}${width ? `?w=${width}` : ""}`;
+
+// A picture at `width`, with the list's own small copy of it — fetched already, for the row —
+// under it until it is in: the inspector shows the picture at once, blurry, instead of an
+// empty box. One that cannot be had leaves the small copy; with neither, the box goes.
+export const previewPair = (source, index, width) => `
+  <img class="low" src="${previewSrc(source, index, 160)}" alt="" draggable="false" onerror="this.remove()">
+  <img class="full" src="${previewSrc(source, index, width)}" alt="" draggable="false"
+       onload="this.previousElementSibling?.remove()"
+       onerror="this.previousElementSibling ? this.remove() : this.parentElement.remove()">`;
 
 export const coverKey = (source) => `${source.kind}${source.id}`;
 export const covered = (source, nsfw) =>
@@ -61,9 +71,18 @@ export async function openLightbox(source, index = 0, title = "") {
   const drawStage = () => {
     const item = items[at];
     const hidden = covered(source, item.nsfw);
+    // The full picture takes a while; until it is in, the strip's own small copy — already
+    // fetched for the strip — stands in for it at the size it will be, so the window shows
+    // the picture, blurry, instead of nothing. A video gets the same copy as its poster.
+    const small = previewSrc(source, at, 160);
+    const size = item.width && item.height ? `width="${item.width}" height="${item.height}"` : "";
     const media = item.type === "video"
-      ? `<video src="${previewSrc(source, at)}" autoplay loop muted playsinline controls></video>`
-      : `<img src="${previewSrc(source, at, 1024)}" alt="" draggable="false">`;
+      ? `<video src="${previewSrc(source, at)}" poster="${small}" autoplay loop muted playsinline controls></video>`
+      : `<div class="picture loading">
+           <img class="low" src="${small}" ${size} alt="" draggable="false">
+           <img class="full" src="${previewSrc(source, at, 1024)}" ${size} alt="" draggable="false">
+           <span class="loading-note">Loading the full size…</span>
+         </div>`;
     $("stage").innerHTML =
       (items.length > 1 ? `<button class="nav" data-step="-1" aria-label="Previous">${icon("chevron-right", "flip")}</button>` : "")
       + `<div class="frame ${hidden ? "covered" : ""}">${media}`
@@ -75,6 +94,24 @@ export async function openLightbox(source, index = 0, title = "") {
     });
     const uncover = $("stage").querySelector(".uncover");
     if (uncover) uncover.onclick = () => { state.revealed.add(coverKey(source)); draw(); invalidate("list", "inspector"); };
+    const full = $("stage").querySelector("img.full");
+    if (full) {
+      const picture = full.parentElement;
+      const shown = () => {
+        picture.classList.remove("loading");
+        picture.querySelector("img.low")?.remove();
+      };
+      // One that cannot be had leaves the small copy in its place, which is still the picture.
+      const failed = () => {
+        full.remove();
+        picture.classList.remove("loading");
+      };
+      if (full.complete && full.naturalWidth) shown();
+      else {
+        full.addEventListener("load", shown, { once: true });
+        full.addEventListener("error", failed, { once: true });
+      }
+    }
   };
 
   const drawStrip = () => {

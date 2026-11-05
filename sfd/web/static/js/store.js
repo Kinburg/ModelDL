@@ -40,6 +40,9 @@ export const state = {
   // Which copy to keep in each set of duplicates, by the set's key, when it is not the one
   // the library suggests.
   keepers: new Map(),
+  // Searches of Civitai kept as presets, the authors hidden from them, and what the filters
+  // offer — Civitai's list of base models, asked for the first time a search is opened.
+  civitai: { presets: [], hidden: [], options: null, loaded: false },
 };
 
 // --- redrawing ------------------------------------------------------------------------

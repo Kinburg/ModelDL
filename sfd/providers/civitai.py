@@ -402,7 +402,7 @@ def _describe_files(version: dict[str, Any]) -> list[CivitaiFile]:
         names[name] = names.get(name, 0) + 1
 
     model = version.get("model") or {}
-    previews = _describe_previews(version)
+    previews = describe_previews(version)
     # The first still image is what the site shows as its thumbnail, and what the model
     # managers expect to find as `<model>.preview.png`.
     preview = next(
@@ -476,8 +476,9 @@ _GENERATION = {
 }
 
 
-def _describe_previews(version: dict[str, Any]) -> list[dict[str, Any]]:
-    """The version's sample images, with the prompt that made each one.
+def describe_previews(version: dict[str, Any]) -> list[dict[str, Any]]:
+    """The version's sample images, with the prompt that made each one — of a download, and
+    of a version a search of Civitai found.
 
     The prompt is the point. A LoRA arrives with trigger words that say which tokens wake it
     up and nothing at all about what a working prompt around them looks like; the sample

@@ -4,7 +4,7 @@
 // and how much — plus the folders a missing model was last seen in, drawn grey. Dropping
 // models on a folder moves them there.
 
-import { esc, fmtBytes, plural } from "./util.js";
+import { esc, fmtAgo, fmtBytes, plural } from "./util.js";
 import { icon } from "./icons.js";
 import {
   state, tree, invalidate, remember, onRender, activeTasks, missingModels, unidentifiedModels,
@@ -14,6 +14,7 @@ import { showMenu } from "./menu.js";
 import {
   go, moveModels, newFolder, hideFolder, revealFolder, addRoot, removeRoot, makePrimary, rescan,
 } from "./actions.js";
+import { openPreset, renamePreset, deletePreset, movePreset } from "./search.js";
 
 const VIEWS = [
   { kind: "downloads", label: "Downloads", icon: "download" },
@@ -76,9 +77,22 @@ function renderSidebar() {
       </div>`);
   }
 
+  const searching = current.kind === "civitai";
+  const presets = state.civitai.presets.map((p) => `
+    <button class="side-item preset ${searching && current.preset === p.id ? "on" : ""}" data-preset="${p.id}" title="${esc(p.name)}">
+      ${icon("star")}<span class="side-label">${esc(p.name)}</span>${unseenBadge(p)}
+    </button>`).join("");
+
   const scrolled = holder.querySelector(".tree")?.scrollTop || 0;
   holder.innerHTML = `
     <div class="side-section">${views}</div>
+    <div class="side-section">
+      <div class="side-title"><span>Civitai</span></div>
+      <button class="side-item ${searching && !current.preset ? "on" : ""}" data-view="civitai">
+        ${icon("search")}<span class="side-label">Search</span>
+      </button>
+      ${presets}
+    </div>
     <div class="side-section grow">
       <div class="side-title">
         <span>Library</span>
@@ -90,6 +104,15 @@ function renderSidebar() {
         <button class="link-button" data-action="add-root">Add one</button></div>`}</div>
     </div>`;
   holder.querySelector(".tree").scrollTop = scrolled;
+}
+
+// What a preset found new the last time it was opened: counted then, and brought down as the
+// versions are seen, never asked of Civitai in the background.
+function unseenBadge(preset) {
+  const unseen = preset.unseen || {};
+  if (!unseen.count) return "";
+  const when = unseen.at ? ` — counted ${fmtAgo(unseen.at)}` : "";
+  return `<span class="badge" title="${plural(unseen.count, "version")} not seen yet${unseen.more ? ", and more not looked through" : ""}${when}">${unseen.count}${unseen.more ? "+" : ""}</span>`;
 }
 
 function walk(item, depth, rows) {
@@ -136,6 +159,8 @@ export function wireSidebar() {
   holder.addEventListener("click", (event) => {
     const view = event.target.closest("[data-view]");
     if (view) { go({ kind: view.dataset.view }); return; }
+    const preset = event.target.closest("[data-preset]");
+    if (preset) { openPreset(Number(preset.dataset.preset)); return; }
     const action = event.target.closest("[data-action]");
     if (action) {
       if (action.dataset.action === "add-root") addRoot();
@@ -155,6 +180,21 @@ export function wireSidebar() {
   });
 
   holder.addEventListener("contextmenu", (event) => {
+    const preset = event.target.closest("[data-preset]");
+    if (preset) {
+      event.preventDefault();
+      const id = Number(preset.dataset.preset);
+      const at = state.civitai.presets.findIndex((p) => p.id === id);
+      showMenu(event.clientX, event.clientY, [
+        { label: "Open", icon: "search", run: () => openPreset(id) },
+        { label: "Rename…", icon: "edit", run: () => renamePreset(id) },
+        { label: "Move up", icon: "arrow-up", disabled: at <= 0, run: () => movePreset(id, -1) },
+        { label: "Move down", icon: "arrow-down", disabled: at >= state.civitai.presets.length - 1, run: () => movePreset(id, 1) },
+        "-",
+        { label: "Delete…", icon: "trash", danger: true, run: () => deletePreset(id) },
+      ]);
+      return;
+    }
     const row = event.target.closest(".tree-row");
     if (!row || row.dataset.node === "outside") return;
     event.preventDefault();
